@@ -19,6 +19,10 @@ ARG HAPPY_AGENT_SHA256_AMD64=4b6023e8380f50c0b7d04e12587fd599f6b3ba791061797ad9e
 ARG CODEX_VERSION=0.160.1
 ARG CODEX_SHA256_ARM64=f54dc5852042445bf41da3aa31156f3cb02f52c5a1a04074de73dc5598f7e1f7
 ARG CODEX_SHA256_AMD64=9226581be592d18f7e7f740a352fdb63aa61e45e39f7eb9b09d3888c84bba33f
+# Codex runs tool calls (MCP tools included) through this companion from the same release; without
+# it every tool call fails with "failed to spawn code-mode host".
+ARG CODEX_CODE_MODE_HOST_SHA256_ARM64=e5e027e6689efda2e3570aa600179f0ebb18632803350e152ed6c9b97dcf9741
+ARG CODEX_CODE_MODE_HOST_SHA256_AMD64=8a69207d97545ac753b6585974e1e67a4c51ae5deacf06517db512bb25e0e3c2
 # Claude Code as a real program, so the daemon's provider-CLI sign-in can run `claude auth login`
 # (npm registry dist.integrity, hex).
 ARG CLAUDE_CODE_VERSION=2.1.321
@@ -32,9 +36,11 @@ RUN set -eu; \
     case "$TARGETARCH" in \
       arm64) happy=linux-arm64; happy_sha=$HAPPY_AGENT_SHA256_ARM64; \
              codex=aarch64-unknown-linux-musl; codex_sha=$CODEX_SHA256_ARM64; \
+             host_sha=$CODEX_CODE_MODE_HOST_SHA256_ARM64; \
              claude=linux-arm64; claude_sha=$CLAUDE_CODE_SHA512_ARM64 ;; \
       amd64) happy=linux-x64; happy_sha=$HAPPY_AGENT_SHA256_AMD64; \
              codex=x86_64-unknown-linux-musl; codex_sha=$CODEX_SHA256_AMD64; \
+             host_sha=$CODEX_CODE_MODE_HOST_SHA256_AMD64; \
              claude=linux-x64; claude_sha=$CLAUDE_CODE_SHA512_AMD64 ;; \
       *) echo "unsupported TARGETARCH '$TARGETARCH': build with docker buildx --platform linux/arm64 or linux/amd64" >&2; exit 1 ;; \
     esac; \
@@ -43,6 +49,11 @@ RUN set -eu; \
     echo "${codex_sha}  /tmp/codex.tar.gz" | sha256sum -c -; \
     tar -xzf /tmp/codex.tar.gz -C /tmp; \
     install -m 0755 "/tmp/codex-${codex}" /out/codex; \
+    curl -fsSL -o /tmp/code-mode-host.tar.gz \
+      "https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/codex-code-mode-host-${codex}.tar.gz"; \
+    echo "${host_sha}  /tmp/code-mode-host.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/code-mode-host.tar.gz -C /tmp; \
+    install -m 0755 "/tmp/codex-code-mode-host-${codex}" /out/codex-code-mode-host; \
     curl -fsSL -o /tmp/claude.tgz \
       "https://registry.npmjs.org/@anthropic-ai/claude-code-${claude}/-/claude-code-${claude}-${CLAUDE_CODE_VERSION}.tgz"; \
     echo "${claude_sha}  /tmp/claude.tgz" | sha512sum -c -; \

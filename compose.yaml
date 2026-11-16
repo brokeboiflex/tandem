@@ -1,29 +1,54 @@
-# Local stack: the gateway only. It creates one runtime container per person on demand.
-# Build the runtime image first: docker buildx build --load -t tandem-runtime:2026.11.6-preview.7 runtime
-name: tandem
+# Local stack: the gateway and the egress proxy. The gateway creates one runtime container and one
+# private network per person on demand.
+# Build the images first (README, Quick start). A second instance on the same machine needs its own
+# directory and .env with a different RUNTIME_PREFIX and GATEWAY_PORT.
+# Stricter Docker access: docker compose -f compose.yaml -f compose.socket-proxy.yaml up -d
+name: ${RUNTIME_PREFIX:-tandem}
 services:
   gateway:
     build: .
-    image: tandem-gateway:0.1.0
-    container_name: tandem-gateway
+    image: ${GATEWAY_IMAGE:-tandem-gateway:0.1.0}
+    container_name: ${RUNTIME_PREFIX:-tandem}-gateway
     env_file: .env
     environment:
       BIND_HOST: 0.0.0.0
       PORT: "8787"
-      RUNTIME_NETWORK: tandem-runtimes
+    # Only the API is published. The MCP proxy (MCP_PROXY_PORT, 8790) is for runtimes on their private
+    # networks and must never be published.
     ports: ["127.0.0.1:${GATEWAY_PORT:-8787}:8787"]
-    networks: [runtimes]
-    # Local development talks to the Engine socket directly, which is root-equivalent. In
-    # production, put a restricted socket proxy in front and set RUNTIME_DOCKER_HOST=tcp://... (README).
-    volumes: ["/var/run/docker.sock:/var/run/docker.sock"]
+    # The published port and the gateway's own outbound calls (OIDC keys). The gateway attaches itself
+    # to every runtime network at run time; runtimes never join this network.
+    networks: [edge]
+    # The plain Engine socket is root on the host; the gateway warns about it at startup. Rootless
+    # Docker: DOCKER_SOCKET=$XDG_RUNTIME_DIR/docker.sock.
+    volumes: ["${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock"]
     user: root
+    depends_on: [egress]
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:8787/healthz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
       interval: 10s
       timeout: 3s
       retries: 3
+  # Smokescreen: the runtimes' only way out (EGRESS_MODE, EGRESS_ALLOW_DOMAINS, EGRESS_ALLOW_RANGES).
+  egress:
+    build: egress
+    image: ${EGRESS_IMAGE:-tandem-egress:0.1.0}
+    container_name: ${RUNTIME_PREFIX:-tandem}-egress
+    environment:
+      EGRESS_MODE: ${EGRESS_MODE:-auto}
+      EGRESS_ALLOW_DOMAINS: ${EGRESS_ALLOW_DOMAINS:-}
+      EGRESS_ALLOW_RANGES: ${EGRESS_ALLOW_RANGES:-}
+    networks: [outbound]
+    read_only: true
+    tmpfs: ["/tmp:size=1m,mode=1777"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    pids_limit: 256
+    restart: unless-stopped
 networks:
-  # Runtimes and the gateway only. Runtimes need Internet egress to reach the vendors.
-  runtimes:
-    name: tandem-runtimes
+  edge:
+    name: ${RUNTIME_PREFIX:-tandem}-edge
+  outbound:
+    name: ${RUNTIME_PREFIX:-tandem}-outbound

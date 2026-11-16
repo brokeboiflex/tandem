@@ -182,6 +182,10 @@ export function fakeDaemon(token: string) {
         if (sub === "messages")
           return json({ runs: agent.runs ?? [], hasMore: false, cursor: "c" });
         if (sub === "abort") return json({ agent }, 202);
+        if (sub === "archive") {
+          agent.archivedAt = Date.now();
+          return json({ agent });
+        }
         if (sub === "send") {
           agent.mode = data.mode;
           const message = {
@@ -193,6 +197,7 @@ export function fakeDaemon(token: string) {
             status: "pending",
             mode: data.mode,
           };
+          agent.lastActivityAt = Date.now();
           agent.runs = [
             ...(agent.runs ?? []),
             {
@@ -253,10 +258,33 @@ export function fakeDaemon(token: string) {
 
 export type FakeDaemon = ReturnType<typeof fakeDaemon>;
 
+/** deploy/sockguard.yaml: the exec commands and archive folders the socket proxy lets through. */
+export async function socketProxyPolicy() {
+  const policy = Bun.YAML.parse(
+    await Bun.file(new URL("../deploy/sockguard.yaml", import.meta.url)).text(),
+  ) as any;
+  return {
+    commands: new Set<string>(
+      policy.request_body.exec.allowed_commands.map((c: string[]) =>
+        JSON.stringify(c),
+      ),
+    ),
+    paths: policy.request_body.container_archive.allowed_paths as string[],
+  };
+}
+
 export class FakeRuntime implements Runtime {
   daemons = new Map<string, FakeDaemon>();
   calls: string[] = [];
+  /** Every command run inside a runtime, in full (checked against the socket proxy's policy). */
+  execs: string[][] = [];
   files: { key: string; dir: string; name: string; content: string }[] = [];
+  /** The volume as the runtime would see it: "<key>:<path>" -> content. */
+  volume = new Map<string, string>();
+  /** When set, every `cat` ends with this exit code, as if killed by a restart. */
+  failReads?: number;
+  /** Source address a runtime's requests come from; tests change it to play a neighbour. */
+  addresses = new Map<string, string>();
   private token = "t".repeat(43);
 
   private handle(key: string): RuntimeHandle {
@@ -280,7 +308,19 @@ export class FakeRuntime implements Runtime {
   }
   async exec(key: string, cmd: string[]) {
     this.calls.push(`exec ${key} ${cmd[0]}`);
+    this.execs.push([...cmd]);
+    if (cmd[0] === "cat" && this.failReads)
+      return { exitCode: this.failReads, stdout: "" };
+    if (cmd[0] === "cat") {
+      const content = this.volume.get(`${key}:${cmd[1]}`);
+      return { exitCode: content === undefined ? 1 : 0, stdout: content ?? "" };
+    }
+    if (cmd[0] === "rm")
+      for (const path of cmd.slice(1)) this.volume.delete(`${key}:${path}`);
     return { exitCode: 0, stdout: "" };
+  }
+  async address(key: string) {
+    return this.daemons.has(key) ? (this.addresses.get(key) ?? "127.0.0.1") : null;
   }
   async writePrivateFile(
     key: string,
@@ -290,6 +330,7 @@ export class FakeRuntime implements Runtime {
   ) {
     this.calls.push(`write ${key} ${dir}/${name}`);
     this.files.push({ key, dir, name, content });
+    this.volume.set(`${key}:${dir}/${name}`, content);
   }
   /** Simulates `docker stop` or a crash behind the gateway's back. */
   kill(key: string) {

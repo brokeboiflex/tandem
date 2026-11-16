@@ -1,0 +1,5 @@
+# Build context whitelist.
+*
+!Dockerfile
+!allowlist.txt
+!entrypoint.sh

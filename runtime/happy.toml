@@ -43,7 +43,7 @@ enabled = false
 [defaults]
 provider = "claude"
 model = "claude-code/default"
-permission_mode = "workspace_write"
+permission_mode = "auto"
 
 # Claude Code itself, through the Claude Agent SDK bundled in the Happy Agent binary. Note: in this
 # version the harness always runs that bundled copy; `executable` above is not honored by it.

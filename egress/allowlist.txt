@@ -1,0 +1,23 @@
+# Hostnames runtimes may reach through the egress proxy by default (EGRESS_MODE=allowlist).
+# "*.example.com" matches every subdomain but not example.com itself. Add your own with
+# EGRESS_ALLOW_DOMAINS (package registries, your services) instead of editing this file.
+
+# Anthropic: Claude Code, Claude sign-in and API keys.
+anthropic.com
+*.anthropic.com
+claude.ai
+*.claude.ai
+claude.com
+*.claude.com
+
+# OpenAI: Codex and ChatGPT sign-in.
+openai.com
+*.openai.com
+chatgpt.com
+*.chatgpt.com
+
+# GitHub: Codex plugin sync and git.
+github.com
+*.github.com
+githubusercontent.com
+*.githubusercontent.com

@@ -1,0 +1,51 @@
+# Main stack switch: tandem (Docker Desktop 29.6.1, plain socket, hardened defaults), 2026-11-16T18:09:19Z
+# Images rebuilt from the merged tree: tandem-runtime:2026.11.6-preview.7 f429573aa822, tandem-gateway:0.1.0 c17962841c88, tandem-egress:0.1.0 f79453661160 (same filesystem layers as the :merge-test images tested above)
+# .env: existing values kept; appended MCP_PROXY_PORT/MCP_PROXY_URL and the hardening/compose settings at their .env.example defaults
+
+## docker compose up -d: gateway recreated, egress created; /healthz back after 12 s
+security: sandbox=runc docker_api=unrestricted egress=allowlist network=per_runtime rootfs=read-only user=10001:10001 cap_add=none no_new_privileges=true limits=2048MiB/2cpu/512pids
+WARNING: gVisor (runsc) is not installed in this Docker Engine, so runtimes use its default runtime (runc) and share the host kernel. Install gVisor (README, Security) or set RUNTIME_OCI_RUNTIME=default to accept this.
+WARNING: The gateway has unrestricted Docker API access, which is root on this host. Use the socket proxy (compose.socket-proxy.yaml, README) or set RUNTIME_DOCKER_PROXY=none to accept this.
+tandem gateway on 0.0.0.0:8787, MCP proxy on port 8790 (auth dev, idle 5 min, permission mode auto)
+
+## gateway -> MCP upstreams
+gateway -> CRM backend (http://host.docker.internal:3000): /health/live 200, POST /api/v1/mcp without a token 401
+gateway -> stub (http://host.docker.internal:8791/mcp): see the lookup_customer calls below
+
+## Real accounts (dev subject demo-user, volume tandem-home-f7105a6733c37b7c5a5ee8f7), 4 turns
+      demo-user MCP servers before: []
+      claude: connected, Max plan, 5 models
+      codex: connected, Free plan, 1 models
+PASS  existing Claude and Codex logins work in the hardened runtime
+      inside tandem-rt-f7105a6733c37b7c5a5ee8f7: 10001 | ro | /home/agent/.cache/tmp | cc-socks | claude-10001 | happy-agent-10001 | http://172.28.0.1:8790/mcp/<key>
+      container: tandem-net-f7105a6733c37b7c5a5ee8f7 ro=true user=10001:10001 caps=[ALL]
+PASS  uid 10001, read-only root, TMPDIR on the volume, own network
+      registered stub for this check: 201
+PASS  mcp.toml names the proxy at the gateway's address on this runtime's network
+PASS  claude: one-word turn on claude-code/haiku  (reply "pong")
+PASS  claude: calls the stub MCP tool through the gateway's proxy  (reply "Wilhelmina Quarrington", 1 upstream call(s))
+PASS  codex: one-word turn on codex-cli/gpt-6-luna  (reply "pong")
+PASS  codex: calls the stub MCP tool through the gateway's proxy  (reply "Wilhelmina Quarrington", 1 upstream call(s))
+PASS  demo-user's MCP registrations restored
+REAL TURNS PASSED
+
+## Egress decisions so far (Smokescreen log)
+   3 false mcp.upwork.com:443
+  13 true api.anthropic.com:443
+   1 true api.openai.com:443
+   3 true auth.openai.com:443
+  50 true chatgpt.com:443
+   1 true github.com:443
+   9 true mcp-proxy.anthropic.com:443
+
+## Volume ownership before the switch (read-only mount): every file in both volumes 10001:10001, no fix needed
+## CRM session runtime recreated from the new spec (volume kept)
+before: tandem-rt-a920428549afc1151c5bb905 exited, network tandem-runtimes, no spec label
+after:  /tandem-rt-a920428549afc1151c5bb905 running tandem-net-a920428549afc1151c5bb905 ro=true user=10001:10001 volume=tandem-home-a920428549afc1151c5bb905
+gateway: runtime ready key=a9204285 ms=69
+obsolete non-internal network tandem-runtimes (old compose, no members) removed
+
+## CRM: AGENT_SERVICE_LOCAL=1 bunx vitest run test/agent-service-local.test.ts (env from backend/.env.main, read-only)
+ Test Files  1 passed (1)
+      Tests  3 passed (3)
+demo-user's previous mcp-servers.json (unverifiable under this SERVICE_SECRET, so already ignored: 'mcp registrations ignored (changed outside the gateway)') was replaced by an empty sealed registry by the check above; instructions.md and titles.json untouched.

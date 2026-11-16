@@ -80,18 +80,72 @@ export function dockerClient(host: string) {
         ...(user ? { User: user } : {}),
       },
     );
-    const res = await raw(
-      "POST",
+    const bytes = await hijack(
       `/exec/${Id}/start`,
       JSON.stringify({ Detach: false, Tty: false }),
     );
-    const bytes = new Uint8Array(await res.arrayBuffer());
     const stdout = demux(bytes, 1);
     const info = await json<{ ExitCode: number | null }>(
       "GET",
       `/exec/${Id}/json`,
     );
     return { exitCode: info.ExitCode ?? -1, stdout };
+  }
+
+  /**
+   * Exec output comes over a hijacked connection. Like the Docker CLI, ask for the upgrade
+   * explicitly: the Engine then answers 101 and streams until the command exits, and socket proxies
+   * (Sockguard always upgrades) behave the same way. fetch() cannot read an upgraded connection.
+   */
+  async function hijack(path: string, body: string): Promise<Uint8Array> {
+    const url = new URL(prefix + path);
+    const request =
+      `POST ${url.pathname} HTTP/1.1\r\nHost: docker\r\nContent-Type: application/json\r\n` +
+      `Connection: Upgrade\r\nUpgrade: tcp\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`;
+    const chunks: Uint8Array[] = [];
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`POST ${path}: timed out`)),
+        60_000,
+      );
+      const handlers = {
+        open: (socket: { write(data: string): number }) =>
+          void socket.write(request),
+        data: (socket: { end(): void }, data: Uint8Array) => {
+          chunks.push(new Uint8Array(data));
+          // A stream (101) ends when the Engine closes it; a sized reply ends after Content-Length.
+          const head = Buffer.concat(chunks);
+          const end = head.indexOf("\r\n\r\n");
+          if (head.subarray(9, 12).toString() === "101") return;
+          const length = /\r\ncontent-length: *(\d+)/i.exec(
+            head.subarray(0, Math.max(end, 0)).toString(),
+          );
+          if (end >= 0 && length && head.length >= end + 4 + Number(length[1]))
+            socket.end();
+        },
+        close: () => (clearTimeout(timer), resolve()),
+        error: (_: unknown, e: Error) => (clearTimeout(timer), reject(e)),
+      };
+      const connect = unix
+        ? Bun.connect({ unix, socket: handlers })
+        : Bun.connect({
+            hostname: url.hostname,
+            port: Number(url.port || 80),
+            socket: handlers,
+          });
+      connect.catch(reject);
+    });
+    const all = Buffer.concat(chunks);
+    const end = all.indexOf("\r\n\r\n");
+    const status = Number(
+      all.subarray(0, Math.max(end, 0)).toString().split(" ")[1],
+    );
+    if (end < 0 || !(status === 101 || status === 200))
+      throw new DockerError(
+        status || 502,
+        `POST ${path}: ${status || "no response"}`,
+      );
+    return new Uint8Array(all.subarray(end + 4));
   }
 
   /** Writes one private file into a container (also a stopped one) through the archive API. */

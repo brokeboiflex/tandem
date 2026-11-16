@@ -5,6 +5,9 @@ set -eu
 umask 077
 
 mkdir -p "$HOME/happy/config" "$HOME/.codex" "$HOME/projects/chats" "$HOME/.agent-runtime"
+# The gateway points TMPDIR into the volume: the root filesystem may be read-only, and Happy unpacks
+# its 341 MiB Claude Code binary there (once per volume instead of once per container).
+mkdir -p "${TMPDIR:-/tmp}"
 
 # Install the gateway-owned config. If the person chose their own Anthropic API key (written by
 # the gateway to the private file below), add it to the built-in Claude account as Happy's
@@ -27,6 +30,26 @@ api_key=""
 # runtime.toml that wins over happy.toml. Nothing here uses them, so the controller's policy is
 # re-applied on every start.
 rm -f "$HOME/.happy/agent/runtime.toml"
+
+# MCP servers the application registered for this person (PUT /v1/mcp-servers). The gateway
+# writes a template whose every server is the gateway's MCP proxy; the proxy address and token
+# come from this container's environment. The gateway owns this file: it is rewritten on every
+# start. Application credentials never come here: the proxy adds them on the way out. It is
+# installed into the volume, which stays writable when the root filesystem is read-only.
+mcp_template="$HOME/.agent-runtime/mcp.toml"
+if [ -s "$mcp_template" ] && [ -n "${MCP_PROXY_URL:-}" ]; then
+  sed "s|@MCP_PROXY_URL@|$MCP_PROXY_URL|g" "$mcp_template" > "$HOME/happy/config/mcp.toml"
+else
+  printf '# No MCP servers registered.\n' > "$HOME/happy/config/mcp.toml"
+fi
+
+# Standing instructions (PUT /v1/instructions): the gateway keeps the canonical copy and the
+# chat workspace gets it as AGENTS.md (Codex) and CLAUDE.md (Claude Code), restored on every start.
+instructions="$HOME/.agent-runtime/instructions.md"
+if [ -f "$instructions" ]; then
+  cp "$instructions" "$HOME/projects/chats/AGENTS.md"
+  cp "$instructions" "$HOME/projects/chats/CLAUDE.md"
+fi
 
 # Codex keeps its sign-in in a file inside the volume (no OS keyring in a container).
 if [ ! -e "$HOME/.codex/config.toml" ]; then

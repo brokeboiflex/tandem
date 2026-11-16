@@ -20,15 +20,19 @@ owner-level API, and a friendlier sign-in flow.
 - **The daemon token never leaves the gateway.** Happy's owner token (shutdown, drain, debug, config,
   bots, remote connections) is read once per runtime through the Docker exec API and kept in memory. The
   gateway can send only an allowlisted set of daemon requests (`src/happy.ts`).
-- **Private network, no published ports.** Runtimes join the `tandem-runtimes` network only. Inside
-  each, a tiny `socat` bridge forwards TCP 24790 to the daemon's Unix socket and accepts connections from
-  the gateway's address only; the daemon still requires its token on every request.
+- **A private network per person, no published ports.** Each runtime sits alone on its own internal
+  network with the gateway and the egress proxy (see [Security](#security)). Inside it, a tiny `socat`
+  bridge forwards TCP 24790 to the daemon's Unix socket and accepts connections from the gateway's
+  address only; the daemon still requires its token on every request.
+- **Application credentials stay in gateway memory.** The token your app sends for its own MCP server
+  (`mcpAuth`) is held in the gateway's memory for that person only, never written to the container, a
+  file or a log. The runtime reaches your MCP server only through the gateway's MCP proxy, which accepts
+  a per-runtime token from that runtime's own address and adds the person's latest credential on the way
+  out (see [Connecting your app's MCP server](#connecting-your-apps-mcp-server)).
 - **Hardened defaults.** Built-in admin bot archived on every start, Happy relay/mobile/Tailcat off,
-  sub-agents limited to their own harness (a Claude chat cannot start Codex work), no Linux capabilities,
-  `no-new-privileges`, memory/CPU/process limits.
-
-Containers are not virtual machines. For untrusted workloads run runtimes on a VM-isolated container
-runtime (for example Kata Containers or gVisor) through a different `Runtime` implementation.
+  sub-agents limited to their own harness (a Claude chat cannot start Codex work), gVisor when the host
+  has it, a non-root user without Linux capabilities, `no-new-privileges`, a read-only root filesystem,
+  memory/CPU/process limits and an egress allowlist.
 
 ## Quick start (local)
 
@@ -39,6 +43,7 @@ images. Runtimes build for **linux/arm64** and **linux/amd64**.
 bun install --frozen-lockfile
 docker buildx build --load -t tandem-runtime:2026.11.6-preview.7 runtime   # person runtime, host platform
 docker buildx build --load -t tandem-gateway:0.1.0 .                       # gateway
+docker buildx build --load -t tandem-egress:0.1.0 egress                   # egress proxy (Smokescreen)
 # Both platforms (needs the containerd image store; never push these images):
 #   docker buildx build --platform linux/arm64,linux/amd64 --load -t tandem-runtime:2026.11.6-preview.7 runtime
 cp .env.example .env    # then set AUTH_MODE=dev, DEV_TOKEN_ROUTE=true and two random secrets:
@@ -50,13 +55,18 @@ open http://127.0.0.1:8787/connect                              # demo sign-in p
 Checks:
 
 ```sh
-bun run typecheck && bun test       # unit tests (fixtures from the pinned daemon)
-bun scripts/e2e.ts                  # against the running stack
+bun run typecheck && bun test       # unit tests (fixtures from the pinned daemon, a stub MCP server)
+bun scripts/e2e.ts                  # against the running stack; its stub MCP server needs
+                                    # MCP_ALLOWED_ORIGINS=http://host.docker.internal:8791 in .env
+E2E_REAL_SUBJECT=<person> bun scripts/e2e.ts   # plus real turns, MCP tool calls included, for a person
+                                    # whose volume holds real sign-ins
+bun scripts/e2e-hardening.ts        # proves the protections below against the running stack
 bun scripts/page-check.ts           # drives /connect in headless Chromium, screenshots to evidence/
                                     # (BROWSER_EXECUTABLE=/path/to/chromium if Playwright has none)
 ```
 
-`bun scripts/token.ts <person>` prints a local development token for `curl`.
+`bun scripts/token.ts <person>` prints a local development token for `curl`. `bun scripts/stub-mcp.ts`
+runs the test MCP server on its own (a `lookup_customer` tool that requires `Bearer valid-…`).
 
 ## API
 
@@ -73,11 +83,18 @@ Every `/v1` request needs `Authorization: Bearer <service JWT>`; `sub` is the pe
 | `DELETE /v1/providers/:id` | Signs out with the vendor CLI and removes its credentials from the volume. |
 | `GET /v1/events` | Server-Sent Events for this person only: `provider.updated`, `conversation.run`, `conversation.message`, `conversation.delta`, `conversation.question`. |
 | `POST /v1/conversations` | `{ provider, model, effort?, title? }` → `201 { conversation }`. |
-| `GET /v1/conversations` | `{ conversations }`, newest activity first. |
+| `GET /v1/conversations` | `{ conversations, nextCursor }`, newest activity first. `?limit=` (1-200, default 50), `?cursor=<nextCursor>` for the next page, `?query=` to search titles (case-insensitive). |
+| `PATCH /v1/conversations/:id` | `{ title }` (1-200 characters, or `null` for the generated title) → `{ conversation }`. |
+| `DELETE /v1/conversations/:id` | Archives the conversation → `204`. It leaves every list and takes no messages; Happy keeps its history. |
 | `GET /v1/conversations/:id/messages` | `{ conversation, messages, runs, hasMore, question }`; `?before=<runId>&limit=` pages back. |
-| `POST /v1/conversations/:id/messages` | `{ text, model?, effort? }` → `202 { message, conversation }`. |
+| `POST /v1/conversations/:id/messages` | `{ text, model?, effort?, mcpAuth?, context? }` → `202 { message, conversation }`. `mcpAuth` is `{ "<server name>": "<Authorization header value>" \| null }` for registered MCP servers: held in gateway memory only, latest wins, `null` forgets it, and all are cleared when the runtime stops or the gateway restarts. `context` (at most 16 000 characters) is a hidden preamble for this message only: the agent receives it, but it is never returned as user text by `GET …/messages` or in events. |
 | `POST /v1/conversations/:id/abort` | Stops the current run. |
-| `POST /v1/conversations/:id/questions/:questionId` | `{ answer }`: an option label, a list of labels, or `{ "<promptId>": [...] }`. Used for permission questions. |
+| `POST /v1/conversations/:id/questions/:questionId` | `{ answer }`: an option label, a list of labels, or `{ "<promptId>": [...] }`. Used for permission questions, including those an MCP server asks. |
+| `GET /v1/mcp-servers` | `{ servers: [{ name, url, enabledTools, description, hasCredential }] }`. |
+| `PUT /v1/mcp-servers/:name` | `{ url, enabledTools?, description? }` → `201` (new) or `200 { server }`. Registers a Streamable HTTP MCP server for this person; no credentials here. `name`: a lowercase letter, then up to 31 lowercase letters, digits or `_`. `url`: `http` or `https`, an origin allowed by `MCP_ALLOWED_ORIGINS`. `enabledTools`: only these tools are offered and callable. At most 20 servers. |
+| `DELETE /v1/mcp-servers/:name` | Removes the server and forgets its credential → `204`. |
+| `GET /v1/instructions` | `{ text }`: the person's standing instructions (empty when none). |
+| `PUT /v1/instructions` | `{ text }` (at most 64 000 characters; empty clears them) → `{ text }`. Written into the chat workspace as `AGENTS.md` (Codex) and `CLAUDE.md` (Claude Code), so both harnesses load them in new conversations. |
 
 `connection` is `{ status: "waiting"|"connected"|"failed"|"cancelled"|"expired", flow: "paste_code"|"device_code"|"api_key", url, userCode, expiresAt, error: { code: "wrong_code"|"expired"|"sign_in_failed"|"unavailable"|"invalid_api_key", message }|null, account }`.
 
@@ -108,35 +125,205 @@ Other unauthenticated routes: `GET /healthz`, `GET /connect` (demo page), and `P
 
 `public/connect.html` is a framework-free reference implementation of these screens.
 
+## Connecting your app's MCP server
+
+Your app can give each person's agent its own MCP server (Streamable HTTP), called with **that person's
+own credentials**, so the server enforces exactly what the person may see and do.
+
+1. **Allow the origin.** Set `MCP_ALLOWED_ORIGINS=https://app.example.com` on the gateway. The gateway sends
+   people's credentials to these origins only; nothing can be registered while it is empty.
+2. **Register the server for the person** (no credentials here), for example when they open your chat:
+
+   ```sh
+   curl -X PUT "$TANDEM/v1/mcp-servers/app" -H "authorization: Bearer $SERVICE_JWT" \
+     -H 'content-type: application/json' \
+     -d '{"url":"https://app.example.com/mcp","description":"Our app","enabledTools":["lookup_customer"]}'
+   ```
+
+   The registration is stored in the person's volume, signed by the gateway (a copy edited inside the
+   runtime is ignored), and survives restarts. A change to the servers or `enabledTools` restarts the
+   person's runtime once it is idle, because Happy reads its MCP configuration when it starts. Optionally
+   `PUT /v1/instructions` with standing instructions about your app.
+3. **Send the person's current credential with every message**, exactly the `Authorization` header your
+   MCP server expects, plus any per-message context:
+
+   ```json
+   POST /v1/conversations/:id/messages
+   { "text": "Who is my next client?",
+     "mcpAuth": { "app": "Bearer <the person's current token>" },
+     "context": "The person is on the calendar page, viewing 2026-11-17." }
+   ```
+
+   Send a fresh credential each time: the latest one wins, and Tandem forgets them all when the runtime
+   stops. The agent sees the context in front of the message; the person never sees it in history or
+   events.
+
+The agent calls your tools as `mcp__app__<tool>`. How a call travels:
+
+- Each runtime's `mcp.toml` lists your server as `http://<gateway>:8790/mcp/<runtime id>/app`, where
+  `<gateway>` is the gateway's address on that runtime's own network (never a name, which gVisor cannot
+  resolve, and in `NO_PROXY`, so the call bypasses the egress proxy), authenticated
+  with a per-runtime proxy token from the runtime's environment (`MCP_PROXY_TOKEN`). Your URL and the
+  person's credential never enter the runtime.
+- The proxy accepts a request only with the right token **and** from that runtime's own address on the
+  private network, looks up the person's registration, and forwards the request to your `url` with the
+  person's latest `mcpAuth` value as `Authorization`. JSON responses and SSE streams pass through
+  unchanged, including questions your server asks mid-call (MCP elicitation), which reach the person as
+  permission questions on `GET /v1/events` and are answered through `/v1/.../questions`.
+- Before the first credential arrives, the proxy holds the runtime's MCP handshake (up to about ten
+  minutes) instead of failing it, and a message that brings the credential waits briefly until the tools
+  are listed.
+- With no credential, or when your server answers `401`, the agent's tool call returns the error
+  `Sign-in for <name> expired or is missing. Send a new message to continue.`, which the agent relays; the
+  spent credential is dropped. Your server's `403` becomes `<name> refused this request (access denied).`
+  The proxy never answers `401` to the runtime, so the connection stays usable for the next credential.
+- `enabledTools` is written to Happy's `enabled_tools` and enforced by the proxy as well.
+
+MCP tools need `PERMISSION_MODE=auto` (the default): on Happy Agent 2026.11.6-preview.7 every MCP tool is
+refused in `read_only` and `workspace_write`, even when the person allows the call. In `auto` the harness's
+own reviewer (Claude Code's auto classifier, Codex's Guardian) decides each call; what it hands off becomes
+a permission question.
+
 ## Configuration
 
 All settings are environment variables, documented with defaults in `.env.example`. The important ones:
 `AUTH_MODE` (`oidc` with `OIDC_ISSUER`/`OIDC_AUDIENCE`/`OIDC_JWKS_URL`, or `dev`), `SERVICE_SECRET`,
 `RUNTIME_DOCKER_HOST`, `RUNTIME_IMAGE`, `IDLE_MINUTES` (default 5; a runtime never stops while a run, a
-question or a sign-in is open) and `PERMISSION_MODE` (default `workspace_write`: actions the agent asks
-about become permission questions).
+question or a sign-in is open), `PERMISSION_MODE` (default `auto`, the safest mode in which MCP tools run;
+never use `full_access` for people's chats) and, for application MCP servers, `MCP_ALLOWED_ORIGINS`,
+`MCP_PROXY_PORT` (default 8790, never published) and `MCP_PROXY_URL` (default: the gateway's address on
+each runtime's own network). `RUNTIME_PREFIX` names every container, volume, network and label of one
+instance, so several instances can share a Docker Engine (each with its own directory, `.env`, prefix
+and `GATEWAY_PORT`). The hardening settings are described under [Security](#security).
 
 Each runtime keeps all its state on its volume: Happy's database, the conversations, the vendor sign-ins
 and the agents' working folder. Tandem has no database of its own.
 
-## Security notes
+## Security
 
-- **Docker socket.** The local compose file mounts `/var/run/docker.sock`, which is root on the host. In
-  production put a restricted proxy in front of it, for example
-  [Tecnativa docker-socket-proxy](https://github.com/Tecnativa/docker-socket-proxy) with only
-  `CONTAINERS=1 EXEC=1 VOLUMES=1 POST=1 ALLOW_START=1 ALLOW_STOP=1 ALLOW_RESTARTS=1`, on a network that
-  runtimes cannot reach, and set `RUNTIME_DOCKER_HOST=tcp://socket-proxy:2375`. Such proxies filter by API
-  section, not by request body, so the gateway can still create containers; treat the gateway host as
-  privileged.
+The threat Tandem is built against: an agent with a shell inside its runtime (possibly steered by
+prompt injection) tries to break out to the host, or to reach what it should not over the network.
+Four protections stack up. Each has a safe default, is detected at startup, degrades with a `WARNING:`
+line instead of locking anyone out when the host cannot provide it, and has an explicit setting to
+require it or to relax it. The gateway logs one `security:` line with what it found at startup;
+`GET /healthz` reports the egress mode. `bun scripts/e2e-hardening.ts` proves each one on a running
+stack.
+
+### 1. Sandbox: gVisor when available
+
+`RUNTIME_OCI_RUNTIME=auto` (default) runs runtimes under gVisor (`runsc`) when the Docker Engine
+offers it, so the agent talks to gVisor's user-space kernel instead of the host's. Without it, runtimes
+use the Engine's default (`runc`) and the gateway warns. `default` accepts the Engine default silently;
+any other value (`runsc`, `runsc-kvm`, `kata-runtime`) is required, and the gateway refuses to start
+when the Engine lacks it. Docker Desktop has no gVisor: use a Linux host or VM for it.
+
+Install gVisor on a Linux Docker host (x86_64 or arm64, kernel 5.6+), from
+[gvisor.dev](https://gvisor.dev/docs/user_guide/install/):
+
+```sh
+sudo apt-get update && sudo apt-get install -y apt-transport-https ca-certificates curl gnupg
+curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" \
+  | sudo tee /etc/apt/sources.list.d/gvisor.list > /dev/null
+sudo apt-get update && sudo apt-get install -y runsc    # the package registers runsc in /etc/docker/daemon.json
+sudo systemctl reload docker
+docker info --format '{{json .Runtimes}}'               # must list "runsc"; then restart the gateway
+```
+
+Happy Agent, Claude Code (including its Bash tool) and Codex run under gVisor; Codex's own
+bubblewrap sandbox works there too, while under `runc` it cannot create namespaces (the container
+remains the boundary). Docker's embedded DNS does not answer inside gVisor sandboxes, so runtimes get
+the gateway and the egress proxy by address, never by name. Expect a slower first start of a fresh
+volume (Happy unpacks Claude Code once) and more processes per runtime in `docker stats`.
+
+### 2. Locked-down runtime containers
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `RUNTIME_USER` | `10001:10001` | the image's `agent` user; empty = the image's own user |
+| `RUNTIME_CAP_ADD` | empty | `CapDrop: ALL` always; add back only what you need (comma-separated) |
+| `RUNTIME_NO_NEW_PRIVILEGES` | `true` | setuid binaries cannot raise privileges |
+| `RUNTIME_READ_ONLY_ROOTFS` | `true` | read-only root filesystem; writable: the person's volume (`/home/agent`) and a `noexec` `/tmp` tmpfs of `RUNTIME_TMPFS_MB` (256) |
+| `RUNTIME_MEMORY_MB`, `RUNTIME_CPUS`, `RUNTIME_PIDS` | `2048`, `2`, `512` | `0` lifts a limit |
+
+`TMPDIR` points into the volume (`~/.cache/tmp`), so the 341 MiB Claude Code binary Happy unpacks lands
+there once per person instead of in memory or a container layer. A stopped runtime is recreated when
+any of these settings, the image or its network changes; a running one is never cut off.
+
+### 3. Narrow Docker access for the gateway
+
+The plain Engine socket is root on the host. The gateway detects whether its Docker API is filtered
+and warns when it is not (`RUNTIME_DOCKER_PROXY=auto`); `required` refuses to start without a filter,
+`none` accepts the plain socket silently. The optional filter is
+[Sockguard](https://github.com/CodesWhat/sockguard), a maintained Docker API proxy that inspects
+request bodies (path- or section-based proxies such as Tecnativa's or wollomatic's cannot refuse a
+privileged container):
+
+```sh
+docker compose -f compose.yaml -f compose.socket-proxy.yaml up -d
+```
+
+The gateway then talks to a Unix socket on a private volume (the proxy has no network at all). The
+policy, `deploy/sockguard.yaml`, is default-deny: the gateway may only create, start, stop, inspect,
+exec into and copy files into containers, volumes and networks that carry Tandem's ownership label
+(`<RUNTIME_PREFIX>.home=1`, which every person volume has always had; Sockguard stamps it on whatever
+the gateway creates). It cannot see or touch other containers, run privileged containers, add
+capabilities, share host namespaces or devices, mount host paths, run another image, or exec as root
+or anything but its own few commands. Notes:
+
+- `RUNTIME_IMAGE` must be fully qualified (`docker.io/library/tandem-runtime:…`, the default).
+- If the proxy logs `permission denied on upstream socket`, set
+  `DOCKER_SOCKET_GID=$(stat -c %g /var/run/docker.sock)`. Rootless Docker: set `DOCKER_SOCKET` to
+  `$XDG_RUNTIME_DIR/docker.sock`.
+- Relaxing a runtime setting (another user, capabilities, no limits, another OCI runtime) needs the
+  matching change in `deploy/sockguard.yaml`.
+- Containers created before switching to the proxy lack the label: remove the stopped
+  `<prefix>-rt-*` containers once (they hold no data); volumes keep working.
+
+### 4. Network isolation and egress control
+
+Each runtime gets its own internal Docker network (`<prefix>-net-<id>`) shared only with the gateway
+and the egress proxy: no route out, no access to other runtimes, other apps' containers or the host.
+On Docker Engine 28+ the network is created in isolated gateway mode, so the host has no address on
+it either; older Engines keep one and the gateway warns that services listening on all host
+interfaces are reachable. Networks are removed when a runtime stops. If Docker runs out of address
+pools, runtimes fall back to one shared internal network with a warning
+(`RUNTIME_NETWORK_ISOLATION=auto`; `per_runtime` never falls back, `shared` always shares); enlarge
+`default-address-pools` in `daemon.json` for many concurrent people.
+
+All outbound traffic goes through the egress proxy, Stripe's
+[Smokescreen](https://github.com/stripe/smokescreen) (`egress/`), via `HTTPS_PROXY`/`HTTP_PROXY`, which
+Claude Code, Codex, Happy, git and curl honour (`NO_PROXY` lists the gateway). It allows only the
+hostnames in `egress/allowlist.txt` (Anthropic, OpenAI/ChatGPT, GitHub) and refuses private, loopback,
+link-local and CGNAT addresses in every mode. Vendor telemetry outside the list (for example Datadog
+log intake) is refused.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `EGRESS_MODE` | `auto` | `auto`/`allowlist`: the allowlist; `open`: any public host; `off`: no proxy, runtimes get direct Internet access (and the host and LAN). `auto` falls back to `off` with a warning when the proxy container is missing; an explicit mode is required |
+| `EGRESS_ALLOW_DOMAINS` | empty | extra hostnames, e.g. `registry.npmjs.org,pypi.org,files.pythonhosted.org,git.example.com`; `*.example.com` covers subdomains only |
+| `EGRESS_ALLOW_RANGES` | empty | private CIDRs runtimes may reach anyway, e.g. an internal registry |
+| `EGRESS_PROXY` | `<prefix>-egress:4750` | the egress proxy container and port |
+
+People's MCP servers keep working: runtimes reach them only through the gateway's MCP proxy (the
+gateway's address on the runtime's network, port `MCP_PROXY_PORT`, outside the egress proxy), and the
+gateway makes the upstream calls itself, only to `MCP_ALLOWED_ORIGINS`.
+
+### Other notes
+
 - **Tokens.** Service JWTs are verified on every request; event streams close when the token expires. In
-  production use `AUTH_MODE=oidc`. Development tokens (`AUTH_MODE=dev`) are for local use only.
+  production use `AUTH_MODE=oidc`. Development tokens (`AUTH_MODE=dev`) are for local use only, and
+  `POST /dev/token` refuses requests from runtime networks.
 - **Secrets in transit.** Login codes and API keys pass through the gateway in memory only: they are not
   logged, stored or echoed (unit-tested). Error responses never include request or daemon bodies.
-- **Egress.** Runtimes need outbound HTTPS to the vendors (Anthropic, OpenAI, GitHub for some tools). They
-  should not reach your internal networks: add egress firewall rules or an egress proxy for
-  `tandem-runtimes`. A person's agent can run commands inside their own container.
-- **Images.** Every download in `runtime/Dockerfile` is pinned and checksum-verified. Do not publish
-  runtime images (see Vendor terms).
+- **Application credentials.** `mcpAuth` values live only in the gateway's memory, keyed by person, and go
+  only to that person's registered URL on an allowed origin (no redirects followed). The runtime's proxy
+  token is in its environment, so the person's agent can read it; it is useless elsewhere, because the
+  proxy port is not published and the proxy also checks the caller's address. With it the agent can do
+  what its MCP tools already can. Keep `MCP_ALLOWED_ORIGINS` to your own app: the gateway can reach
+  networks the runtimes cannot.
+- **Images.** Every download in `runtime/Dockerfile` and `egress/Dockerfile` is pinned and
+  checksum-verified; Sockguard is pinned by digest. Do not publish runtime images (see Vendor terms).
 
 ## Vendor terms
 
@@ -158,8 +345,17 @@ package at build time; prebuilt images containing it must not be published. See 
   meant for testing.
 - Happy's `claude_code` harness always starts the Claude Code copy embedded in Happy Agent (byte-identical
   to the official 2.1.321 build) and ignores the `executable` setting in this version.
+- Claude Code and Codex turns with real accounts were not run under gVisor in this release's tests
+  (sign-in flows, Claude Code's Bash tool against a stand-in API and Codex's sandbox were).
 - The Docker runtime controller is for a single host. A Kubernetes implementation of the `Runtime`
   interface (`src/runtime.ts`) is the path to multiple hosts.
+- Happy generates a conversation's title from its first messages, which include that message's
+  `context`; set a `title` (or `PATCH` it) when the context must not show up there. Happy has no rename,
+  so `PATCH` titles are kept by the gateway in the person's volume.
+- MCP server and `enabledTools` changes apply after the automatic idle restart; standing instructions
+  apply to new conversations.
+- The signed registration file can be rolled back by the person's own agent to an earlier version the
+  app registered for that same person; it cannot point anywhere the app did not.
 
 ## License
 

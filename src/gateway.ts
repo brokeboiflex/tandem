@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { devToken, verifier, type Principal } from "./auth";
 import { loadConfig, type Config } from "./config";
 import * as H from "./happy";
+import * as M from "./mcp";
 import { DockerRuntime, runtimeKey, type Runtime } from "./runtime";
 import { sseComment, sseEncode, sseFrames } from "./sse";
 
@@ -25,6 +26,8 @@ class Person {
   starting?: Promise<H.Daemon>;
   stopping?: Promise<void>;
   restarting?: Promise<void>;
+  /** The pending restart reloads vendor accounts (shown as `connecting`), not just config. */
+  accountRestart = false;
   events?: AbortController;
   lastUsed = Date.now();
   clients = new Set<Client>();
@@ -33,6 +36,10 @@ class Person {
   memos: Partial<Record<H.ProviderId, H.CodeMemo>> = {};
   restartedOps = new Set<string>();
   apiKeyFailure?: H.Connection;
+  /** Registered MCP servers and title overrides, read once from the person's volume. */
+  mcpServers?: M.McpServer[];
+  mcpWrites: Promise<unknown> = Promise.resolve();
+  titles?: Record<string, string>;
   ctx: H.EventContext = {
     conversations: new Set(),
     blockTypes: new Map(),
@@ -65,6 +72,20 @@ export function createGateway(
   const emit = (p: Person, event: string, data: unknown) => {
     for (const client of p.clients) client(event, data);
   };
+  // Application credentials for MCP servers live only inside the proxy, never on `Person`.
+  const proxy = new M.McpProxy({
+    secret: cfg.serviceSecret,
+    servers: (key) => serversOf(person(key)),
+    address: (key) => runtime.address(key),
+    fetchImpl: opts.fetchImpl,
+    log,
+  });
+  // Detected protections (src/security.ts); /healthz reports the effective egress mode.
+  let egress: string = cfg.egressMode;
+  void runtime.posture?.().then(
+    (p) => (egress = p.egress),
+    () => {},
+  );
 
   // --- Runtime lifecycle ----------------------------------------------------------------------
 
@@ -169,6 +190,7 @@ export function createGateway(
     p.daemon = undefined;
     p.config = undefined;
     p.clis = {};
+    proxy.clear(p.key);
     log(`runtime ${why} key=${p.key.slice(0, 8)}`);
   }
 
@@ -211,8 +233,16 @@ export function createGateway(
     return false;
   }
 
-  /** Restarts the runtime once it is idle, so harnesses reload credentials and the live model list. */
-  function restartRuntime(p: Person, maxWaitMs: number) {
+  /**
+   * Restarts the runtime once it is idle, so harnesses reload credentials and the live model list
+   * ("account"), or the daemon reads a changed MCP configuration ("config").
+   */
+  function restartRuntime(
+    p: Person,
+    maxWaitMs: number,
+    reason: "account" | "config" = "account",
+  ) {
+    if (reason === "account") p.accountRestart = true;
     return (p.restarting ??= (async () => {
       try {
         for (const id of H.PROVIDER_IDS) void publish(p, id);
@@ -231,6 +261,7 @@ export function createGateway(
       } finally {
         p.starting = undefined;
         p.restarting = undefined;
+        p.accountRestart = false;
         for (const id of H.PROVIDER_IDS) void publish(p, id);
       }
     })());
@@ -249,6 +280,7 @@ export function createGateway(
     p.daemon = undefined;
     p.config = undefined;
     p.clis = {};
+    proxy.clear(p.key); // credentials last only while the runtime runs
     p.stopping = runtime.stop(p.key).finally(() => (p.stopping = undefined));
     await p.stopping;
     log(`runtime stopped key=${p.key.slice(0, 8)} (idle)`);
@@ -270,6 +302,9 @@ export function createGateway(
           log("runtime stop failed", (e as Error).message),
         );
     }
+    await runtime
+      .sweep?.()
+      .catch((e) => log("network sweep failed", (e as Error).message));
     // Adopt runtimes started outside the gateway (manual restart, crash recovery) so they idle out too.
     for (const key of await runtime.listRunning().catch(() => [])) {
       const p = person(key);
@@ -310,7 +345,7 @@ export function createGateway(
       if (p.apiKeyFailure) return p.apiKeyFailure;
     }
     return H.connectionView(id, cli, p.memos[id], {
-      restarting: !!p.restarting,
+      restarting: !!p.restarting && p.accountRestart,
     });
   }
 
@@ -318,7 +353,9 @@ export function createGateway(
     const cli = fresh || !p.clis[id] ? await cliOf(p, id) : p.clis[id];
     const config = await configOf(p);
     return {
-      provider: H.providerView(id, cli, config, { restarting: !!p.restarting }),
+      provider: H.providerView(id, cli, config, {
+        restarting: !!p.restarting && p.accountRestart,
+      }),
       connection: connectionFor(p, id, cli, config),
     };
   }
@@ -345,6 +382,43 @@ export function createGateway(
     }
     return cli;
   }
+
+  // --- Files the gateway keeps in the person's volume ------------------------------------------------
+
+  /** One file from a running runtime; empty when it does not exist (cat exits 1). */
+  async function readFile(p: Person, path: string) {
+    const r = await runtime.exec(p.key, ["cat", path]);
+    if (r.exitCode === 0) return r.stdout;
+    if (r.exitCode === 1) return "";
+    // Killed or never started (the runtime is restarting): never mistake that for an empty file,
+    // which would drop the person's registrations.
+    throw new Error(`reading a runtime file failed (exit ${r.exitCode})`);
+  }
+
+  async function serversOf(p: Person) {
+    if (p.mcpServers) return p.mcpServers;
+    const text = await readFile(p, `${M.MCP_DIR}/${M.REGISTRY_FILE}`);
+    const servers = M.openRegistry(cfg.serviceSecret, p.key, text);
+    if (!servers)
+      log(`mcp registrations ignored (changed outside the gateway) key=${p.key.slice(0, 8)}`);
+    return (p.mcpServers = servers ?? []);
+  }
+
+  async function titlesOf(p: Person) {
+    if (p.titles) return p.titles;
+    let titles: Record<string, string> = {};
+    try {
+      const parsed = JSON.parse((await readFile(p, `${H.RUNTIME_DIR}/${H.TITLES_FILE}`)) || "{}");
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
+        titles = Object.fromEntries(
+          Object.entries(parsed).filter(([, v]) => typeof v === "string"),
+        ) as Record<string, string>;
+    } catch {}
+    return (p.titles = titles);
+  }
+
+  const view = async (p: Person, agent: any, mode: any) =>
+    H.conversationView(agent, mode, (await titlesOf(p))[agent.id]);
 
   // --- /v1 handlers -------------------------------------------------------------------------------
 
@@ -682,17 +756,85 @@ export function createGateway(
     return json({ conversation: H.conversationView(agent, mode) }, 201);
   }
 
-  async function listConversations({ p }: Ctx) {
+  /** Newest activity first; `cursor` continues after the last item of the previous page. */
+  async function listConversations({ p, url }: Ctx) {
+    const limit = Math.min(
+      200,
+      Math.max(1, Number(url.searchParams.get("limit")) || 50),
+    );
+    const query = (url.searchParams.get("query") ?? "").trim().toLowerCase();
+    if (query.length > 200)
+      throw new HttpError(400, "invalid_request", "query must be at most 200 characters");
+    const rawCursor = url.searchParams.get("cursor");
+    const cursor = rawCursor ? H.decodeCursor(rawCursor) : null;
+    if (rawCursor && !cursor)
+      throw new HttpError(400, "invalid_request", "cursor is not valid");
     const d = await daemonFor(p);
     const { project } = await d.call("GET", `/v0/projects/${H.PROJECT_ID}`);
-    const agents = (project.agents ?? []).filter(H.isConversationAgent);
+    const titles = await titlesOf(p);
+    const at = (a: any) => Number(a.lastActivityAt ?? a.createdAt) || 0;
+    const agents = (project.agents ?? [])
+      .filter(H.isConversationAgent)
+      .filter(
+        (a: any) =>
+          !query ||
+          String(titles[a.id] ?? a.title ?? "").toLowerCase().includes(query),
+      )
+      .sort((a: any, b: any) => at(b) - at(a) || (a.id < b.id ? -1 : 1))
+      .filter(
+        (a: any) =>
+          !cursor || at(a) < cursor.at || (at(a) === cursor.at && a.id > cursor.id),
+      );
+    const page = agents.slice(0, limit);
     const views = await Promise.all(
-      agents.map(async (a: any) =>
-        H.conversationView(a, await modeOf(d, a.id)),
-      ),
+      page.map(async (a: any) => view(p, a, await modeOf(d, a.id))),
     );
-    views.sort((a, b) => b.lastActivityAt.localeCompare(a.lastActivityAt));
-    return json({ conversations: views });
+    const last = page.at(-1);
+    return json({
+      conversations: views,
+      nextCursor:
+        agents.length > limit && last ? H.encodeCursor(at(last), last.id) : null,
+    });
+  }
+
+  async function renameConversation({ p, params, body }: Ctx) {
+    const { title } = body;
+    const clean = typeof title === "string" ? title.trim() : title;
+    if (
+      clean !== null &&
+      (typeof clean !== "string" ||
+        !clean ||
+        clean.length > 200 ||
+        /[\u0000-\u001f\u007f]/.test(clean))
+    )
+      throw new HttpError(
+        400,
+        "invalid_request",
+        "title must be 1-200 characters, or null to use the generated title",
+      );
+    const d = await daemonFor(p);
+    const agent = await conversationAgent(d, p, params[0]!);
+    // Happy has no rename: the gateway keeps the person's own titles in their volume.
+    const titles = { ...(await titlesOf(p)) };
+    if (clean === null) delete titles[agent.id];
+    else titles[agent.id] = clean;
+    await runtime.writePrivateFile(
+      p.key,
+      H.RUNTIME_DIR,
+      H.TITLES_FILE,
+      `${JSON.stringify(titles)}\n`,
+    );
+    p.titles = titles;
+    return json({ conversation: await view(p, agent, await modeOf(d, agent.id)) });
+  }
+
+  /** Archives: Happy keeps the history, the conversation leaves every list and takes no messages. */
+  async function archiveConversation({ p, params }: Ctx) {
+    const d = await daemonFor(p);
+    const agent = await conversationAgent(d, p, params[0]!);
+    await d.call("POST", `/v0/agents/${agent.id}/archive`, {});
+    p.ctx.conversations.delete(agent.id);
+    return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
   }
 
   async function getMessages({ p, params, url }: Ctx) {
@@ -719,7 +861,7 @@ export function createGateway(
     });
     const { question } = await d.call("GET", `/v0/agents/${agent.id}/question`);
     return json({
-      conversation: H.conversationView(agent, await modeOf(d, agent.id)),
+      conversation: await view(p, agent, await modeOf(d, agent.id)),
       messages,
       runs,
       hasMore: !!page.hasMore,
@@ -735,6 +877,10 @@ export function createGateway(
         "invalid_request",
         "text must be 1-100000 characters",
       );
+    const auth = parseMcpAuth(body.mcpAuth);
+    const context = parseContext(body.context);
+    // Before the runtime starts: a cold start's MCP connections then find the credential waiting.
+    if (auth) proxy.setCredentials(p.key, auth);
     const d = await daemonFor(p);
     const agent = await conversationAgent(d, p, params[0]!);
     const current = await modeOf(d, agent.id);
@@ -766,8 +912,14 @@ export function createGateway(
         );
       mode = { ...mode, modelId: m.id, effort: e };
     }
+    // A server that was waiting for this credential lists its tools before the turn starts.
+    if (auth) await proxy.settle(p.key, 5000);
     const sent = await d
-      .call("POST", `/v0/agents/${agent.id}/send`, { id: newId(), text, mode })
+      .call("POST", `/v0/agents/${agent.id}/send`, {
+        id: newId(),
+        text: H.withContext(text, context),
+        mode,
+      })
       .catch((e) => {
         // The daemon checks the mode against the live model catalog.
         if (e instanceof H.DaemonError && e.status === 400)
@@ -781,7 +933,7 @@ export function createGateway(
     return json(
       {
         message: H.normalizeMessage(sent.message, null),
-        conversation: H.conversationView(agent, mode),
+        conversation: await view(p, agent, mode),
       },
       202,
     );
@@ -792,12 +944,7 @@ export function createGateway(
     const agent = await conversationAgent(d, p, params[0]!);
     const r = await d.call("POST", `/v0/agents/${agent.id}/abort`, {});
     return json(
-      {
-        conversation: H.conversationView(
-          r.agent ?? agent,
-          await modeOf(d, agent.id),
-        ),
-      },
+      { conversation: await view(p, r.agent ?? agent, await modeOf(d, agent.id)) },
       202,
     );
   }
@@ -831,6 +978,150 @@ export function createGateway(
     return json({ question: H.normalizeQuestion(r.question) });
   }
 
+  /** `{ [server]: "Bearer …" | null }`: the Authorization value the proxy sends upstream. */
+  function parseMcpAuth(raw: unknown): Record<string, string | null> | null {
+    if (raw === undefined || raw === null) return null;
+    const entries =
+      raw && typeof raw === "object" && !Array.isArray(raw)
+        ? Object.entries(raw)
+        : null;
+    if (
+      !entries ||
+      entries.length > M.MAX_SERVERS ||
+      !entries.every(
+        ([name, value]) =>
+          M.isServerName(name) &&
+          (value === null ||
+            (typeof value === "string" &&
+              value.length > 0 &&
+              value.length <= M.MAX_CREDENTIAL &&
+              /^[\x20-\x7e]+$/.test(value))),
+      )
+    )
+      // Never echo the value: it is a credential.
+      throw new HttpError(
+        400,
+        "invalid_request",
+        "mcpAuth must map server names to Authorization header values (or null)",
+      );
+    return Object.fromEntries(entries) as Record<string, string | null>;
+  }
+
+  function parseContext(raw: unknown) {
+    if (raw === undefined || raw === null || raw === "") return "";
+    if (
+      typeof raw !== "string" ||
+      raw.length > H.MAX_CONTEXT ||
+      raw.includes(H.CONTEXT_CLOSE)
+    )
+      throw new HttpError(
+        400,
+        "invalid_request",
+        `context must be text of at most ${H.MAX_CONTEXT} characters`,
+      );
+    return raw;
+  }
+
+  // --- MCP servers and instructions -----------------------------------------------------------------
+
+  const mcpView = (p: Person, s: M.McpServer) => ({
+    ...s,
+    hasCredential: proxy.hasCredential(p.key, s.name),
+  });
+
+  async function listMcpServers({ p }: Ctx) {
+    await daemonFor(p);
+    return json({ servers: (await serversOf(p)).map((s) => mcpView(p, s)) });
+  }
+
+  /** Writes registrations and Happy's config template; restarts when idle if the template changed. */
+  function changeServers(
+    p: Person,
+    change: (servers: M.McpServer[]) => M.McpServer[],
+  ) {
+    const write = p.mcpWrites.then(async () => {
+      await daemonFor(p);
+      const before = await serversOf(p);
+      const after = change(before).sort((a, b) => a.name.localeCompare(b.name));
+      await runtime.writePrivateFile(
+        p.key,
+        M.MCP_DIR,
+        M.REGISTRY_FILE,
+        M.sealRegistry(cfg.serviceSecret, p.key, after),
+      );
+      const template = M.renderMcpToml(after);
+      await runtime.writePrivateFile(p.key, M.MCP_DIR, M.TEMPLATE_FILE, template);
+      p.mcpServers = after;
+      // Happy reads mcp.toml when it starts; the entrypoint installs the template then.
+      if (template !== M.renderMcpToml(before))
+        void restartRuntime(p, 10 * 60_000, "config").catch((e) =>
+          log("config restart failed", (e as Error).message),
+        );
+      return after;
+    });
+    p.mcpWrites = write.catch(() => {});
+    return write;
+  }
+
+  async function putMcpServer({ p, params, body }: Ctx) {
+    const parsed = M.parseServer(params[0]!, body, cfg.mcpAllowedOrigins);
+    if (typeof parsed === "string")
+      throw new HttpError(400, "invalid_request", parsed);
+    let created = false;
+    await changeServers(p, (servers) => {
+      created = !servers.some((s) => s.name === parsed.name);
+      if (created && servers.length >= M.MAX_SERVERS)
+        throw new HttpError(
+          409,
+          "too_many_servers",
+          `At most ${M.MAX_SERVERS} MCP servers can be registered.`,
+        );
+      return [...servers.filter((s) => s.name !== parsed.name), parsed];
+    });
+    return json({ server: mcpView(p, parsed) }, created ? 201 : 200);
+  }
+
+  async function deleteMcpServer({ p, params }: Ctx) {
+    const name = params[0]!;
+    await changeServers(p, (servers) => {
+      if (!servers.some((s) => s.name === name))
+        throw new HttpError(404, "not_found");
+      return servers.filter((s) => s.name !== name);
+    });
+    proxy.setCredentials(p.key, { [name]: null });
+    return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
+  }
+
+  async function getInstructions({ p }: Ctx) {
+    await daemonFor(p);
+    return json({
+      text: await readFile(p, `${H.RUNTIME_DIR}/${H.INSTRUCTIONS_FILE}`),
+    });
+  }
+
+  /** Standing instructions for every conversation: AGENTS.md (Codex) and CLAUDE.md (Claude Code). */
+  async function putInstructions({ p, body }: Ctx) {
+    const { text } = body;
+    if (typeof text !== "string" || text.length > H.MAX_INSTRUCTIONS)
+      throw new HttpError(
+        400,
+        "invalid_request",
+        `text must be at most ${H.MAX_INSTRUCTIONS} characters`,
+      );
+    await daemonFor(p);
+    const files: [string, string][] = [
+      [H.RUNTIME_DIR, H.INSTRUCTIONS_FILE],
+      [H.PROJECT_PATH, "AGENTS.md"],
+      [H.PROJECT_PATH, "CLAUDE.md"],
+    ];
+    if (!text.trim())
+      await runtime.exec(p.key, ["rm", "-f", ...files.map(([dir, name]) => `${dir}/${name}`)]);
+    else
+      for (const [dir, name] of files)
+        await runtime.writePrivateFile(p.key, dir, name, text);
+    return json({ text: text.trim() ? text : "" });
+  }
+
   const routes: [string, RegExp, (c: Ctx) => Response | Promise<Response>][] = [
     ["GET", /^\/v1\/providers$/, listProviders],
     ["POST", /^\/v1\/providers\/(claude|codex)\/connect$/, startConnect],
@@ -841,14 +1132,21 @@ export function createGateway(
     ["GET", /^\/v1\/events$/, events],
     ["POST", /^\/v1\/conversations$/, createConversation],
     ["GET", /^\/v1\/conversations$/, listConversations],
+    ["PATCH", new RegExp(`^/v1/conversations/(${ID})$`), renameConversation],
+    ["DELETE", new RegExp(`^/v1/conversations/(${ID})$`), archiveConversation],
     ["GET", new RegExp(`^/v1/conversations/(${ID})/messages$`), getMessages],
     ["POST", new RegExp(`^/v1/conversations/(${ID})/messages$`), sendMessage],
     ["POST", new RegExp(`^/v1/conversations/(${ID})/abort$`), abort],
     [
       "POST",
-      new RegExp(`^/v1/conversations/(${ID})/questions/(${ID})$`),
+      new RegExp(`^/v1/conversations/(${ID})/questions/(${H.QUESTION_ID})$`),
       answer,
     ],
+    ["GET", /^\/v1\/mcp-servers$/, listMcpServers],
+    ["PUT", new RegExp(`^/v1/mcp-servers/(${M.MCP_NAME})$`), putMcpServer],
+    ["DELETE", new RegExp(`^/v1/mcp-servers/(${M.MCP_NAME})$`), deleteMcpServer],
+    ["GET", /^\/v1\/instructions$/, getInstructions],
+    ["PUT", /^\/v1\/instructions$/, putInstructions],
   ];
 
   async function readJson(req: Request) {
@@ -889,19 +1187,26 @@ export function createGateway(
     });
   }
 
-  async function fetchHandler(req: Request): Promise<Response> {
+  async function fetchHandler(
+    req: Request,
+    server?: { requestIP(req: Request): { address: string } | null },
+  ): Promise<Response> {
     const url = new URL(req.url);
     const path = url.pathname;
     let name = "unmatched";
+    // Runtimes reach the gateway on their private network; they must never mint tokens.
+    const peer = server?.requestIP(req)?.address;
+    const fromRuntime = !!peer && !!runtime.isRuntimeAddress?.(peer);
     try {
       if (req.method === "GET" && path === "/healthz")
-        return json({ ok: true });
+        return json({ ok: true, egress });
       if (req.method === "GET" && path === "/connect") return await page();
       if (
         req.method === "POST" &&
         path === "/dev/token" &&
         cfg.authMode === "dev" &&
-        cfg.devTokenRoute
+        cfg.devTokenRoute &&
+        !fromRuntime
       ) {
         const { subject } = await readJson(req);
         if (
@@ -931,7 +1236,9 @@ export function createGateway(
           401,
         );
       const p = person(runtimeKey(cfg.serviceSecret, principal.subject));
-      const body = req.method === "POST" ? await readJson(req) : {};
+      const body = ["POST", "PUT", "PATCH"].includes(req.method)
+        ? await readJson(req)
+        : {};
       const params = path.match(route[1])!.slice(1);
       const ctx = { p, req, url, params, body, principal };
       const d = p.daemon;
@@ -976,20 +1283,53 @@ export function createGateway(
     }
   }
 
-  return { fetch: fetchHandler, rediscover, idleSweep, people };
+  /** The MCP proxy's own listener: reachable only on the private runtime network. */
+  async function mcpProxy(req: Request, server: any): Promise<Response> {
+    try {
+      return await proxy.handle(req, server);
+    } catch (e) {
+      log("mcp_proxy_failed", (e as Error)?.name ?? "Error");
+      return json({ error: "unavailable" }, 502);
+    }
+  }
+
+  return { fetch: fetchHandler, mcpProxy, rediscover, idleSweep, people };
 }
 
 if (import.meta.main) {
   const cfg = loadConfig();
-  const gateway = createGateway(cfg, new DockerRuntime(cfg));
+  const runtime = new DockerRuntime(cfg);
+  // Each protection is detected before serving; an explicitly required one that this host lacks
+  // stops the gateway here instead of running weaker than configured.
+  const posture = await runtime.posture().catch((e) => {
+    console.error(
+      `startup failed (Docker API ${cfg.dockerHost}): ${(e as Error).message}`,
+    );
+    process.exit(1);
+  });
+  console.log(
+    `security: sandbox=${posture.sandbox} docker_api=${posture.dockerApi} egress=${posture.egress} ` +
+      `network=${posture.network} rootfs=${cfg.runtimeReadOnlyRootfs ? "read-only" : "writable"} ` +
+      `user=${cfg.runtimeUser || "image default"} cap_add=${cfg.runtimeCapAdd.join(",") || "none"} ` +
+      `no_new_privileges=${cfg.runtimeNoNewPrivileges} limits=${cfg.runtimeMemoryMb}MiB/${cfg.runtimeCpus}cpu/${cfg.runtimePids}pids`,
+  );
+  for (const w of posture.warnings) console.warn(`WARNING: ${w}`);
+  const gateway = createGateway(cfg, runtime);
   Bun.serve({
     hostname: cfg.host,
     port: cfg.port,
     fetch: gateway.fetch,
     idleTimeout: 255,
   });
+  // Runtimes reach the MCP proxy on its own port; publish only the API port.
+  Bun.serve({
+    hostname: cfg.host,
+    port: cfg.mcpProxyPort,
+    fetch: gateway.mcpProxy,
+    idleTimeout: 255,
+  });
   console.log(
-    `tandem gateway on ${cfg.host}:${cfg.port} (auth ${cfg.authMode}, idle ${cfg.idleMs / 60_000} min)`,
+    `tandem gateway on ${cfg.host}:${cfg.port}, MCP proxy on port ${cfg.mcpProxyPort} (auth ${cfg.authMode}, idle ${cfg.idleMs / 60_000} min, permission mode ${cfg.permissionMode})`,
   );
   await gateway
     .rediscover()

@@ -7,5 +7,5 @@ RUN bun install --frozen-lockfile --production
 COPY src ./src
 COPY public ./public
 USER bun
-EXPOSE 8787
+EXPOSE 8787 8790
 CMD ["bun", "src/gateway.ts"]

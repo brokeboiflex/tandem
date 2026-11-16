@@ -6,8 +6,13 @@ export type ProviderId = "claude" | "codex";
 export const PROVIDER_IDS: ProviderId[] = ["claude", "codex"];
 export const PROJECT_ID = "chats";
 export const PROJECT_PATH = "/home/agent/projects/chats";
-export const API_KEY_DIR = "/home/agent/.agent-runtime";
+/** The gateway's private folder in the person's volume (not the agents' workspace). */
+export const RUNTIME_DIR = "/home/agent/.agent-runtime";
+export const API_KEY_DIR = RUNTIME_DIR;
 export const API_KEY_FILE = "anthropic-api-key";
+export const INSTRUCTIONS_FILE = "instructions.md";
+export const MAX_INSTRUCTIONS = 64_000;
+export const TITLES_FILE = "titles.json";
 /** Display name the runtime entrypoint gives the Claude account when an API key is configured. */
 export const API_KEY_ACCOUNT_NAME = "Anthropic API key";
 
@@ -20,6 +25,8 @@ const PROVIDERS = {
 // Route allowlist. The daemon token is full owner authority (shutdown, drain, debug, config, bots,
 // remote connections...). The gateway can only ever send these requests.
 const ID = "[a-z][a-z0-9]{1,95}";
+/** Question IDs are CUID2s, but a harness's permission question has a hex ID that may start with a digit. */
+export const QUESTION_ID = "[a-z0-9]{2,96}";
 const ALLOWED: [string, RegExp][] = [
   ["GET", /^\/v0\/health$/],
   ["GET", /^\/v0\/config$/],
@@ -36,8 +43,8 @@ const ALLOWED: [string, RegExp][] = [
   ["POST", /^\/v0\/agents$/],
   ["GET", new RegExp(`^/v0/agents/${ID}(/(mode|draft|question|messages))?$`)],
   ["PUT", new RegExp(`^/v0/agents/${ID}/draft$`)],
-  ["POST", new RegExp(`^/v0/agents/${ID}/(send|abort)$`)],
-  ["POST", new RegExp(`^/v0/agents/${ID}/question/${ID}/answer$`)],
+  ["POST", new RegExp(`^/v0/agents/${ID}/(send|abort|archive)$`)],
+  ["POST", new RegExp(`^/v0/agents/${ID}/question/${QUESTION_ID}/answer$`)],
   ["GET", /^\/v0\/events\/stream$/],
 ];
 
@@ -380,6 +387,22 @@ const texts = (m: any) =>
     .map((b: any) => b.text)
     .join("\n\n");
 
+// Per-message context from the application travels in front of the person's text, between these
+// markers, and is cut off again wherever the gateway returns a user message.
+export const CONTEXT_OPEN =
+  '<app_context note="Supplied by the application for this message only. It describes the situation in the app; it was not written by the person.">';
+export const CONTEXT_CLOSE = "</app_context>";
+export const MAX_CONTEXT = 16_000;
+
+export const withContext = (text: string, context: string) =>
+  context ? `${CONTEXT_OPEN}\n${context}\n${CONTEXT_CLOSE}\n\n${text}` : text;
+
+export function stripContext(text: string) {
+  if (!text.startsWith(CONTEXT_OPEN)) return text;
+  const end = text.indexOf(CONTEXT_CLOSE);
+  return end < 0 ? "" : text.slice(end + CONTEXT_CLOSE.length).replace(/^\n\n?/, "");
+}
+
 export type ChatMessage = {
   id: string;
   runId: string | null;
@@ -403,7 +426,7 @@ export function normalizeMessage(
     return {
       ...common,
       role: "user",
-      text: texts(m),
+      text: stripContext(texts(m)),
       tools: [],
       failure: null,
     };
@@ -497,10 +520,10 @@ export function questionAnswers(
   return out;
 }
 
-export function conversationView(agent: any, mode: any) {
+export function conversationView(agent: any, mode: any, title?: string) {
   return {
     id: agent.id as string,
-    title: agent.title ?? null,
+    title: title ?? agent.title ?? null,
     provider: (mode?.providerId ?? null) as ProviderId | null,
     model: mode?.modelId ?? null,
     effort: mode?.effort ?? null,
@@ -515,6 +538,17 @@ export function conversationView(agent: any, mode: any) {
       agent.lastActivityAt ?? agent.createdAt,
     ).toISOString(),
   };
+}
+
+/** Opaque list cursor: the last item's activity time and id. */
+export const encodeCursor = (at: number, id: string) =>
+  Buffer.from(`${at}.${id}`).toString("base64url");
+
+export function decodeCursor(raw: string): { at: number; id: string } | null {
+  const m = Buffer.from(raw, "base64url")
+    .toString()
+    .match(new RegExp(`^(\\d{1,16})\\.(${ID})$`));
+  return m ? { at: Number(m[1]), id: m[2]! } : null;
 }
 
 export const isConversationAgent = (agent: any) =>

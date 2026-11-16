@@ -5,7 +5,7 @@ import type { Config } from "../src/config";
 import { createGateway } from "../src/gateway";
 import { runtimeKey } from "../src/runtime";
 import { sseFrames } from "../src/sse";
-import { FakeRuntime, GOOD_CODE_PREFIX } from "./fake-daemon";
+import { FakeRuntime, GOOD_CODE_PREFIX, socketProxyPolicy } from "./fake-daemon";
 
 const cfg = {
   port: 0,
@@ -21,6 +21,7 @@ const cfg = {
   runtimeImage: "x",
   runtimeNetwork: "x",
   runtimePrefix: "test",
+  runtimePlatform: "",
   runtimeMemoryMb: 1,
   runtimeCpus: 1,
   runtimePids: 1,
@@ -29,6 +30,9 @@ const cfg = {
   permissionMode: "workspace_write",
   restartAfterSignIn: false,
   devVolumeOverrides: new Map(),
+  mcpProxyPort: 0,
+  mcpProxyUrl: "",
+  mcpAllowedOrigins: [] as string[],
 } as Config;
 
 setDefaultTimeout(30_000);
@@ -444,5 +448,20 @@ describe("conversations and isolation between people", () => {
     expect(a).not.toBe(
       runtimeKey("another-service-secret-of-32-characters", "alice"),
     );
+  });
+});
+
+describe("socket proxy policy (deploy/sockguard.yaml)", () => {
+  test("every command the gateway ran in a runtime and every folder it wrote to is allowlisted", async () => {
+    const policy = await socketProxyPolicy();
+    expect(runtime.execs.length).toBeGreaterThan(0);
+    expect(
+      runtime.execs.filter((c) => !policy.commands.has(JSON.stringify(c))),
+    ).toEqual([]);
+    expect(
+      [...new Set(runtime.files.map((f) => f.dir))].filter(
+        (d) => !policy.paths.includes(d),
+      ),
+    ).toEqual([]);
   });
 });

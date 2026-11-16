@@ -1,0 +1,80 @@
+# Merged MCP + hardening tree, images tandem-{gateway,runtime,egress}:merge-test (gateway 7b707060b5e3, runtime c7c6b3cbf88f, egress fade7c662caa)
+# Lima VM tandem-gv-merge (vz, aarch64, 4 CPU, 8 GiB): Ubuntu 26.04 LTS 7.0.0-28-generic, Docker 29.10.0, runsc release-20261109.0 (gVisor), plain socket, separate compose project RUNTIME_PREFIX=tandem-gv, port 8798, 2026-11-16T18:09:07Z
+
+## bun scripts/e2e-hardening.ts
+PASS  two runtimes start
+PASS  GET /healthz reports the egress mode  (allowlist)
+      security: sandbox=gvisor (runsc) docker_api=unrestricted egress=allowlist network=per_runtime rootfs=read-only user=10001:10001 cap_add=none no_new_privileges=true limits=2048MiB/2cpu/512pids
+      WARNING: The gateway has unrestricted Docker API access, which is root on this host. Use the socket proxy (compose.socket-proxy.yaml, README) or set RUNTIME_DOC
+PASS  gVisor available: the runtime runs under runsc  (runsc)
+PASS  the agent sees gVisor's kernel, not the host's  ([    0.000000] Starting gVisor... | 4.19.0-gvisor)
+PASS  runs as non-root uid 10001
+PASS  no capabilities, not even in the bounding set
+PASS  no-new-privileges is set
+PASS  memory, CPU and pids limits; read-only root; not privileged  (2147483648 2000000000 512 true false)
+PASS  the root filesystem is read-only
+PASS  /tmp is a writable scratch tmpfs
+PASS  /tmp is noexec
+PASS  no Docker socket, mount, chroot, su, sysrq or raw devices
+PASS  shell, file and git tools work in the workspace  (2.1.321 (Claude Code), codex-cli 0.160.1)
+PASS  Happy unpacks Claude Code into TMPDIR on the volume (works with a read-only root)
+      codex's own bwrap sandbox inside the runtime: works
+PASS  plain socket: the gateway reports unrestricted access and warns  (unix:///var/run/docker.sock)
+PASS  each runtime has its own internal network  (tandem-gv-net-f9198961698499d19432c296, internal=true)
+PASS  its only peers are the gateway and the egress proxy  (tandem-gv-egress tandem-gv-gateway tandem-gv-rt-f9198961698499d19432c296)
+PASS  egress to an allowed vendor domain works through the proxy  (CONNECT 200)
+PASS  egress to a domain outside the allowlist is refused  (CONNECT 407)
+PASS  an EGRESS_ALLOW_DOMAINS entry is reachable (registry.npmjs.org)  (CONNECT 200)
+PASS  no direct route out, bypassing the proxy  (000 exit=7)
+PASS  no DNS for outside names inside the runtime
+PASS  the egress proxy refuses private addresses (here the gateway's)  (407 exit=0)
+PASS  control: Bob's listener and the host service answer where they should  (host service on port 18048, reached from an ordinary network via 172.22.0.1)
+PASS  a runtime cannot reach another runtime  (exit=7)
+PASS  a runtime cannot reach other apps' containers  (exit=7)
+PASS  a runtime cannot reach services on the Docker host  (tried 172.22.0.1, 172.17.0.1, host.docker.internal)
+PASS  the Docker API proxy is not reachable from a runtime (no shared network or socket)
+      gateway name from inside the runtime: does not resolve (use its address)
+PASS  the gateway is the runtime's peer (healthz answers directly, NO_PROXY)
+PASS  the runtime reaches the gateway's MCP proxy by address, without the egress proxy  (http://172.20.0.1:8790/mcp/<key>)
+PASS  another runtime cannot reach this runtime's MCP proxy address (directly or through the egress proxy)  (000 exit=7, 407 exit=0)
+PASS  a runtime cannot mint service tokens on the gateway  (404)
+PASS  Claude Code's Bash tool runs in the runtime and writes to the workspace  (TOOL RESULT: shell-tool-ok | 10001 | 4.19.0-gvisor | shell-tool-ok)
+      egress allowed so far: api.anthropic.com:443, chatgpt.com:443, github.com:443, registry.npmjs.org:443
+      egress refused so far: 172.20.0.1:8787, 172.20.0.1:8790, example.com:443, http-intake.logs.us5.datadoghq.com:443
+E2E HARDENING PASSED
+
+## bun scripts/e2e.ts (incl. MCP stub flow, no real accounts)
+PASS  cold start: GET /v1/providers creates and starts a fresh runtime  (8.64 s)
+      claude: not_connected, 0 models
+      codex: not_connected, 0 models
+PASS  warm start: a stopped runtime starts again on the next request  (4.18 s)
+PASS  runtime publishes no host ports
+PASS  runtime bridge accepts only the gateway address  (HAPPY_BRIDGE_ALLOW=172.22.0.1/32)
+PASS  a neighbour container on the runtime network is refused  (curl: (56) Recv failure: Connection reset by peer)
+PASS  claude: connect starts the vendor sign-in  (0.62 s, paste_code, https://claude.com/cai/oauth/authorize?<redacted>, expires 2026-11-16T18:12:10.810Z)
+PASS  claude: SSE reports provider.updated connecting
+PASS  claude: cancel ends the sign-in
+PASS  claude: provider back to not_connected
+PASS  codex: connect starts the vendor sign-in  (0.36 s, device_code, https://auth.openai.com/codex/device, userCode 10 chars, expires 2026-11-16T18:12:11.383Z)
+PASS  codex: SSE reports provider.updated connecting
+PASS  codex: cancel ends the sign-in
+PASS  codex: provider back to not_connected
+PASS  claude: malformed code -> waiting + wrong_code  (That code didn't work. Copy the whole code from the Claude page and paste it again.)
+PASS  claude: code refused by Anthropic -> fresh sign-in, waiting + wrong_code  (That code wasn't accepted. Open the sign-in page again to get a new code, then paste it here.)
+PASS  claude: a bogus API key is refused and removed  (6.71 s)
+PASS  claude: still not connected after the refused key
+PASS  second person: no conversations
+PASS  second person: separate runtime container
+PASS  mcp: PUT registers a server for this person
+PASS  mcp: a non-http(s) url is refused
+PASS  mcp: GET lists the person's own servers only
+PASS  instructions: PUT and GET
+PASS  mcp: the runtime's mcp.toml names only the gateway proxy, never the upstream
+PASS  instructions: AGENTS.md and CLAUDE.md in the chat workspace
+PASS  proxy: an absent or wrong runtime token is refused
+PASS  proxy: its own runtime gets a clear MCP error while no credential was sent  ({"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"Sign-in for stub expired or is missing. Send a new message to continue."}],"isError":true}})
+PASS  proxy: another person's runtime cannot use its own token on this person's path
+PASS  proxy: a leaked runtime token is refused from any other container  (403)
+      idle footprint tandem-gv-rt-c6c98f6c284af20ee4ed19a7: 960.3MiB / 2GiB cpu=1.31% pids=75
+      gateway: 34.71MiB / 7.728GiB cpu=1.93%
+E2E PASSED
