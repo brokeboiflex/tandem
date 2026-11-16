@@ -1,0 +1,9 @@
+node_modules
+work
+evidence
+runtime
+tests
+scripts
+.env
+.docker-config
+.git

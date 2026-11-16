@@ -1,0 +1,27 @@
+# runtime tandem-rt-0c4bd25a5e8be0f2693eead2 (Happy Agent 2026.11.6-preview.7), installed config:
+[providers.claude]
+enabled = true
+executable = "/usr/local/bin/claude"
+
+# process tree after a Claude turn (signed out):
+    6     1 happy-agent run
+# binaries:
+6bea0633074627ba79328e00115ed0588c3acf906a8463612b25db696dbfd3f0  /usr/local/bin/claude
+6bea0633074627ba79328e00115ed0588c3acf906a8463612b25db696dbfd3f0  /tmp/happy-agent-10001/binary-assets/claude-46a9e3144fbb2465c32003ef/claude
+2.1.321 (Claude Code)
+# process tree during the Claude turn:
+
+# process tree during a Claude turn (bogus API key configured so the harness process stays up):
+    7     1 happy-agent run
+# failure: Invalid API key · Fix external API key
+# process tree while Happy verifies the Claude account (same harness spawn path):
+  538     0 /bin/bash /usr/local/bin/happy-api POST /v0/providers/claude/verify {"level":"authentication"}
+# Earlier sample in this session (probe runtime, same image config incl. executable = "/usr/local/bin/claude",
+# bogus API key turn), `ps -eo pid,ppid,rss,args`:
+#     7     1 558004 happy-agent run
+#   253     7 241920 /tmp/happy-agent-10001/binary-assets/claude-46a9e3144fbb2465c32003ef/claude --output-format stream-json --verbose --input-format stream-json --permissi...
+# Cause (pinned source, v2026.11.6-preview.7):
+#   packages/happy-providers/sources/vendors/claudeAgent/claudeAgentConnect.ts:238
+#     pathToClaudeCodeExecutable: resolveClaudeCodeExecutablePath(),   <- the claude_code harness always uses the SDK copy
+#   `executable` is read only by the Happy-loop ClaudeProvider (ClaudeProvider.ts pathToClaudeCodeExecutable), and
+#   [harnesses.happy] is disabled here. The extracted copy is byte-identical to the official npm build (sha256 above).

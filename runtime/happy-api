@@ -1,0 +1,32 @@
+#!/bin/bash
+# happy-api METHOD PATH [BODY]
+#   Calls the local Happy Agent daemon over its owner-only Unix socket.
+#   BODY is a JSON string, or "@-" to read it from stdin (use that for anything secret).
+#   Prints the response body; exits non-zero on HTTP >= 400 (curl --fail-with-body).
+#   HAPPY_API_MAX_TIME overrides the 30 s request limit (e.g. for the SSE event stream).
+# The bearer token is read from the daemon's private token file and handed to curl through a
+# pipe: never through argv, the environment, stdout, or a file of our own.
+set -euo pipefail
+
+method=${1:?usage: happy-api METHOD PATH [BODY|@-]}
+path=${2:?usage: happy-api METHOD PATH [BODY|@-]}
+body=${3:-}
+
+root=${HAPPY_HOME_DIR:-$HOME/.happy}/agent
+sock=$root/server.sock
+token_file=$root/token
+
+if [[ ! -S $sock || ! -r $token_file ]]; then
+  echo "happy-api: daemon socket or token not present yet ($root)" >&2
+  exit 69
+fi
+
+args=(-sS -N --fail-with-body --max-time "${HAPPY_API_MAX_TIME:-30}"
+      --unix-socket "$sock" -X "$method")
+if [[ -n $body ]]; then
+  args+=(-H 'Content-Type: application/json' --data-binary "$body")
+fi
+
+exec curl "${args[@]}" \
+  -H @<(printf 'Authorization: Bearer %s\n' "$(<"$token_file")") \
+  "http://happy-agent$path"

@@ -1,0 +1,7 @@
+PASS  both cards render Not connected
+PASS  Claude opens its sign-in page in a new tab (claude.ai)
+PASS  the code field is focused and labelled
+PASS  a wrong code shows an inline error and keeps the sign-in open
+PASS  Codex shows a 10-character device code, copy button, sign-in link and countdown (reached by keyboard)
+PASS  cancel returns both cards to a Try again state
+PASS  Claude also offers its own API key

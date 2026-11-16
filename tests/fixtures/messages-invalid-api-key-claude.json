@@ -1,0 +1,80 @@
+{
+  "runs": [
+    {
+      "id": "msgkey1",
+      "status": "failed",
+      "reason": "error",
+      "startedAt": 1794834241996,
+      "endedAt": 1794834242693,
+      "usage": {},
+      "costUsd": null,
+      "messages": [
+        {
+          "id": "msgkey1",
+          "role": "user",
+          "createdAt": 1794834241996,
+          "content": [
+            {
+              "type": "text",
+              "text": "Reply with the single word: pong"
+            }
+          ],
+          "metadata": {},
+          "status": "accepted",
+          "delivery": "queue",
+          "mode": {
+            "providerId": "claude",
+            "modelId": "claude-code/haiku",
+            "effort": "low",
+            "serviceTier": null,
+            "permissionMode": "workspace_write"
+          },
+          "profile": null,
+          "runId": "msgkey1"
+        },
+        {
+          "id": "yvaulio4bobda6iqs4c1jdo7",
+          "role": "service",
+          "createdAt": 1794834242687,
+          "content": [
+            {
+              "type": "text",
+              "text": "Invalid API key · Fix external API key"
+            }
+          ],
+          "error": {
+            "code": "inference_failed",
+            "mode": {
+              "providerId": "claude",
+              "modelId": "claude-code/haiku",
+              "effort": "low",
+              "serviceTier": null,
+              "permissionMode": "workspace_write",
+              "providerType": "claude",
+              "account": null
+            },
+            "credentialSource": null,
+            "recovery": {
+              "steps": [
+                "Retry this conversation. If it still fails, ask the person who manages this installation to check the selected provider."
+              ],
+              "actions": [
+                "ask_chief"
+              ]
+            }
+          },
+          "failure": {
+            "fallbackProviders": [],
+            "kind": "internal",
+            "message": "Invalid API key · Fix external API key",
+            "detail": "Invalid API key · Fix external API key"
+          },
+          "metadata": {
+            "providerId": "claude",
+            "modelId": "claude-code/haiku"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,58 @@
+# Machine-wide Happy Agent configuration for ONE person's runtime (standalone, not team mode).
+# The entrypoint installs this file at ~/happy/config/happy.toml on every start, so the gateway
+# owns this policy; the person's state lives on the named volume.
+
+[settings]
+# Happy syncs to its relay/mobile app by default. Off: the gateway is the only client.
+happy_integration = false
+
+# Unattended start: satisfies the profile part of onboarding without a profile API call.
+[profile]
+name = "Tandem user"
+email = "user@tandem.invalid"
+
+[feature.team]
+enabled = false
+
+# No Internet exposure of the API, and no phone pairing socket.
+[feature.tailcat]
+enabled = false
+
+[feature.mobile_connector]
+enabled = false
+
+# Only the two vendor accounts the person signs in to through the vendors' own CLIs.
+[providers]
+default_enable = false
+
+# `executable` names the official Claude Code binary installed in this image (see the harness note
+# below). With no credentials named here the account is the person's own `claude auth login`; the
+# entrypoint adds `api_key` below when the person chose their own Anthropic API key instead.
+[providers.claude]
+enabled = true
+executable = "/usr/local/bin/claude"
+
+[providers.codex]
+enabled = true
+
+# Happy's own agent loop is off: the vendors' unmodified agents run every turn.
+[harnesses.happy]
+enabled = false
+
+# What a new agent gets when a message names nothing. The gateway always sends an explicit mode.
+[defaults]
+provider = "claude"
+model = "claude-code/default"
+permission_mode = "workspace_write"
+
+# Claude Code itself, through the Claude Agent SDK bundled in the Happy Agent binary. Note: in this
+# version the harness always runs that bundled copy; `executable` above is not honored by it.
+# No sub-agents on other harnesses: a Claude conversation must not start Codex work.
+[harnesses.claude_code]
+providers = ["claude"]
+subagent_harnesses = []
+
+# Codex itself, through `codex app-server` (the pinned /usr/local/bin/codex on PATH).
+[harnesses.codex_cli]
+providers = ["codex"]
+subagent_harnesses = []

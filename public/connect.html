@@ -1,0 +1,909 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Connect your AI accounts · Tandem</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #f6f7f9;
+        --card: #fff;
+        --text: #1b1f24;
+        --muted: #59636e;
+        --line: #d8dee4;
+        --accent: #1f6feb;
+        --accent-text: #fff;
+        --ok: #1a7f37;
+        --warn: #9a6700;
+        --bad: #cf222e;
+        --focus: #0969da;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #0d1117;
+          --card: #161b22;
+          --text: #e6edf3;
+          --muted: #9198a1;
+          --line: #30363d;
+          --accent: #2f81f7;
+          --ok: #3fb950;
+          --warn: #d29922;
+          --bad: #f85149;
+          --focus: #58a6ff;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        font:
+          16px/1.5 system-ui,
+          -apple-system,
+          "Segoe UI",
+          sans-serif;
+        background: var(--bg);
+        color: var(--text);
+      }
+      main {
+        max-width: 960px;
+        margin: 0 auto;
+        padding: 32px 20px 48px;
+      }
+      h1 {
+        font-size: 1.6rem;
+        margin: 0 0 4px;
+      }
+      .lede {
+        color: var(--muted);
+        margin: 0 0 24px;
+      }
+      .identity {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: end;
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 16px;
+        margin-bottom: 24px;
+      }
+      .identity label {
+        display: grid;
+        gap: 4px;
+        font-weight: 600;
+        flex: 1 1 260px;
+      }
+      .cards {
+        display: grid;
+        gap: 20px;
+        grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      }
+      .card {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 20px;
+        display: grid;
+        gap: 14px;
+        align-content: start;
+      }
+      .card header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+      }
+      .card h2 {
+        font-size: 1.2rem;
+        margin: 0;
+      }
+      .pill {
+        font-size: 0.8rem;
+        font-weight: 600;
+        border-radius: 999px;
+        padding: 2px 10px;
+        border: 1px solid currentColor;
+        white-space: nowrap;
+      }
+      .pill.connected {
+        color: var(--ok);
+      }
+      .pill.connecting {
+        color: var(--warn);
+      }
+      .pill.not_connected {
+        color: var(--muted);
+      }
+      p {
+        margin: 0;
+      }
+      .muted {
+        color: var(--muted);
+      }
+      ol {
+        margin: 0;
+        padding-left: 1.3em;
+        display: grid;
+        gap: 12px;
+      }
+      input {
+        font: inherit;
+        padding: 8px 10px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--bg);
+        color: var(--text);
+        width: 100%;
+      }
+      button,
+      .button {
+        font: inherit;
+        font-weight: 600;
+        padding: 8px 14px;
+        border-radius: 8px;
+        border: 1px solid var(--line);
+        background: var(--card);
+        color: var(--text);
+        cursor: pointer;
+        text-decoration: none;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+      }
+      button.primary,
+      .button.primary {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: var(--accent-text);
+      }
+      button.danger {
+        color: var(--bad);
+        border-color: var(--bad);
+      }
+      button.link {
+        border: none;
+        background: none;
+        padding: 0;
+        color: var(--accent);
+        font-weight: 500;
+        text-decoration: underline;
+      }
+      button:disabled {
+        opacity: 0.55;
+        cursor: progress;
+      }
+      :focus-visible {
+        outline: 3px solid var(--focus);
+        outline-offset: 2px;
+      }
+      .row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+      }
+      .code {
+        font:
+          700 2rem/1.2 ui-monospace,
+          SFMono-Regular,
+          Menlo,
+          monospace;
+        letter-spacing: 0.12em;
+        padding: 10px 14px;
+        border: 2px dashed var(--line);
+        border-radius: 10px;
+        user-select: all;
+      }
+      .error {
+        color: var(--bad);
+        font-weight: 600;
+      }
+      .ok {
+        color: var(--ok);
+        font-weight: 600;
+      }
+      form {
+        display: grid;
+        gap: 8px;
+      }
+      .visually-hidden {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        clip: rect(0 0 0 0);
+        white-space: nowrap;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Connect your AI accounts</h1>
+      <p class="lede">
+        Sign in with your own Claude and ChatGPT accounts. Your sign-in stays in
+        your private workspace; passwords are entered only on the vendor's own
+        pages.
+      </p>
+
+      <form class="identity" id="identity" aria-label="Who are you?">
+        <label id="identity-label"
+          ><span id="identity-text">Service token</span>
+          <input
+            id="identity-input"
+            autocomplete="off"
+            spellcheck="false"
+            required
+          />
+        </label>
+        <button class="primary" type="submit">Continue</button>
+        <p id="identity-status" class="muted" role="status"></p>
+      </form>
+
+      <section class="cards" aria-label="Accounts">
+        <article
+          class="card"
+          id="card-claude"
+          aria-labelledby="title-claude"
+        ></article>
+        <article
+          class="card"
+          id="card-codex"
+          aria-labelledby="title-codex"
+        ></article>
+      </section>
+      <p class="visually-hidden" aria-live="polite" id="announce"></p>
+    </main>
+    <script nonce="__NONCE__">
+      "use strict";
+      const DEV_TOKENS = __DEV_TOKENS__;
+      const NAMES = { claude: "Claude", codex: "ChatGPT (Codex)" };
+      const VENDOR = { claude: "Claude", codex: "ChatGPT" };
+      const state = { claude: {}, codex: {} }; // { provider, connection, busy, ui }
+      let token = null,
+        listening = null;
+
+      const $ = (id) => document.getElementById(id);
+      function h(tag, attrs = {}, ...children) {
+        const el = document.createElement(tag);
+        for (const [k, v] of Object.entries(attrs)) {
+          if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+          else if (v === true) el.setAttribute(k, "");
+          else if (v !== false && v != null) el.setAttribute(k, v);
+        }
+        for (const c of children.flat())
+          if (c != null && c !== false)
+            el.append(c instanceof Node ? c : String(c));
+        return el;
+      }
+      const announce = (text) => {
+        $("announce").textContent = "";
+        setTimeout(() => ($("announce").textContent = text), 50);
+      };
+
+      async function api(method, path, body) {
+        const res = await fetch(path, {
+          method,
+          headers: {
+            authorization: `Bearer ${token}`,
+            ...(body ? { "content-type": "application/json" } : {}),
+          },
+          body: body ? JSON.stringify(body) : undefined,
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.status === 401) {
+          showIdentity("Your token isn't valid any more. Enter a new one.");
+          throw new Error("unauthorized");
+        }
+        if (!res.ok)
+          throw Object.assign(
+            new Error(
+              data.message || "Something went wrong. Please try again.",
+            ),
+            { code: data.error },
+          );
+        return data;
+      }
+
+      // ---- identity ---------------------------------------------------------------------------------
+      if (DEV_TOKENS) {
+        $("identity-text").textContent =
+          "Your user ID (local development only)";
+        $("identity-input").value = "demo-user";
+      } else {
+        $("identity-input").type = "password";
+      }
+      function showIdentity(message) {
+        $("identity-status").textContent = message;
+        $("identity-input").focus();
+      }
+      $("identity").addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const value = $("identity-input").value.trim();
+        try {
+          if (DEV_TOKENS) {
+            const res = await fetch("/dev/token", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ subject: value }),
+            });
+            if (!res.ok)
+              throw new Error("Use letters, digits, dots, dashes or @.");
+            token = (await res.json()).token;
+          } else {
+            token = value;
+            $("identity-input").value = "";
+          }
+          $("identity-status").textContent = "Loading your accounts…";
+          const { providers } = await api("GET", "/v1/providers");
+          for (const p of providers) {
+            state[p.id].provider = p;
+            render(p.id);
+          }
+          $("identity-status").textContent = DEV_TOKENS
+            ? `Signed in as ${value}.`
+            : "Token accepted.";
+          listen();
+        } catch (err) {
+          if (err.message !== "unauthorized") showIdentity(err.message);
+        }
+      });
+
+      // ---- live updates (fetch-based SSE, so the token stays in a header) ---------------------------
+      async function listen() {
+        listening?.abort();
+        const ac = (listening = new AbortController());
+        while (!ac.signal.aborted) {
+          try {
+            const res = await fetch("/v1/events", {
+              headers: { authorization: `Bearer ${token}` },
+              signal: ac.signal,
+            });
+            if (res.status === 401)
+              return showIdentity("Your token expired. Enter a new one.");
+            const reader = res.body.getReader(),
+              decoder = new TextDecoder();
+            let buffer = "";
+            for (;;) {
+              const { value, done } = await reader.read();
+              if (done) break;
+              buffer += decoder.decode(value, { stream: true });
+              let end;
+              while ((end = buffer.indexOf("\n\n")) >= 0) {
+                const frame = buffer.slice(0, end);
+                buffer = buffer.slice(end + 2);
+                const event = /^event: (.*)$/m.exec(frame)?.[1],
+                  data = /^data: (.*)$/m.exec(frame)?.[1];
+                if (event === "provider.updated" && data) {
+                  const { provider, connection } = JSON.parse(data);
+                  const s = state[provider.id];
+                  const was = s.provider?.status;
+                  s.provider = provider;
+                  s.connection = connection;
+                  if (
+                    was &&
+                    was !== "connected" &&
+                    provider.status === "connected"
+                  )
+                    announce(`${NAMES[provider.id]} is connected.`);
+                  render(provider.id);
+                }
+              }
+            }
+          } catch {
+            /* reconnect below */
+          }
+          if (!ac.signal.aborted) await new Promise((r) => setTimeout(r, 2000));
+        }
+      }
+
+      // ---- actions ----------------------------------------------------------------------------------
+      async function act(id, fn) {
+        const s = state[id];
+        s.busy = true;
+        s.error = null;
+        render(id);
+        try {
+          await fn(s);
+        } catch (err) {
+          if (err.message !== "unauthorized") s.error = err.message;
+        }
+        s.busy = false;
+        render(id);
+      }
+      const connect = (id) =>
+        act(id, async (s) => {
+          // Open the tab inside the click so pop-up blockers allow it; point it at the vendor page below.
+          const tab =
+            id === "claude" ? window.open("about:blank", "_blank") : null;
+          try {
+            const { connection } = await api(
+              "POST",
+              `/v1/providers/${id}/connect`,
+              {},
+            );
+            s.connection = connection;
+            s.ui = null;
+            if (tab && connection.status === "waiting" && connection.url) {
+              tab.opener = null;
+              tab.location.href = connection.url;
+            } else tab?.close();
+            s.focus = id === "claude" ? "code" : "copy";
+          } catch (err) {
+            tab?.close();
+            throw err;
+          }
+        });
+      const submitCode = (id, input) =>
+        act(id, async (s) => {
+          const { connection } = await api(
+            "POST",
+            `/v1/providers/${id}/connect/code`,
+            { code: input.value },
+          );
+          s.connection = connection;
+          if (connection.error?.code === "wrong_code") {
+            s.focus = "code";
+            announce(connection.error.message);
+          } else clearInput(`${id}-code`);
+        });
+      const cancel = (id) =>
+        act(id, async (s) => {
+          s.connection = (
+            await api("DELETE", `/v1/providers/${id}/connect`)
+          ).connection;
+          s.ui = null;
+        });
+      const disconnect = (id) =>
+        act(id, async (s) => {
+          s.provider = (await api("DELETE", `/v1/providers/${id}`)).provider;
+          s.connection = null;
+          s.ui = null;
+          announce(`${NAMES[id]} is disconnected.`);
+          s.focus = "connect";
+        });
+      const saveKey = (id, input) =>
+        act(id, async (s) => {
+          const { connection } = await api(
+            "POST",
+            `/v1/providers/${id}/connect`,
+            { method: "api_key", apiKey: input.value },
+          );
+          clearInput(`${id}-key`);
+          s.connection = connection;
+          if (connection.status === "connected") {
+            s.ui = null;
+            s.provider = (await api("GET", "/v1/providers")).providers.find(
+              (p) => p.id === id,
+            );
+          }
+        });
+
+      // Re-renders replace the card, so clear the live field rather than the one that was submitted.
+      const clearInput = (elementId) => $(elementId) && ($(elementId).value = "");
+
+      // ---- rendering --------------------------------------------------------------------------------
+      function remaining(iso) {
+        const ms = Date.parse(iso) - Date.now();
+        if (!(ms > 0)) return "now";
+        const m = Math.floor(ms / 60000),
+          sec = Math.floor((ms % 60000) / 1000);
+        return `${m}:${String(sec).padStart(2, "0")}`;
+      }
+      function render(id) {
+        const s = state[id],
+          p = s.provider,
+          c = s.connection,
+          card = $(`card-${id}`);
+        const status = p?.status ?? "not_connected";
+        const pillText = {
+          connected: "Connected",
+          connecting: "Connecting…",
+          not_connected: "Not connected",
+        }[status];
+        const body = [];
+        const waiting = c && c.status === "waiting";
+
+        if (!p)
+          body.push(
+            h("p", { class: "muted" }, "Continue above to see this account."),
+          );
+        else if (s.ui === "confirm-disconnect") {
+          body.push(
+            h(
+              "p",
+              {},
+              `Disconnect ${NAMES[id]}? This signs your account out of this workspace and removes its stored sign-in.`,
+            ),
+            h(
+              "div",
+              { class: "row" },
+              h(
+                "button",
+                {
+                  class: "danger",
+                  id: `${id}-confirm`,
+                  disabled: s.busy,
+                  onclick: () => disconnect(id),
+                },
+                s.busy ? "Disconnecting…" : "Disconnect",
+              ),
+              h(
+                "button",
+                {
+                  disabled: s.busy,
+                  onclick: () => {
+                    s.ui = null;
+                    render(id);
+                  },
+                },
+                "Keep connected",
+              ),
+            ),
+          );
+          s.focus ??= "confirm";
+        } else if (s.ui === "api-key") {
+          const input = h("input", {
+            id: `${id}-key`,
+            type: "password",
+            autocomplete: "off",
+            spellcheck: "false",
+            required: true,
+            "aria-describedby": `${id}-key-help`,
+          });
+          body.push(
+            h(
+              "form",
+              {
+                onsubmit: (e) => {
+                  e.preventDefault();
+                  saveKey(id, input);
+                },
+              },
+              h("label", { for: `${id}-key` }, "Anthropic API key"),
+              input,
+              h(
+                "p",
+                { class: "muted", id: `${id}-key-help` },
+                "Create a key at console.anthropic.com. Usage is billed to that key, not to a Claude subscription.",
+              ),
+              h(
+                "div",
+                { class: "row" },
+                h(
+                  "button",
+                  { class: "primary", type: "submit", disabled: s.busy },
+                  s.busy ? "Checking the key…" : "Save key",
+                ),
+                h(
+                  "button",
+                  {
+                    type: "button",
+                    disabled: s.busy,
+                    onclick: () => {
+                      s.ui = null;
+                      render(id);
+                    },
+                  },
+                  "Cancel",
+                ),
+              ),
+            ),
+          );
+          s.focus ??= "key";
+        } else if (waiting && c.flow === "paste_code") {
+          const input = h("input", {
+            id: `${id}-code`,
+            autocomplete: "one-time-code",
+            spellcheck: "false",
+            required: true,
+            "aria-invalid": c.error ? "true" : "false",
+            "aria-describedby": c.error ? `${id}-code-error` : null,
+          });
+          body.push(
+            h(
+              "ol",
+              {},
+              h(
+                "li",
+                {},
+                h(
+                  "p",
+                  {},
+                  "Sign in on the Claude page we opened in a new tab. ",
+                ),
+                c.url
+                  ? h(
+                      "a",
+                      {
+                        class: "button",
+                        href: c.url,
+                        target: "_blank",
+                        rel: "noopener noreferrer",
+                      },
+                      "Open the Claude sign-in page",
+                    )
+                  : h("p", { class: "muted" }, "Preparing the sign-in page…"),
+              ),
+              h(
+                "li",
+                {},
+                h(
+                  "form",
+                  {
+                    onsubmit: (e) => {
+                      e.preventDefault();
+                      submitCode(id, input);
+                    },
+                  },
+                  h(
+                    "label",
+                    { for: `${id}-code` },
+                    "After you approve, Claude shows a code. Copy it and paste it here:",
+                  ),
+                  input,
+                  c.error &&
+                    h(
+                      "p",
+                      { class: "error", id: `${id}-code-error`, role: "alert" },
+                      c.error.message,
+                    ),
+                  h(
+                    "div",
+                    { class: "row" },
+                    h(
+                      "button",
+                      { class: "primary", type: "submit", disabled: s.busy },
+                      s.busy ? "Checking…" : "Submit code",
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            c.expiresAt &&
+              h(
+                "p",
+                { class: "muted" },
+                "This sign-in expires in ",
+                h(
+                  "span",
+                  { "data-countdown": c.expiresAt },
+                  remaining(c.expiresAt),
+                ),
+                ".",
+              ),
+            h(
+              "div",
+              {},
+              h(
+                "button",
+                { disabled: s.busy, onclick: () => cancel(id) },
+                "Cancel sign-in",
+              ),
+            ),
+          );
+        } else if (waiting && c.flow === "device_code") {
+          const copied = h("span", { class: "ok", role: "status" });
+          body.push(
+            h(
+              "ol",
+              {},
+              h(
+                "li",
+                {},
+                h("p", {}, "Copy this code:"),
+                c.userCode
+                  ? h(
+                      "div",
+                      { class: "row" },
+                      h(
+                        "span",
+                        {
+                          class: "code",
+                          "aria-label": `Code ${c.userCode.split("").join(" ")}`,
+                        },
+                        c.userCode,
+                      ),
+                      h(
+                        "button",
+                        {
+                          id: `${id}-copy`,
+                          onclick: async () => {
+                            await navigator.clipboard.writeText(c.userCode);
+                            copied.textContent = "Copied";
+                          },
+                        },
+                        "Copy code",
+                      ),
+                      copied,
+                    )
+                  : h("p", { class: "muted" }, "Getting a code…"),
+              ),
+              h(
+                "li",
+                {},
+                h(
+                  "p",
+                  {},
+                  "Open the sign-in page, sign in with your ChatGPT account and enter the code.",
+                ),
+                c.url &&
+                  h(
+                    "a",
+                    {
+                      class: "button primary",
+                      href: c.url,
+                      target: "_blank",
+                      rel: "noopener noreferrer",
+                    },
+                    "Open sign-in page",
+                  ),
+              ),
+            ),
+            h(
+              "p",
+              { role: "status" },
+              "Waiting for you to confirm… This page updates by itself.",
+            ),
+            c.expiresAt &&
+              h(
+                "p",
+                { class: "muted" },
+                "The code expires in ",
+                h(
+                  "span",
+                  { "data-countdown": c.expiresAt },
+                  remaining(c.expiresAt),
+                ),
+                ".",
+              ),
+            h(
+              "div",
+              {},
+              h(
+                "button",
+                { disabled: s.busy, onclick: () => cancel(id) },
+                "Cancel sign-in",
+              ),
+            ),
+          );
+        } else if (status === "connected") {
+          const a = p.account ?? {};
+          body.push(
+            p.method === "api_key"
+              ? h("p", {}, "Using your own Anthropic API key.")
+              : h(
+                  "p",
+                  {},
+                  "Signed in as ",
+                  h("strong", {}, a.email ?? "your account"),
+                  a.plan ? ` · ${a.plan} plan` : "",
+                ),
+            h(
+              "p",
+              { class: "muted" },
+              `${p.models.length} model${p.models.length === 1 ? "" : "s"} available: ${p.models.map((m) => m.name).join(", ") || "loading…"}`,
+            ),
+            h(
+              "div",
+              {},
+              h(
+                "button",
+                {
+                  class: "danger",
+                  disabled: s.busy,
+                  onclick: () => {
+                    s.ui = "confirm-disconnect";
+                    s.focus = "confirm";
+                    render(id);
+                  },
+                },
+                "Disconnect",
+              ),
+            ),
+          );
+        } else if (status === "connecting") {
+          body.push(h("p", { role: "status" }, "Finishing the connection…"));
+        } else {
+          const result =
+            c &&
+            {
+              expired: "The sign-in timed out. Start again when you're ready.",
+              cancelled: "Sign-in cancelled.",
+              failed: c.error?.message,
+            }[c.status];
+          body.push(
+            h(
+              "p",
+              { class: "muted" },
+              `Use your own ${VENDOR[id]} account. You'll sign in on ${VENDOR[id]}'s own page.`,
+            ),
+            result &&
+              h(
+                "p",
+                {
+                  class: c.status === "cancelled" ? "muted" : "error",
+                  role: c.status === "cancelled" ? "status" : "alert",
+                },
+                result,
+              ),
+            h(
+              "div",
+              { class: "row" },
+              h(
+                "button",
+                {
+                  class: "primary",
+                  id: `${id}-connect`,
+                  disabled: s.busy,
+                  onclick: () => connect(id),
+                },
+                s.busy
+                  ? "Starting…"
+                  : c && c.status !== "connected"
+                    ? "Try again"
+                    : `Connect ${VENDOR[id]}`,
+              ),
+              id === "claude" &&
+                h(
+                  "button",
+                  {
+                    class: "link",
+                    disabled: s.busy,
+                    onclick: () => {
+                      s.ui = "api-key";
+                      s.focus = "key";
+                      render(id);
+                    },
+                  },
+                  "Use your own Anthropic API key",
+                ),
+            ),
+          );
+        }
+        if (s.error)
+          body.push(h("p", { class: "error", role: "alert" }, s.error));
+
+        // Keep what the person is typing (and where) across live updates.
+        const typed = {};
+        for (const el of card.querySelectorAll("input")) typed[el.id] = el.value;
+        const active = card.contains(document.activeElement)
+          ? document.activeElement.id
+          : null;
+        card.replaceChildren(
+          h(
+            "header",
+            {},
+            h("h2", { id: `title-${id}` }, NAMES[id]),
+            h("span", { class: `pill ${status}` }, pillText),
+          ),
+          ...body.filter(Boolean),
+        );
+        const target = {
+          code: `${id}-code`,
+          copy: `${id}-copy`,
+          confirm: `${id}-confirm`,
+          key: `${id}-key`,
+          connect: `${id}-connect`,
+        }[s.focus];
+        for (const [elementId, value] of Object.entries(typed))
+          if ($(elementId) && !$(elementId).value) $(elementId).value = value;
+        if (!target && active && $(active)) $(active).focus();
+        if (target && $(target) && !s.busy) {
+          $(target).focus();
+          if (s.focus === "code") $(target).select();
+          s.focus = null;
+        }
+      }
+      setInterval(() => {
+        for (const el of document.querySelectorAll("[data-countdown]"))
+          el.textContent = remaining(el.dataset.countdown);
+      }, 1000);
+      render("claude");
+      render("codex");
+      if (DEV_TOKENS) $("identity-input").focus();
+    </script>
+  </body>
+</html>

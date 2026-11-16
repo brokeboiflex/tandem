@@ -1,0 +1,104 @@
+{
+  "cursor": "01a1e470-6ed6-7c7b-9792-8cd75b1247bd",
+  "runs": [
+    {
+      "id": "msgtwo1",
+      "status": "failed",
+      "reason": "error",
+      "startedAt": 1794833921236,
+      "endedAt": 1794833936083,
+      "usage": {},
+      "costUsd": null,
+      "messages": [
+        {
+          "id": "msgtwo1",
+          "role": "user",
+          "createdAt": 1794833921236,
+          "content": [
+            {
+              "type": "text",
+              "text": "Reply with the single word: pong"
+            }
+          ],
+          "metadata": {},
+          "status": "accepted",
+          "delivery": "queue",
+          "mode": {
+            "providerId": "codex",
+            "modelId": "codex-cli/gpt-6-luna",
+            "effort": "low",
+            "serviceTier": null,
+            "permissionMode": "workspace_write"
+          },
+          "profile": null,
+          "runId": "msgtwo1"
+        },
+        {
+          "id": "a0a2df21-032d-4462-8995-aefff7c833dc",
+          "role": "service",
+          "createdAt": 1794833921296,
+          "content": [
+            {
+              "type": "configuration",
+              "before": null,
+              "after": {
+                "providerId": "codex",
+                "modelId": "codex-cli/gpt-6-luna",
+                "effort": "low",
+                "serviceTier": null,
+                "permissionMode": "workspace_write",
+                "providerType": "codex",
+                "account": null
+              },
+              "beforeMessageId": "msgtwo1"
+            }
+          ],
+          "metadata": {}
+        },
+        {
+          "id": "bqivow7cuadt8sd8si6iduvt",
+          "role": "service",
+          "createdAt": 1794833936064,
+          "content": [
+            {
+              "type": "text",
+              "text": "unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses, cf-ray: <redacted>WAW, request id: req_<redacted>\n2026-11-16T12:58:41.851614Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 401 Unauthorized, url: wss://api.openai.com/v1/responses\n2026-11-16T12:58:42.367564Z ERROR codex_api::endpoint::responses_websocke…"
+            }
+          ],
+          "error": {
+            "code": "inference_failed",
+            "mode": {
+              "providerId": "codex",
+              "modelId": "codex-cli/gpt-6-luna",
+              "effort": "low",
+              "serviceTier": null,
+              "permissionMode": "workspace_write",
+              "providerType": "codex",
+              "account": null
+            },
+            "credentialSource": null,
+            "recovery": {
+              "steps": [
+                "Retry this conversation. If it still fails, ask the person who manages this installation to check the selected provider."
+              ],
+              "actions": [
+                "ask_chief"
+              ]
+            }
+          },
+          "failure": {
+            "fallbackProviders": [],
+            "kind": "internal",
+            "message": "unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses, cf-ray: <redacted>WAW, request id: req_<redacted>\n2026-11-16T12:58:41.851614Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 401 Unauthorized, url: wss://api.openai.com/v1/responses\n2026-11-16T12:58:42.367564Z ERROR codex_api::endpoint::responses_websocke…",
+            "detail": "unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses, cf-ray: <redacted>WAW, request id: req_<redacted>"
+          },
+          "metadata": {
+            "providerId": "codex",
+            "modelId": "codex-cli/gpt-6-luna"
+          }
+        }
+      ]
+    }
+  ],
+  "hasMore": false
+}
