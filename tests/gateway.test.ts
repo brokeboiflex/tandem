@@ -451,6 +451,130 @@ describe("conversations and isolation between people", () => {
   });
 });
 
+describe("last-known provider state", () => {
+  const listen = async (token: string) => {
+    const ac = new AbortController();
+    const res = await fetch(`${base}/v1/events`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: ac.signal,
+    });
+    const events: { event: string; data: any }[] = [];
+    void (async () => {
+      try {
+        for await (const f of sseFrames(res.body!))
+          events.push({ event: f.event, data: JSON.parse(f.data) });
+      } catch {}
+    })();
+    return { events, close: () => ac.abort() };
+  };
+  const until = async (ok: () => boolean | Promise<boolean>, ms = 5000) => {
+    for (const end = Date.now() + ms; !(await ok()); await Bun.sleep(50))
+      if (Date.now() > end) throw new Error("timed out");
+  };
+  const idleStop = async (key: string) => {
+    gateway.people.get(key)!.lastUsed = 0;
+    await gateway.idleSweep();
+    expect(gateway.people.get(key)!.daemon).toBeUndefined();
+  };
+  const erinKey = runtimeKey(cfg.serviceSecret, "erin");
+  let erin: string;
+
+  test("a stopped runtime answers at once with what it last reported, then starts in the background", async () => {
+    erin = await tokenFor("erin");
+    await call(erin, "POST", "/v1/providers/claude/connect", {});
+    await call(erin, "POST", "/v1/providers/claude/connect/code", {
+      code: `${GOOD_CODE_PREFIX}#state`,
+    });
+    const live = (await call(erin, "GET", "/v1/providers")).body.providers;
+    expect(live[0]).toMatchObject({ id: "claude", status: "connected" });
+    const stream = await listen(erin);
+    await until(() => stream.events.length >= 2);
+    await idleStop(erinKey);
+
+    runtime.startDelayMs = 1500; // a real runtime takes a second or more to start
+    runtime.calls.length = 0;
+    const asked = Date.now();
+    const t0 = performance.now();
+    const r = await call(erin, "GET", "/v1/providers");
+    expect(performance.now() - t0).toBeLessThan(500);
+    expect(r.body.providers.map((p: any) => [p.id, p.status])).toEqual([
+      ["claude", "connected"],
+      ["codex", "not_connected"],
+    ]);
+    expect(r.body.providers[0].models.length).toBeGreaterThan(0);
+    expect(Date.parse(r.body.providers[0].checkedAt)).toBeLessThan(asked);
+    expect(runtime.calls).toEqual([`ensure ${erinKey}`]); // started, not awaited
+
+    // Once it is up, the live state reaches the person's clients.
+    stream.events.length = 0;
+    await until(() =>
+      stream.events.some(
+        (e) =>
+          e.event === "provider.updated" &&
+          Date.parse(e.data.provider.checkedAt) >= asked,
+      ),
+    );
+    stream.close();
+    runtime.startDelayMs = 0;
+    expect(gateway.people.get(erinKey)!.daemon).toBeDefined();
+  });
+
+  test("a turn that finds the sign-in expired makes it not connected, also while stopped, until a new sign-in", async () => {
+    const fake = runtime.daemons.get(erinKey)!;
+    fake.push("message.created", {
+      agentId: "someconversation",
+      runId: "r1",
+      message: {
+        id: "failed1",
+        role: "service",
+        createdAt: Date.now(),
+        content: [{ type: "text", text: "Not logged in · Please run /login" }],
+        error: { code: "inference_failed", mode: { providerId: "claude" } },
+        failure: { kind: "internal", message: "Not logged in · Please run /login" },
+      },
+    });
+    const claude = async () =>
+      (await call(erin, "GET", "/v1/providers")).body.providers[0];
+    await until(async () => (await claude()).status === "not_connected");
+    expect(await claude()).toMatchObject({ method: null, account: null, models: [] });
+    expect(
+      (await call(erin, "GET", "/v1/providers/claude/connect")).body.connection,
+    ).toBeNull();
+
+    await idleStop(erinKey);
+    expect(await claude()).toMatchObject({ status: "not_connected" });
+
+    await call(erin, "POST", "/v1/providers/claude/connect", {});
+    const r = await call(erin, "POST", "/v1/providers/claude/connect/code", {
+      code: `${GOOD_CODE_PREFIX}#again`,
+    });
+    expect(r.body.connection.status).toBe("connected");
+    expect(await claude()).toMatchObject({ status: "connected" });
+  });
+
+  test("after a gateway restart nothing is remembered, so the first answer waits for the runtime", async () => {
+    const restarted = createGateway(cfg, runtime, { log: () => {} });
+    runtime.startDelayMs = 300;
+    const t0 = performance.now();
+    const res = await restarted.fetch(
+      new Request(`${base}/v1/providers`, {
+        headers: { authorization: `Bearer ${erin}` },
+      }),
+    );
+    runtime.startDelayMs = 0;
+    expect(res.status).toBe(200);
+    expect(performance.now() - t0).toBeGreaterThanOrEqual(300);
+  });
+
+  test("what is remembered holds no credentials", () => {
+    const known = JSON.stringify(
+      [...gateway.people.values()].map((p) => p.known),
+    );
+    expect(known).toContain("user@example.com");
+    expect(known).not.toMatch(/sk-ant|SECRET|goodcode|token/i);
+  });
+});
+
 describe("socket proxy policy (deploy/sockguard.yaml)", () => {
   test("every command the gateway ran in a runtime and every folder it wrote to is allowlisted", async () => {
     const policy = await socketProxyPolicy();

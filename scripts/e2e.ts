@@ -119,9 +119,21 @@ check(
 for (const p of providers.body.providers)
   console.log(`      ${p.id}: ${p.status}, ${p.models.length} models`);
 docker("stop", "-t", "30", container(alice.subject)); // as after an idle stop
+const stoppedAt = Date.now();
 t0 = performance.now();
 const warm = await alice.call("GET", "/v1/providers");
-check(warm.status === 200, "warm start: a stopped runtime starts again on the next request", seconds(t0));
+check(
+  warm.status === 200 &&
+    performance.now() - t0 < 500 &&
+    warm.body.providers.every((p: any) => Date.parse(p.checkedAt) < stoppedAt),
+  "stopped runtime: GET /v1/providers answers at once with the last-known state",
+  seconds(t0),
+);
+t0 = performance.now();
+const running = () =>
+  docker("inspect", "-f", "{{.State.Running}}", container(alice.subject)) === "true";
+while (!running() && performance.now() - t0 < 30_000) await Bun.sleep(250);
+check(running(), "…and the runtime starts again in the background", seconds(t0));
 check(
   docker("port", container(alice.subject)) === "",
   "runtime publishes no host ports",

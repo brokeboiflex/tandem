@@ -75,7 +75,7 @@ Every `/v1` request needs `Authorization: Bearer <service JWT>`; `sub` is the pe
 
 | Method and path | Purpose |
 | --- | --- |
-| `GET /v1/providers` | `{ providers: [{ id: "claude"\|"codex", status: "connected"\|"not_connected"\|"connecting", method: "subscription"\|"api_key"\|null, account: { email, plan }\|null, models: [{ id, name, efforts, defaultEffort }] }] }`. Models come from the account's live catalog and are empty until connected. |
+| `GET /v1/providers` | `{ providers: [{ id: "claude"\|"codex", status: "connected"\|"not_connected"\|"connecting", method: "subscription"\|"api_key"\|null, account: { email, plan }\|null, models: [{ id, name, efforts, defaultEffort }], checkedAt }] }`. Models come from the account's live catalog and are empty until connected. `checkedAt` (ISO time) is when this was read from the person's runtime. While the runtime is stopped the answer comes at once from the gateway's memory, with that older `checkedAt`; the runtime starts in the background and `/v1/events` delivers the live state as `provider.updated` once it is up. Only the first request after a gateway restart waits for the runtime. A provider whose turn failed with `signin_required` reports `not_connected` until the person signs in again. |
 | `POST /v1/providers/:id/connect` | Starts the vendor sign-in, answers `{ connection }` once the vendor page is ready. Claude also accepts `{ "method": "api_key", "apiKey": "sk-ant-…" }`. |
 | `GET /v1/providers/:id/connect` | Current `{ connection }` (or `null`). |
 | `POST /v1/providers/:id/connect/code` | `{ code }` from the Claude page. A rejected code answers `status: "waiting"` with `error.code: "wrong_code"`. |
@@ -109,7 +109,9 @@ Other unauthenticated routes: `GET /healthz`, `GET /connect` (demo page), and `P
 
 1. Call `GET /v1/providers` (or open `/v1/events`) when the person opens your settings screen. It starts
    their runtime in the background (about 2 s for a new person, about 1 s for a stopped one), so the
-   sign-in itself starts in well under a second.
+   sign-in itself starts in well under a second. For a stopped runtime the providers answer comes at
+   once from what the gateway last read (`checkedAt`), so show it and apply the `provider.updated` that
+   follows.
 2. **Claude** (`flow: "paste_code"`): open `url` in a new tab. After approving, Claude's page shows a code;
    the person pastes it and you send it to `/connect/code`. A code Claude refuses comes back as
    `wrong_code` with the sign-in still waiting. When Anthropic itself refuses the code, Tandem starts a
@@ -316,6 +318,11 @@ gateway makes the upstream calls itself, only to `MCP_ALLOWED_ORIGINS`.
   `POST /dev/token` refuses requests from runtime networks.
 - **Secrets in transit.** Login codes and API keys pass through the gateway in memory only: they are not
   logged, stored or echoed (unit-tested). Error responses never include request or daemon bodies.
+- **Last-known provider state.** For a stopped runtime the gateway answers `GET /v1/providers` from the
+  views it last read (status, method, account e-mail and plan, models, `checkedAt`), kept in memory per
+  person: no tokens, keys or codes. It is not persisted. After a gateway restart the first request waits
+  for the runtime instead of reading the volume: a stopped runtime's container is removed, so reading
+  its files would mean creating a container just for that, outside the gateway's narrow Docker access.
 - **Application credentials.** `mcpAuth` values live only in the gateway's memory, keyed by person, and go
   only to that person's registered URL on an allowed origin (no redirects followed). The runtime's proxy
   token is in its environment, so the person's agent can read it; it is useless elsewhere, because the

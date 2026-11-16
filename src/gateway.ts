@@ -36,6 +36,13 @@ class Person {
   memos: Partial<Record<H.ProviderId, H.CodeMemo>> = {};
   restartedOps = new Set<string>();
   apiKeyFailure?: H.Connection;
+  /**
+   * The last settled provider views read from the running runtime, with when: what
+   * /v1/providers shows while the runtime is stopped. Views only, never credentials.
+   */
+  known: Partial<Record<H.ProviderId, { view: H.ProviderView; checkedAt: number }>> = {};
+  /** When (daemon time) a turn last failed for want of a provider's sign-in; a newer sign-in clears it. */
+  signinRequired: Partial<Record<H.ProviderId, number>> = {};
   /** Registered MCP servers and title overrides, read once from the person's volume. */
   mcpServers?: M.McpServer[];
   mcpWrites: Promise<unknown> = Promise.resolve();
@@ -202,7 +209,7 @@ export function createGateway(
     if (ev.type === "provider_cli.updated") {
       const cli = ev.payload?.providerCli;
       if (!H.PROVIDER_IDS.includes(cli?.id)) return;
-      p.clis[cli.id as H.ProviderId] = cli;
+      sawCli(p, cli.id, cli);
       if (
         cli.operation?.kind === "sign_in" &&
         cli.operation.status === "succeeded"
@@ -213,6 +220,12 @@ export function createGateway(
       p.config = undefined;
       for (const id of H.PROVIDER_IDS) void publish(p, id);
     } else {
+      // Happy keeps reporting an expired account as signed in; the failed turn is the evidence.
+      const signout = H.signinFailure(ev);
+      if (signout && signout.at >= d.handle.startedAt) {
+        p.signinRequired[signout.provider] = signout.at;
+        void publish(p, signout.provider);
+      }
       for (const f of H.mapEvent(ev, p.ctx)) emit(p, f.type, f.data);
     }
   }
@@ -324,46 +337,88 @@ export function createGateway(
 
   // --- Provider state ---------------------------------------------------------------------------
 
-  async function configOf(p: Person) {
+  /** The person's daemon; with `start` false only one that is up, so nothing is started. */
+  function daemonOf(p: Person, start = true) {
+    if (start || p.daemon) return daemonFor(p);
+    return Promise.reject(new Error("runtime is not running"));
+  }
+
+  async function configOf(p: Person, start = true) {
     return (p.config ??= (
-      await (await daemonFor(p)).call("GET", "/v0/config")
+      await (await daemonOf(p, start)).call("GET", "/v0/config")
     ).config);
   }
 
-  async function cliOf(p: Person, id: H.ProviderId) {
+  async function cliOf(p: Person, id: H.ProviderId, start = true) {
     const { providerCli } = await (
-      await daemonFor(p)
+      await daemonOf(p, start)
     ).call("GET", `/v0/provider-clis/${id}`);
-    return (p.clis[id] = providerCli);
+    return sawCli(p, id, providerCli);
+  }
+
+  /** Every provider CLI state passes here: a sign-in finished after a failed turn clears its verdict. */
+  function sawCli(p: Person, id: H.ProviderId, cli: any) {
+    const op = cli?.operation;
+    if (
+      op?.kind === "sign_in" &&
+      op.status === "succeeded" &&
+      op.finishedAt >= (p.signinRequired[id] ?? Infinity)
+    )
+      delete p.signinRequired[id];
+    return (p.clis[id] = cli);
   }
 
   function connectionFor(p: Person, id: H.ProviderId, cli: any, config: any) {
     const op = cli?.operation?.kind === "sign_in" ? cli.operation : null;
     const signingIn = op && ["running", "waiting"].includes(op.status);
+    const signinRequired = id in p.signinRequired;
     if (id === "claude" && !signingIn) {
-      if (H.usesApiKey(config)) return H.apiKeyConnection("connected");
+      if (H.usesApiKey(config) && !signinRequired)
+        return H.apiKeyConnection("connected");
       if (p.apiKeyFailure) return p.apiKeyFailure;
     }
     return H.connectionView(id, cli, p.memos[id], {
       restarting: !!p.restarting && p.accountRestart,
+      signinRequired,
     });
   }
 
-  async function state(p: Person, id: H.ProviderId, fresh = true) {
-    const cli = fresh || !p.clis[id] ? await cliOf(p, id) : p.clis[id];
-    const config = await configOf(p);
+  async function state(
+    p: Person,
+    id: H.ProviderId,
+    fresh = true,
+    start = true,
+  ) {
+    const cli = fresh || !p.clis[id] ? await cliOf(p, id, start) : p.clis[id];
+    const config = await configOf(p, start);
+    const provider = H.providerView(id, cli, config, {
+      restarting: !!p.restarting && p.accountRestart,
+      signinRequired: id in p.signinRequired,
+    });
+    const checkedAt = Date.now();
+    // Only settled views are remembered: a sign-in in progress ends with its runtime.
+    if (provider.status !== "connecting")
+      p.known[id] = { view: provider, checkedAt };
     return {
-      provider: H.providerView(id, cli, config, {
-        restarting: !!p.restarting && p.accountRestart,
-      }),
+      provider: { ...provider, checkedAt: new Date(checkedAt).toISOString() },
       connection: connectionFor(p, id, cli, config),
     };
   }
 
+  /** The state remembered from the running runtime, marked with when it was read. */
+  function lastKnown(p: Person, id: H.ProviderId) {
+    const { view, checkedAt } = p.known[id]!;
+    return { ...view, checkedAt: new Date(checkedAt).toISOString() };
+  }
+
+  /**
+   * Sends the live state to the person's clients. Without a client it only refreshes the
+   * last-known state from a runtime that is up: nothing is started just to remember it.
+   */
   async function publish(p: Person, id: H.ProviderId) {
-    if (!p.clients.size) return;
-    const s = await state(p, id, false).catch(() => null);
-    if (s) emit(p, "provider.updated", s);
+    const clients = p.clients.size > 0;
+    const s = await state(p, id, false, clients).catch(() => null);
+    if (s && clients) emit(p, "provider.updated", s);
   }
 
   async function waitOp(
@@ -431,7 +486,20 @@ export function createGateway(
     principal: Principal;
   };
 
+  /**
+   * A stopped runtime answers at once with the last-known state (`checkedAt` says when it was read)
+   * and starts in the background, so a message sent next finds it up; clients on /v1/events then
+   * get the live state as `provider.updated`. Nothing is known before the first answer after a
+   * gateway start, so that one waits for the runtime.
+   */
   async function listProviders({ p }: Ctx) {
+    if (!p.daemon && !p.restarting && H.PROVIDER_IDS.every((id) => p.known[id])) {
+      void daemonFor(p).then(
+        () => H.PROVIDER_IDS.forEach((id) => void publish(p, id)),
+        (e) => log("background start failed", (e as Error).message),
+      );
+      return json({ providers: H.PROVIDER_IDS.map((id) => lastKnown(p, id)) });
+    }
     const states = await Promise.all(H.PROVIDER_IDS.map((id) => state(p, id)));
     return json({ providers: states.map((s) => s.provider) });
   }
@@ -506,6 +574,8 @@ export function createGateway(
       .catch(() => null);
     if (verdict?.status === "passed") {
       p.apiKeyFailure = undefined;
+      delete p.signinRequired.claude;
+      void publish(p, "claude");
       return H.apiKeyConnection("connected");
     }
     await runtime.exec(p.key, [
@@ -603,7 +673,7 @@ export function createGateway(
     const { providerCli } = await (
       await daemonFor(p)
     ).call("POST", `/v0/provider-clis/${id}/cancel`, {});
-    p.clis[id] = providerCli;
+    sawCli(p, id, providerCli);
     delete p.memos[id];
     return json({
       connection: connectionFor(p, id, providerCli, await configOf(p)),
@@ -622,6 +692,7 @@ export function createGateway(
         : `codex logout >/dev/null 2>&1; rm -f "$HOME/.codex/auth.json"`;
     await runtime.exec(p.key, ["sh", "-c", script]);
     delete p.memos[id];
+    delete p.signinRequired[id];
     p.apiKeyFailure = undefined;
     await restartRuntime(p, 2 * 60_000); // warm harness processes must drop the old sign-in
     return json({ provider: (await state(p, id)).provider });

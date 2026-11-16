@@ -173,11 +173,15 @@ export function usesApiKey(config: any) {
   return config?.providers?.claude?.name === API_KEY_ACCOUNT_NAME;
 }
 
+/**
+ * `signinRequired`: a turn has since failed for want of this sign-in (Happy keeps reporting the
+ * account as signed in), so it counts as not connected until the person signs in again.
+ */
 export function providerView(
   id: ProviderId,
   cli: any,
   config: any,
-  opts: { restarting?: boolean } = {},
+  opts: { restarting?: boolean; signinRequired?: boolean } = {},
 ) {
   const op = cli?.operation?.kind === "sign_in" ? cli.operation : null;
   const apiKey = id === "claude" && usesApiKey(config);
@@ -185,7 +189,7 @@ export function providerView(
   let status: "connected" | "not_connected" | "connecting" = "not_connected";
   if (opts.restarting || (op && ["running", "waiting"].includes(op.status)))
     status = "connecting";
-  else if (apiKey || signedIn) status = "connected";
+  else if ((apiKey || signedIn) && !opts.signinRequired) status = "connected";
   return {
     id,
     status,
@@ -202,6 +206,8 @@ export function providerView(
     models: status === "connected" ? liveModels(config, id) : [],
   };
 }
+
+export type ProviderView = ReturnType<typeof providerView>;
 
 /** Lines the CLI printed since a snapshot. The output is a sliding window of the last 20 lines. */
 export function newLines(before: string[], after: string[]): string[] {
@@ -227,7 +233,7 @@ export function connectionView(
   id: ProviderId,
   cli: any,
   memo: CodeMemo | undefined,
-  opts: { restarting?: boolean; now?: number } = {},
+  opts: { restarting?: boolean; signinRequired?: boolean; now?: number } = {},
 ): Connection | null {
   const now = opts.now ?? Date.now();
   const op = cli?.operation?.kind === "sign_in" ? cli.operation : null;
@@ -244,7 +250,7 @@ export function connectionView(
     plan: cli.signIn?.account?.plan ?? null,
   });
   if (!op)
-    return cli?.signIn?.status === "signed_in"
+    return cli?.signIn?.status === "signed_in" && !opts.signinRequired
       ? { ...base, status: "connected", account: account() }
       : null;
   const wrong = memo && memo.opId === op.id && memo.wrong;
@@ -277,6 +283,8 @@ export function connectionView(
       };
     }
     case "succeeded":
+      // Older than the failed turn that found this sign-in expired (newer ones clear the verdict).
+      if (opts.signinRequired) return null;
       return opts.restarting
         ? { ...base, status: "waiting" }
         : { ...base, status: "connected", account: account() };
@@ -379,6 +387,23 @@ export function classifyFailure(failure: any, providerId?: string): Failure {
         ? String(failure.message).slice(0, 300)
         : "The assistant couldn't finish this reply. Please try again.",
   };
+}
+
+/**
+ * The provider whose sign-in a turn just found missing or expired: a service message with a
+ * `signin_required` failure, at the daemon's time. Null for every other event.
+ */
+export function signinFailure(ev: {
+  type: string;
+  payload: any;
+}): { provider: ProviderId; at: number } | null {
+  const m = ev.payload?.message;
+  if (!["message.created", "message.updated"].includes(ev.type)) return null;
+  if (m?.role !== "service" || !m.failure) return null;
+  const provider = m.error?.mode?.providerId ?? m.failure?.provider?.id;
+  if (!PROVIDER_IDS.includes(provider)) return null;
+  if (classifyFailure(m.failure, provider).code !== "signin_required") return null;
+  return { provider, at: Number(m.createdAt) || Date.now() };
 }
 
 const texts = (m: any) =>

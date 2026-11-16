@@ -285,6 +285,8 @@ export class FakeRuntime implements Runtime {
   failReads?: number;
   /** Source address a runtime's requests come from; tests change it to play a neighbour. */
   addresses = new Map<string, string>();
+  /** How long starting a runtime takes (a real one takes a second or more). */
+  startDelayMs = 0;
   private token = "t".repeat(43);
 
   private handle(key: string): RuntimeHandle {
@@ -294,6 +296,7 @@ export class FakeRuntime implements Runtime {
   }
   async ensure(key: string) {
     this.calls.push(`ensure ${key}`);
+    await Bun.sleep(this.startDelayMs);
     return this.handle(key);
   }
   async restart(key: string) {

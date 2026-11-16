@@ -83,6 +83,21 @@ describe("live model catalog", () => {
     expect(view.method).toBe("subscription");
     expect(view.account).toEqual({ email: "user@example.com", plan: "Free" });
     expect(view.models.map((m) => m.id)).toEqual(["codex-cli/gpt-6-luna"]);
+    // A turn has since found the sign-in expired: not connected, though Happy still says signed in.
+    expect(
+      H.providerView("codex", signedIn, codexFreeConfig, {
+        signinRequired: true,
+      }),
+    ).toEqual({
+      id: "codex",
+      status: "not_connected",
+      method: null,
+      account: null,
+      models: [],
+    });
+    expect(
+      H.connectionView("codex", signedIn, undefined, { signinRequired: true }),
+    ).toBeNull();
   });
 
   test("a sign-in in progress or a post-sign-in restart reads as connecting", () => {
@@ -427,6 +442,26 @@ describe("event mapping", () => {
       conversationId: "probeclaude1",
       run: { status: "failed", failure: { code: "signin_required" } },
     });
+  });
+
+  test("only the failed turn of real signed-out events names the provider to sign in again", async () => {
+    const events = (
+      await Bun.file(
+        `${import.meta.dir}/fixtures/events-signed-out-claude.jsonl`,
+      ).text()
+    )
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l));
+    expect(events.map(H.signinFailure)).toEqual([
+      null,
+      null,
+      null,
+      null,
+      null,
+      { provider: "claude", at: events[5].payload.message.createdAt },
+      null,
+    ]);
   });
 
   test("assistant text deltas pass, reasoning deltas and unknown conversations do not", () => {
