@@ -1,7 +1,8 @@
 // End-to-end check against a running stack (docker compose up). Uses the Docker CLI on the host only
 // to measure footprint and to force-stop a runtime; everything else goes through the /v1 façade.
 //
-//   bun scripts/e2e.ts                      sign-in flows, wrong codes, isolation, cold start, footprint
+//   bun scripts/e2e.ts                      sign-in flows, wrong codes, isolation, cold start, footprint;
+//                                           restarts the gateway container once (reads after a restart)
 //   E2E_REAL_SUBJECT=<subject> bun scripts/e2e.ts
 //                                           also real turns for that subject's signed-in accounts (its runtime
 //                                           volume must hold real logins, e.g. through DEV_VOLUME_OVERRIDES),
@@ -74,11 +75,14 @@ async function client(subject: string) {
     };
   };
   const events: { event: string; data: any }[] = [];
-  const ac = new AbortController();
+  let ac: AbortController | undefined;
+  /** Opens the person's event stream, as an app does when its UI opens: this starts the runtime. */
   const listen = async () => {
+    ac?.abort();
+    const own = (ac = new AbortController());
     const res = await fetch(`${BASE}/v1/events`, {
       headers: { authorization: `Bearer ${token}` },
-      signal: ac.signal,
+      signal: own.signal,
     });
     void (async () => {
       try {
@@ -87,7 +91,18 @@ async function client(subject: string) {
       } catch {}
     })();
   };
-  return { subject, call, events, listen, close: () => ac.abort() };
+  /** The live state of both providers, which the stream sends once the runtime is up. */
+  const live = (since = 0, ms = 90_000) =>
+    waitFor(() => {
+      const latest = new Map<string, any>();
+      for (const e of events.slice(since))
+        if (e.event === "provider.updated")
+          latest.set(e.data.provider.id, e.data.provider);
+      return latest.size >= 2
+        ? [...latest.values()].sort((a, b) => a.id.localeCompare(b.id))
+        : undefined;
+    }, ms);
+  return { subject, call, events, listen, live, close: () => ac?.abort() };
 }
 type Client = Awaited<ReturnType<typeof client>>;
 
@@ -105,20 +120,100 @@ async function waitFor<T>(
   }
 }
 
-// --- 1. Cold start, provider status, footprint ----------------------------------------------------
+// --- 1. Reads never start a runtime; opening the event stream does ------------------------------
 const alice = await client(`e2e-alice-${run}`);
 const bob = await client(`e2e-bob-${run}`);
+// The Docker Engine API on the host, read directly: inspecting and following events through the CLI
+// is too slow to time a start.
+const dockerSocket = (process.env.DOCKER_HOST ?? "").startsWith("unix://")
+  ? process.env.DOCKER_HOST!.slice(7)
+  : "/var/run/docker.sock";
+const engine = (path: string, signal?: AbortSignal) =>
+  fetch(`http://docker${path}`, { unix: dockerSocket, signal } as RequestInit);
+/** The runtime container's state: null while it does not exist. */
+const containerState = async (subject: string) => {
+  const res = await engine(`/containers/${container(subject)}/json`);
+  return res.ok ? ((await res.json()) as any).State : null;
+};
+const running = async (subject: string) =>
+  (await containerState(subject))?.Running === true;
+const allUnknown = (r: { status: number; body: any }) =>
+  r.status === 200 &&
+  r.body.providers.length === 2 &&
+  r.body.providers.every((p: any) => p.status === "unknown" && p.checkedAt === null);
+/** Engine events about one person's runtime (network, volume, container), as they arrive here. */
+async function watchRuntime(subject: string) {
+  const key = runtimeKey(serviceSecret, subject);
+  const seen: { at: number; what: string }[] = [];
+  const ac = new AbortController();
+  const res = await engine("/events", ac.signal);
+  void (async () => {
+    const decoder = new TextDecoder();
+    let buffer = "";
+    try {
+      for await (const chunk of res.body!) {
+        buffer += decoder.decode(chunk, { stream: true });
+        for (let nl; (nl = buffer.indexOf("\n")) >= 0; ) {
+          const ev = JSON.parse(buffer.slice(0, nl));
+          buffer = buffer.slice(nl + 1);
+          const name = ev.Actor?.Attributes?.name ?? ev.Actor?.ID ?? "";
+          if (name.includes(key))
+            seen.push({ at: performance.now(), what: `${ev.Type} ${ev.Action}` });
+        }
+      }
+    } catch {}
+  })();
+  return { seen, stop: () => ac.abort() };
+}
+/** Opens the stream; reports when Docker began the start, when the container ran and the live state came. */
+async function wakeAndTime(c: Client) {
+  const watch = await watchRuntime(c.subject);
+  const since = c.events.length;
+  const t0 = performance.now();
+  await c.listen();
+  const state = await c.live(since);
+  const live = state ? performance.now() - t0 : undefined;
+  watch.stop();
+  const first = watch.seen[0];
+  const started = watch.seen.find((e) => e.what === "container start");
+  return {
+    first: first && first.at - t0,
+    firstWhat: first?.what,
+    started: started && started.at - t0,
+    live,
+    state,
+  };
+}
+const ms = (v?: number) => (v === undefined ? "never" : `${v.toFixed(0)} ms`);
+
 let t0 = performance.now();
-const providers = await alice.call("GET", "/v1/providers");
-const cold = seconds(t0);
+let r = await alice.call("GET", "/v1/providers");
+check(allUnknown(r), "new person: GET /v1/providers answers `unknown` at once", seconds(t0));
+r = await alice.call("GET", "/v1/conversations");
 check(
-  providers.status === 200 && providers.body.providers.length === 2,
-  "cold start: GET /v1/providers creates and starts a fresh runtime",
-  cold,
+  r.status === 409 && r.body?.error === "runtime_stopped",
+  "new person: other reads answer 409 runtime_stopped",
 );
-for (const p of providers.body.providers)
+await Bun.sleep(2000);
+check((await containerState(alice.subject)) === null, "…and no runtime is created");
+let woke = await wakeAndTime(alice);
+check(
+  woke.first !== undefined && woke.first < 500 && woke.started !== undefined,
+  "cold start: opening /v1/events starts creating a fresh runtime at once",
+  `${woke.firstWhat} after ${ms(woke.first)}, container started after ${ms(woke.started)}`,
+);
+check(
+  !!woke.state && woke.state.every((p: any) => p.status !== "unknown"),
+  "cold start: the live state arrives over the stream",
+  `${ms(woke.live)} after opening`,
+);
+for (const p of woke.state ?? [])
   console.log(`      ${p.id}: ${p.status}, ${p.models.length} models`);
-docker("stop", "-t", "30", container(alice.subject)); // as after an idle stop
+
+// The UI closes, then the runtime stops (as after an idle stop): reads still start nothing.
+alice.close();
+await Bun.sleep(500);
+docker("stop", "-t", "30", container(alice.subject));
 const stoppedAt = Date.now();
 t0 = performance.now();
 const warm = await alice.call("GET", "/v1/providers");
@@ -129,11 +224,44 @@ check(
   "stopped runtime: GET /v1/providers answers at once with the last-known state",
   seconds(t0),
 );
+await Bun.sleep(3000);
+check(!(await running(alice.subject)), "stopped runtime: …and starts nothing");
+
+// After a gateway restart nothing is remembered: `unknown`, and still nothing started.
+docker("restart", "-t", "10", `${PREFIX}-gateway`);
+await waitFor(
+  () => fetch(`${BASE}/healthz`).then((res) => res.ok, () => false),
+  60_000,
+);
 t0 = performance.now();
-const running = () =>
-  docker("inspect", "-f", "{{.State.Running}}", container(alice.subject)) === "true";
-while (!running() && performance.now() - t0 < 30_000) await Bun.sleep(250);
-check(running(), "…and the runtime starts again in the background", seconds(t0));
+r = await alice.call("GET", "/v1/providers");
+check(allUnknown(r), "after a gateway restart: GET /v1/providers answers `unknown` at once", seconds(t0));
+await Bun.sleep(3000);
+check(!(await running(alice.subject)), "after a gateway restart: …and starts nothing");
+woke = await wakeAndTime(alice);
+check(
+  woke.started !== undefined && woke.first !== undefined && woke.first < 500,
+  "stopped runtime: opening /v1/events starts it at once",
+  `${woke.firstWhat} after ${ms(woke.first)}, container started after ${ms(woke.started)}`,
+);
+check(
+  !!woke.state && woke.state.every((p: any) => p.status !== "unknown") && (await running(alice.subject)),
+  "stopped runtime: the live state arrives over the stream",
+  `${ms(woke.live)} after opening`,
+);
+// With the stream open, a runtime stopped behind the gateway's back is restarted at once and the
+// live state comes again on the same stream (a restart waits for the container to finish stopping).
+{
+  const since = alice.events.length;
+  t0 = performance.now();
+  docker("stop", "-t", "10", container(alice.subject));
+  const again = await alice.live(since, 120_000);
+  check(
+    !!again && (await running(alice.subject)),
+    "open stream: a runtime stopped outside the gateway is restarted and reports live again",
+    `${seconds(t0)} after the stop`,
+  );
+}
 check(
   docker("port", container(alice.subject)) === "",
   "runtime publishes no host ports",
@@ -177,7 +305,6 @@ check(
 );
 
 // --- 2. Connect -> cancel for both providers ---------------------------------------------------------
-await alice.listen();
 for (const id of ["claude", "codex"]) {
   t0 = performance.now();
   const start = await alice.call("POST", `/v1/providers/${id}/connect`, {});
@@ -214,7 +341,7 @@ for (const id of ["claude", "codex"]) {
 // --- 3. Wrong Claude codes ---------------------------------------------------------------------------
 let start = (await alice.call("POST", "/v1/providers/claude/connect", {})).body
   .connection;
-let r = await alice.call("POST", "/v1/providers/claude/connect/code", {
+r = await alice.call("POST", "/v1/providers/claude/connect/code", {
   code: "notarealcode123",
 });
 check(
@@ -255,6 +382,8 @@ check(
 );
 
 // --- 5. A second person sees nothing of the first ----------------------------------------------------
+await bob.listen();
+await bob.live();
 const bobList = await bob.call("GET", "/v1/conversations");
 check(
   bobList.status === 200 && bobList.body.conversations.length === 0,
@@ -350,7 +479,7 @@ const realSubject = process.env.E2E_REAL_SUBJECT;
 if (realSubject) {
   const real = await client(realSubject);
   await real.listen();
-  const status = (await real.call("GET", "/v1/providers")).body.providers;
+  const status = (await real.live()) ?? [];
   const cheap: Record<string, string[]> = {
     claude: ["claude-code/haiku", "claude-code/sonnet"],
     codex: ["codex-cli/gpt-6-luna"],

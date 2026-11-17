@@ -114,7 +114,8 @@
       .pill.connecting {
         color: var(--warn);
       }
-      .pill.not_connected {
+      .pill.not_connected,
+      .pill.unknown {
         color: var(--muted);
       }
       p {
@@ -385,6 +386,7 @@
                   if (
                     was &&
                     was !== "connected" &&
+                    was !== "unknown" &&
                     provider.status === "connected"
                   )
                     announce(`${NAMES[provider.id]} is connected.`);
@@ -502,6 +504,7 @@
           connected: "Connected",
           connecting: "Connecting…",
           not_connected: "Not connected",
+          unknown: "Checking…",
         }[status];
         const body = [];
         const waiting = c && c.status === "waiting";
@@ -806,6 +809,9 @@
           );
         } else if (status === "connecting") {
           body.push(h("p", { role: "status" }, "Finishing the connection…"));
+        } else if (status === "unknown") {
+          // Not read since the gateway started; the event stream brings the live state.
+          body.push(h("p", { role: "status", class: "muted" }, "Checking this account…"));
         } else {
           const result =
             c &&

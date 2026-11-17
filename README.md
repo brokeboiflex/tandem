@@ -56,8 +56,8 @@ Checks:
 
 ```sh
 bun run typecheck && bun test       # unit tests (fixtures from the pinned daemon, a stub MCP server)
-bun scripts/e2e.ts                  # against the running stack; its stub MCP server needs
-                                    # MCP_ALLOWED_ORIGINS=http://host.docker.internal:8791 in .env
+bun scripts/e2e.ts                  # against the running stack (restarts its gateway once); its stub MCP
+                                    # server needs MCP_ALLOWED_ORIGINS=http://host.docker.internal:8791 in .env
 E2E_REAL_SUBJECT=<person> bun scripts/e2e.ts   # plus real turns, MCP tool calls included, for a person
                                     # whose volume holds real sign-ins
 bun scripts/e2e-hardening.ts        # proves the protections below against the running stack
@@ -73,15 +73,24 @@ runs the test MCP server on its own (a `lookup_customer` tool that requires `Bea
 Every `/v1` request needs `Authorization: Bearer <service JWT>`; `sub` is the person. Anything else is
 `404`. Errors are `{ "error": "<code>", "message": "<readable sentence>" }`.
 
+**When a runtime runs.** Reads (`GET`) never start a person's runtime, so an app may prefetch with them
+when the person signs in to it. Opening `GET /v1/events` starts it: open the stream when your assistant
+UI opens, not before. Any change (`POST`, `PUT`, `PATCH`, `DELETE`), such as sending a message, starts it
+too. While the runtime is stopped, `GET /v1/providers` answers at once from memory; every other read
+answers `409 runtime_stopped`, and a read that arrives while the runtime is starting waits for it. A
+runtime stops after `IDLE_MINUTES` without requests, but never while one of the person's event streams is
+open, a run is in progress or a sign-in is waiting; the idle time counts from the last stream closing.
+While a stream is open, a runtime that stops on its own (a crash, `docker stop`) is restarted at once.
+
 | Method and path | Purpose |
 | --- | --- |
-| `GET /v1/providers` | `{ providers: [{ id: "claude"\|"codex", status: "connected"\|"not_connected"\|"connecting", method: "subscription"\|"api_key"\|null, account: { email, plan }\|null, models: [{ id, name, efforts, defaultEffort }], checkedAt }] }`. Models come from the account's live catalog and are empty until connected. `checkedAt` (ISO time) is when this was read from the person's runtime. While the runtime is stopped the answer comes at once from the gateway's memory, with that older `checkedAt`; the runtime starts in the background and `/v1/events` delivers the live state as `provider.updated` once it is up. Only the first request after a gateway restart waits for the runtime. A provider whose turn failed with `signin_required` reports `not_connected` until the person signs in again. |
+| `GET /v1/providers` | `{ providers: [{ id: "claude"\|"codex", status: "connected"\|"not_connected"\|"connecting"\|"unknown", method: "subscription"\|"api_key"\|null, account: { email, plan }\|null, models: [{ id, name, efforts, defaultEffort }], checkedAt }] }`. Models come from the account's live catalog and are empty until connected. `checkedAt` (ISO time) is when this was read from the person's runtime. Never starts the runtime. While it is stopped or starting, the answer comes at once from the gateway's memory, with that older `checkedAt`; open `/v1/events` to start it and receive the live state as `provider.updated` once it is up. A provider not read since the gateway started (after a gateway restart, until the person's runtime has run) is `status: "unknown"` with `checkedAt: null`, `method: null`, `account: null` and no models: show it as loading, not as signed out. A provider whose turn failed with `signin_required` reports `not_connected` until the person signs in again. |
 | `POST /v1/providers/:id/connect` | Starts the vendor sign-in, answers `{ connection }` once the vendor page is ready. Claude also accepts `{ "method": "api_key", "apiKey": "sk-ant-…" }`. |
 | `GET /v1/providers/:id/connect` | Current `{ connection }` (or `null`). |
 | `POST /v1/providers/:id/connect/code` | `{ code }` from the Claude page. A rejected code answers `status: "waiting"` with `error.code: "wrong_code"`. |
 | `DELETE /v1/providers/:id/connect` | Cancels the sign-in. |
 | `DELETE /v1/providers/:id` | Signs out with the vendor CLI and removes its credentials from the volume. |
-| `GET /v1/events` | Server-Sent Events for this person only: `provider.updated`, `conversation.run`, `conversation.message`, `conversation.delta`, `conversation.question`. |
+| `GET /v1/events` | Server-Sent Events for this person only: `provider.updated`, `conversation.run`, `conversation.message`, `conversation.delta`, `conversation.question`. Opening it starts the person's runtime, and it keeps the runtime from stopping while it is open. Its first `provider.updated` for each provider is the live state, sent once the runtime is up. The stream closes when the token expires; reconnect with a fresh one. |
 | `POST /v1/conversations` | `{ provider, model, effort?, title? }` → `201 { conversation }`. |
 | `GET /v1/conversations` | `{ conversations, nextCursor }`, newest activity first. `?limit=` (1-200, default 50), `?cursor=<nextCursor>` for the next page, `?query=` to search titles (case-insensitive). |
 | `PATCH /v1/conversations/:id` | `{ title }` (1-200 characters, or `null` for the generated title) → `{ conversation }`. |
@@ -107,11 +116,11 @@ Other unauthenticated routes: `GET /healthz`, `GET /connect` (demo page), and `P
 
 ## The connect flow
 
-1. Call `GET /v1/providers` (or open `/v1/events`) when the person opens your settings screen. It starts
-   their runtime in the background (about 2 s for a new person, about 1 s for a stopped one), so the
-   sign-in itself starts in well under a second. For a stopped runtime the providers answer comes at
-   once from what the gateway last read (`checkedAt`), so show it and apply the `provider.updated` that
-   follows.
+1. Open `/v1/events` when the person opens your settings screen, and call `GET /v1/providers` for the
+   first view. The stream starts their runtime (about 2 s for a new person, about 1 s for a stopped
+   one), so the sign-in itself starts in well under a second. The providers answer comes at once from
+   what the gateway last read (`checkedAt`, or `unknown` after a gateway restart), so show it and apply
+   the `provider.updated` that follows.
 2. **Claude** (`flow: "paste_code"`): open `url` in a new tab. After approving, Claude's page shows a code;
    the person pastes it and you send it to `/connect/code`. A code Claude refuses comes back as
    `wrong_code` with the sign-in still waiting. When Anthropic itself refuses the code, Tandem starts a
@@ -320,9 +329,11 @@ gateway makes the upstream calls itself, only to `MCP_ALLOWED_ORIGINS`.
   logged, stored or echoed (unit-tested). Error responses never include request or daemon bodies.
 - **Last-known provider state.** For a stopped runtime the gateway answers `GET /v1/providers` from the
   views it last read (status, method, account e-mail and plan, models, `checkedAt`), kept in memory per
-  person: no tokens, keys or codes. It is not persisted. After a gateway restart the first request waits
-  for the runtime instead of reading the volume: a stopped runtime's container is removed, so reading
-  its files would mean creating a container just for that, outside the gateway's narrow Docker access.
+  person: no tokens, keys or codes. It is not persisted. After a gateway restart the answer is `unknown`
+  until the runtime has run, instead of reading the volume: a stopped runtime's container is removed, so
+  reading its files would mean creating a container just for that, outside the gateway's narrow Docker
+  access. Answering a read is never a reason to start a runtime: an app that prefetches at sign-in must
+  not wake every person's container.
 - **Application credentials.** `mcpAuth` values live only in the gateway's memory, keyed by person, and go
   only to that person's registered URL on an allowed origin (no redirects followed). The runtime's proxy
   token is in its environment, so the person's agent can read it; it is useless elsewhere, because the

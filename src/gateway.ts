@@ -40,7 +40,9 @@ class Person {
    * The last settled provider views read from the running runtime, with when: what
    * /v1/providers shows while the runtime is stopped. Views only, never credentials.
    */
-  known: Partial<Record<H.ProviderId, { view: H.ProviderView; checkedAt: number }>> = {};
+  known: Partial<
+    Record<H.ProviderId, { view: H.ProviderView; checkedAt: number }>
+  > = {};
   /** When (daemon time) a turn last failed for want of a provider's sign-in; a newer sign-in clears it. */
   signinRequired: Partial<Record<H.ProviderId, number>> = {};
   /** Registered MCP servers and title overrides, read once from the person's volume. */
@@ -190,7 +192,10 @@ export function createGateway(
     })();
   }
 
-  /** Drops a runtime handle that no longer answers; the next request starts the runtime again. */
+  /**
+   * Drops a runtime handle that no longer answers. An open event stream starts it again at once;
+   * otherwise the next change or event stream does.
+   */
   function forget(p: Person, d: H.Daemon, why: string) {
     if (p.daemon !== d) return;
     p.events?.abort();
@@ -199,6 +204,15 @@ export function createGateway(
     p.clis = {};
     proxy.clear(p.key);
     log(`runtime ${why} key=${p.key.slice(0, 8)}`);
+    if (p.clients.size > 0 && !p.starting)
+      // A restart, not a start: a runtime whose daemon just stopped answering can still be
+      // shutting down, and only a restart waits for that. One that is gone is created again.
+      void (p.starting = start(p, true)
+        .catch(() => start(p, false))
+        .finally(() => (p.starting = undefined))).then(
+        () => H.PROVIDER_IDS.forEach((id) => void publish(p, id)),
+        (e) => log("restart failed", (e as Error).message),
+      );
   }
 
   function onDaemonEvent(
@@ -299,12 +313,17 @@ export function createGateway(
     log(`runtime stopped key=${p.key.slice(0, 8)} (idle)`);
   }
 
+  /**
+   * Stops runtimes unused for IDLE_MINUTES. An open event stream counts as use (closing it is the
+   * last use), and so does a run or sign-in in progress.
+   */
   async function idleSweep() {
     for (const p of people.values()) {
       if (
         !p.daemon ||
         p.starting ||
         p.restarting ||
+        p.clients.size > 0 ||
         Date.now() - p.lastUsed < cfg.idleMs
       )
         continue;
@@ -337,10 +356,19 @@ export function createGateway(
 
   // --- Provider state ---------------------------------------------------------------------------
 
-  /** The person's daemon; with `start` false only one that is up, so nothing is started. */
+  /**
+   * The person's daemon. With `start` false (reads) only one that is up or already starting:
+   * nothing is started, and a stopped runtime is `409 runtime_stopped`.
+   */
   function daemonOf(p: Person, start = true) {
-    if (start || p.daemon) return daemonFor(p);
-    return Promise.reject(new Error("runtime is not running"));
+    if (start || p.daemon || p.starting) return daemonFor(p);
+    return Promise.reject(
+      new HttpError(
+        409,
+        "runtime_stopped",
+        "The workspace is stopped. Opening /v1/events starts it.",
+      ),
+    );
   }
 
   async function configOf(p: Person, start = true) {
@@ -405,10 +433,25 @@ export function createGateway(
     };
   }
 
-  /** The state remembered from the running runtime, marked with when it was read. */
+  /**
+   * The state remembered from the running runtime, marked with when it was read. Before the first
+   * read since the gateway started it is `unknown`, with `checkedAt: null`.
+   */
   function lastKnown(p: Person, id: H.ProviderId) {
-    const { view, checkedAt } = p.known[id]!;
-    return { ...view, checkedAt: new Date(checkedAt).toISOString() };
+    const known = p.known[id];
+    if (!known)
+      return {
+        id,
+        status: "unknown" as const,
+        method: null,
+        account: null,
+        models: [],
+        checkedAt: null,
+      };
+    return {
+      ...known.view,
+      checkedAt: new Date(known.checkedAt).toISOString(),
+    };
   }
 
   /**
@@ -455,7 +498,9 @@ export function createGateway(
     const text = await readFile(p, `${M.MCP_DIR}/${M.REGISTRY_FILE}`);
     const servers = M.openRegistry(cfg.serviceSecret, p.key, text);
     if (!servers)
-      log(`mcp registrations ignored (changed outside the gateway) key=${p.key.slice(0, 8)}`);
+      log(
+        `mcp registrations ignored (changed outside the gateway) key=${p.key.slice(0, 8)}`,
+      );
     return (p.mcpServers = servers ?? []);
   }
 
@@ -463,7 +508,9 @@ export function createGateway(
     if (p.titles) return p.titles;
     let titles: Record<string, string> = {};
     try {
-      const parsed = JSON.parse((await readFile(p, `${H.RUNTIME_DIR}/${H.TITLES_FILE}`)) || "{}");
+      const parsed = JSON.parse(
+        (await readFile(p, `${H.RUNTIME_DIR}/${H.TITLES_FILE}`)) || "{}",
+      );
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
         titles = Object.fromEntries(
           Object.entries(parsed).filter(([, v]) => typeof v === "string"),
@@ -487,20 +534,16 @@ export function createGateway(
   };
 
   /**
-   * A stopped runtime answers at once with the last-known state (`checkedAt` says when it was read)
-   * and starts in the background, so a message sent next finds it up; clients on /v1/events then
-   * get the live state as `provider.updated`. Nothing is known before the first answer after a
-   * gateway start, so that one waits for the runtime.
+   * Never starts a runtime. A running one answers live (a restart is waited for); otherwise the
+   * answer comes at once from the last-known state. Opening /v1/events starts the runtime and
+   * delivers the live state as `provider.updated`.
    */
   async function listProviders({ p }: Ctx) {
-    if (!p.daemon && !p.restarting && H.PROVIDER_IDS.every((id) => p.known[id])) {
-      void daemonFor(p).then(
-        () => H.PROVIDER_IDS.forEach((id) => void publish(p, id)),
-        (e) => log("background start failed", (e as Error).message),
-      );
+    if (!p.daemon && !p.restarting)
       return json({ providers: H.PROVIDER_IDS.map((id) => lastKnown(p, id)) });
-    }
-    const states = await Promise.all(H.PROVIDER_IDS.map((id) => state(p, id)));
+    const states = await Promise.all(
+      H.PROVIDER_IDS.map((id) => state(p, id, true, false)),
+    );
     return json({ providers: states.map((s) => s.provider) });
   }
 
@@ -592,7 +635,8 @@ export function createGateway(
 
   async function getConnect({ p, params }: Ctx) {
     return json({
-      connection: (await state(p, params[0] as H.ProviderId)).connection,
+      connection: (await state(p, params[0] as H.ProviderId, true, false))
+        .connection,
     });
   }
 
@@ -698,12 +742,22 @@ export function createGateway(
     return json({ provider: (await state(p, id)).provider });
   }
 
+  /**
+   * The person's live events. Opening the stream is what starts a stopped runtime (reads never do),
+   * and an open stream keeps it from stopping when idle; its first `provider.updated` per provider
+   * is the live state once the runtime is up.
+   */
   function events({ p, req, principal }: Ctx) {
     let send: Client | undefined;
     let timers: Timer[] = [];
-    const close = (controller: ReadableStreamDefaultController) => {
+    // Leaving is the client's last use: the idle period starts then.
+    const leave = () => {
       if (send) p.clients.delete(send);
+      p.lastUsed = Date.now();
       timers.forEach(clearTimeout);
+    };
+    const close = (controller: ReadableStreamDefaultController) => {
+      leave();
       try {
         controller.close();
       } catch {}
@@ -727,17 +781,13 @@ export function createGateway(
           ),
         ];
         req.signal.addEventListener("abort", () => close(controller));
-        // Snapshot first; this also warms the runtime so a sign-in starts quickly.
         for (const id of H.PROVIDER_IDS)
           void state(p, id).then(
             (s) => send?.("provider.updated", s),
             () => {},
           );
       },
-      cancel() {
-        if (send) p.clients.delete(send);
-        timers.forEach(clearTimeout);
-      },
+      cancel: leave,
     });
     return new Response(body, {
       headers: {
@@ -835,12 +885,16 @@ export function createGateway(
     );
     const query = (url.searchParams.get("query") ?? "").trim().toLowerCase();
     if (query.length > 200)
-      throw new HttpError(400, "invalid_request", "query must be at most 200 characters");
+      throw new HttpError(
+        400,
+        "invalid_request",
+        "query must be at most 200 characters",
+      );
     const rawCursor = url.searchParams.get("cursor");
     const cursor = rawCursor ? H.decodeCursor(rawCursor) : null;
     if (rawCursor && !cursor)
       throw new HttpError(400, "invalid_request", "cursor is not valid");
-    const d = await daemonFor(p);
+    const d = await daemonOf(p, false);
     const { project } = await d.call("GET", `/v0/projects/${H.PROJECT_ID}`);
     const titles = await titlesOf(p);
     const at = (a: any) => Number(a.lastActivityAt ?? a.createdAt) || 0;
@@ -849,12 +903,16 @@ export function createGateway(
       .filter(
         (a: any) =>
           !query ||
-          String(titles[a.id] ?? a.title ?? "").toLowerCase().includes(query),
+          String(titles[a.id] ?? a.title ?? "")
+            .toLowerCase()
+            .includes(query),
       )
       .sort((a: any, b: any) => at(b) - at(a) || (a.id < b.id ? -1 : 1))
       .filter(
         (a: any) =>
-          !cursor || at(a) < cursor.at || (at(a) === cursor.at && a.id > cursor.id),
+          !cursor ||
+          at(a) < cursor.at ||
+          (at(a) === cursor.at && a.id > cursor.id),
       );
     const page = agents.slice(0, limit);
     const views = await Promise.all(
@@ -864,7 +922,9 @@ export function createGateway(
     return json({
       conversations: views,
       nextCursor:
-        agents.length > limit && last ? H.encodeCursor(at(last), last.id) : null,
+        agents.length > limit && last
+          ? H.encodeCursor(at(last), last.id)
+          : null,
     });
   }
 
@@ -896,7 +956,9 @@ export function createGateway(
       `${JSON.stringify(titles)}\n`,
     );
     p.titles = titles;
-    return json({ conversation: await view(p, agent, await modeOf(d, agent.id)) });
+    return json({
+      conversation: await view(p, agent, await modeOf(d, agent.id)),
+    });
   }
 
   /** Archives: Happy keeps the history, the conversation leaves every list and takes no messages. */
@@ -905,11 +967,14 @@ export function createGateway(
     const agent = await conversationAgent(d, p, params[0]!);
     await d.call("POST", `/v0/agents/${agent.id}/archive`, {});
     p.ctx.conversations.delete(agent.id);
-    return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
+    return new Response(null, {
+      status: 204,
+      headers: { "cache-control": "no-store" },
+    });
   }
 
   async function getMessages({ p, params, url }: Ctx) {
-    const d = await daemonFor(p);
+    const d = await daemonOf(p, false);
     const agent = await conversationAgent(d, p, params[0]!);
     const q = new URLSearchParams({
       limit: String(
@@ -1015,7 +1080,13 @@ export function createGateway(
     const agent = await conversationAgent(d, p, params[0]!);
     const r = await d.call("POST", `/v0/agents/${agent.id}/abort`, {});
     return json(
-      { conversation: await view(p, r.agent ?? agent, await modeOf(d, agent.id)) },
+      {
+        conversation: await view(
+          p,
+          r.agent ?? agent,
+          await modeOf(d, agent.id),
+        ),
+      },
       202,
     );
   }
@@ -1101,7 +1172,7 @@ export function createGateway(
   });
 
   async function listMcpServers({ p }: Ctx) {
-    await daemonFor(p);
+    await daemonOf(p, false);
     return json({ servers: (await serversOf(p)).map((s) => mcpView(p, s)) });
   }
 
@@ -1121,7 +1192,12 @@ export function createGateway(
         M.sealRegistry(cfg.serviceSecret, p.key, after),
       );
       const template = M.renderMcpToml(after);
-      await runtime.writePrivateFile(p.key, M.MCP_DIR, M.TEMPLATE_FILE, template);
+      await runtime.writePrivateFile(
+        p.key,
+        M.MCP_DIR,
+        M.TEMPLATE_FILE,
+        template,
+      );
       p.mcpServers = after;
       // Happy reads mcp.toml when it starts; the entrypoint installs the template then.
       if (template !== M.renderMcpToml(before))
@@ -1160,11 +1236,14 @@ export function createGateway(
       return servers.filter((s) => s.name !== name);
     });
     proxy.setCredentials(p.key, { [name]: null });
-    return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
+    return new Response(null, {
+      status: 204,
+      headers: { "cache-control": "no-store" },
+    });
   }
 
   async function getInstructions({ p }: Ctx) {
-    await daemonFor(p);
+    await daemonOf(p, false);
     return json({
       text: await readFile(p, `${H.RUNTIME_DIR}/${H.INSTRUCTIONS_FILE}`),
     });
@@ -1186,7 +1265,11 @@ export function createGateway(
       [H.PROJECT_PATH, "CLAUDE.md"],
     ];
     if (!text.trim())
-      await runtime.exec(p.key, ["rm", "-f", ...files.map(([dir, name]) => `${dir}/${name}`)]);
+      await runtime.exec(p.key, [
+        "rm",
+        "-f",
+        ...files.map(([dir, name]) => `${dir}/${name}`),
+      ]);
     else
       for (const [dir, name] of files)
         await runtime.writePrivateFile(p.key, dir, name, text);
@@ -1215,7 +1298,11 @@ export function createGateway(
     ],
     ["GET", /^\/v1\/mcp-servers$/, listMcpServers],
     ["PUT", new RegExp(`^/v1/mcp-servers/(${M.MCP_NAME})$`), putMcpServer],
-    ["DELETE", new RegExp(`^/v1/mcp-servers/(${M.MCP_NAME})$`), deleteMcpServer],
+    [
+      "DELETE",
+      new RegExp(`^/v1/mcp-servers/(${M.MCP_NAME})$`),
+      deleteMcpServer,
+    ],
     ["GET", /^\/v1\/instructions$/, getInstructions],
     ["PUT", /^\/v1\/instructions$/, putInstructions],
   ];

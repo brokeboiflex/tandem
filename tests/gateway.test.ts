@@ -5,7 +5,11 @@ import type { Config } from "../src/config";
 import { createGateway } from "../src/gateway";
 import { runtimeKey } from "../src/runtime";
 import { sseFrames } from "../src/sse";
-import { FakeRuntime, GOOD_CODE_PREFIX, socketProxyPolicy } from "./fake-daemon";
+import {
+  FakeRuntime,
+  GOOD_CODE_PREFIX,
+  socketProxyPolicy,
+} from "./fake-daemon";
 
 const cfg = {
   port: 0,
@@ -72,6 +76,53 @@ async function call(
   return { status: res.status, body: text ? JSON.parse(text) : null };
 }
 
+/** Opens a person's event stream, as an app does when its UI opens; this starts their runtime. */
+async function listen(
+  token: string,
+  send: (req: Request) => Promise<Response> = (req) => fetch(req),
+) {
+  const ac = new AbortController();
+  const res = await send(
+    new Request(`${base}/v1/events`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: ac.signal,
+    }),
+  );
+  const events: { event: string; data: any }[] = [];
+  void (async () => {
+    try {
+      for await (const f of sseFrames(res.body!))
+        events.push({ event: f.event, data: JSON.parse(f.data) });
+    } catch {}
+  })();
+  const updates = () => events.filter((e) => e.event === "provider.updated");
+  return { events, updates, close: () => ac.abort() };
+}
+
+const until = async (ok: () => boolean | Promise<boolean>, ms = 5000) => {
+  for (const end = Date.now() + ms; !(await ok()); await Bun.sleep(25))
+    if (Date.now() > end) throw new Error("timed out");
+};
+
+/** Starts a person's runtime the way an app does, and waits until it is up and the stream closed. */
+async function wake(token: string) {
+  const stream = await listen(token);
+  await until(() => stream.updates().length >= 2);
+  stream.close();
+  await until(() =>
+    [...gateway.people.values()].every((p) => p.clients.size === 0),
+  );
+}
+
+const unknown = (id: string) => ({
+  id,
+  status: "unknown",
+  method: null,
+  account: null,
+  models: [],
+  checkedAt: null,
+});
+
 describe("façade surface", () => {
   test("anything outside the /v1 contract is 404, authenticated or not", async () => {
     for (const [method, path] of [
@@ -106,16 +157,49 @@ describe("façade surface", () => {
 });
 
 describe("providers and sign-in", () => {
-  test("first request starts the runtime, archives the admin bot and lists both providers", async () => {
+  test("reads never start a runtime: providers are unknown, everything else is runtime_stopped", async () => {
+    const key = runtimeKey(cfg.serviceSecret, "alice");
     const { status, body } = await call(alice, "GET", "/v1/providers");
     expect(status).toBe(200);
+    expect(body.providers).toEqual([unknown("claude"), unknown("codex")]);
+    for (const path of [
+      "/v1/conversations",
+      "/v1/conversations/mabc/messages",
+      "/v1/providers/claude/connect",
+      "/v1/mcp-servers",
+      "/v1/instructions",
+    ])
+      expect(await call(alice, "GET", path)).toMatchObject({
+        status: 409,
+        body: { error: "runtime_stopped" },
+      });
+    expect(runtime.calls.filter((c) => c.includes(key))).toEqual([]);
+    expect(runtime.daemons.has(key)).toBe(false);
+  });
+
+  test("opening the event stream starts the runtime, archives the admin bot and sends the live state", async () => {
+    const key = runtimeKey(cfg.serviceSecret, "alice");
+    const stream = await listen(alice);
+    await until(() => stream.updates().length >= 2);
+    stream.close();
+    expect(runtime.calls).toContain(`ensure ${key}`);
+    expect(
+      stream
+        .updates()
+        .map(({ data: { provider: p } }) => [p.id, p.status, p.models.length])
+        .sort(),
+    ).toEqual([
+      ["claude", "not_connected", 0],
+      ["codex", "not_connected", 0],
+    ]);
+    const { body } = await call(alice, "GET", "/v1/providers");
     expect(
       body.providers.map((p: any) => [p.id, p.status, p.models.length]),
     ).toEqual([
       ["claude", "not_connected", 0],
       ["codex", "not_connected", 0],
     ]);
-    const d = runtime.daemons.get(runtimeKey(cfg.serviceSecret, "alice"))!;
+    const d = runtime.daemons.get(key)!;
     expect(
       d.requests.some(
         (r) =>
@@ -413,29 +497,78 @@ describe("conversations and isolation between people", () => {
     ); // Bob's own snapshot
   });
 
-  test("a runtime stopped outside the gateway is started again on the next request", async () => {
+  test("a runtime stopped outside the gateway: a read answers without starting it, the next change starts it", async () => {
     const key = runtimeKey(cfg.serviceSecret, "carol");
     const carol = await tokenFor("carol");
-    expect((await call(carol, "GET", "/v1/providers")).status).toBe(200);
+    await wake(carol);
     runtime.kill(key);
     runtime.calls.length = 0;
+    const read = await call(carol, "GET", "/v1/providers");
+    expect(read.body.providers.map((p: any) => p.status)).toEqual([
+      "not_connected",
+      "not_connected",
+    ]);
+    expect(runtime.calls).not.toContain(`ensure ${key}`);
     const t0 = performance.now();
-    expect((await call(carol, "GET", "/v1/providers")).status).toBe(200);
+    expect(
+      (await call(carol, "POST", "/v1/providers/codex/connect", {})).status,
+    ).toBe(200);
     expect(performance.now() - t0).toBeLessThan(5000);
     expect(runtime.calls).toContain(`ensure ${key}`);
+    await call(carol, "DELETE", "/v1/providers/codex/connect");
+  });
+
+  test("while an event stream is open, a runtime that went away is restarted at once", async () => {
+    const key = runtimeKey(cfg.serviceSecret, "frank");
+    const stream = await listen(await tokenFor("frank"));
+    await until(() => stream.updates().length >= 2);
+    runtime.kill(key);
+    runtime.calls.length = 0;
+    stream.events.length = 0;
+    // A restart waits for a runtime that is still shutting down; a plain start would not.
+    await until(() => runtime.calls.includes(`restart ${key}`));
+    // Its clients get the live state again once it is back.
+    await until(() => stream.updates().length >= 2);
+    stream.close();
   });
 
   test("idle runtimes stop, but never while a run is in progress", async () => {
     const key = runtimeKey(cfg.serviceSecret, "dave");
-    expect((await call(await tokenFor("dave"), "GET", "/v1/providers")).status).toBe(200);
+    await wake(await tokenFor("dave"));
     const fake = runtime.daemons.get(key)!;
-    fake.agents.set("busyconvo", { id: "busyconvo", workspaceId: "chats", parentAgentId: null, status: "working", pendingQuestionId: null, createdAt: 0, archivedAt: null });
+    fake.agents.set("busyconvo", {
+      id: "busyconvo",
+      workspaceId: "chats",
+      parentAgentId: null,
+      status: "working",
+      pendingQuestionId: null,
+      createdAt: 0,
+      archivedAt: null,
+    });
     for (const p of gateway.people.values()) p.lastUsed = 0;
     runtime.calls.length = 0;
     await gateway.idleSweep();
     expect(runtime.calls).not.toContain(`stop ${key}`);
     fake.agents.get("busyconvo").status = "idle";
     gateway.people.get(key)!.lastUsed = 0;
+    await gateway.idleSweep();
+    expect(runtime.calls).toContain(`stop ${key}`);
+  });
+
+  test("an open event stream keeps the runtime from idling out; the idle period starts when it closes", async () => {
+    const key = runtimeKey(cfg.serviceSecret, "heidi");
+    const stream = await listen(await tokenFor("heidi"));
+    await until(() => stream.updates().length >= 2);
+    const heidi = gateway.people.get(key)!;
+    heidi.lastUsed = 0;
+    runtime.calls.length = 0;
+    await gateway.idleSweep();
+    expect(runtime.calls).not.toContain(`stop ${key}`);
+    stream.close();
+    await until(() => heidi.clients.size === 0);
+    await gateway.idleSweep();
+    expect(runtime.calls).not.toContain(`stop ${key}`);
+    heidi.lastUsed = 0;
     await gateway.idleSweep();
     expect(runtime.calls).toContain(`stop ${key}`);
   });
@@ -452,34 +585,17 @@ describe("conversations and isolation between people", () => {
 });
 
 describe("last-known provider state", () => {
-  const listen = async (token: string) => {
-    const ac = new AbortController();
-    const res = await fetch(`${base}/v1/events`, {
-      headers: { authorization: `Bearer ${token}` },
-      signal: ac.signal,
-    });
-    const events: { event: string; data: any }[] = [];
-    void (async () => {
-      try {
-        for await (const f of sseFrames(res.body!))
-          events.push({ event: f.event, data: JSON.parse(f.data) });
-      } catch {}
-    })();
-    return { events, close: () => ac.abort() };
-  };
-  const until = async (ok: () => boolean | Promise<boolean>, ms = 5000) => {
-    for (const end = Date.now() + ms; !(await ok()); await Bun.sleep(50))
-      if (Date.now() > end) throw new Error("timed out");
-  };
   const idleStop = async (key: string) => {
-    gateway.people.get(key)!.lastUsed = 0;
+    const person = gateway.people.get(key)!;
+    await until(() => person.clients.size === 0);
+    person.lastUsed = 0;
     await gateway.idleSweep();
-    expect(gateway.people.get(key)!.daemon).toBeUndefined();
+    expect(person.daemon).toBeUndefined();
   };
   const erinKey = runtimeKey(cfg.serviceSecret, "erin");
   let erin: string;
 
-  test("a stopped runtime answers at once with what it last reported, then starts in the background", async () => {
+  test("a stopped runtime answers at once with what it last reported and starts nothing; the event stream starts it", async () => {
     erin = await tokenFor("erin");
     await call(erin, "POST", "/v1/providers/claude/connect", {});
     await call(erin, "POST", "/v1/providers/claude/connect/code", {
@@ -487,8 +603,7 @@ describe("last-known provider state", () => {
     });
     const live = (await call(erin, "GET", "/v1/providers")).body.providers;
     expect(live[0]).toMatchObject({ id: "claude", status: "connected" });
-    const stream = await listen(erin);
-    await until(() => stream.events.length >= 2);
+    await wake(erin);
     await idleStop(erinKey);
 
     runtime.startDelayMs = 1500; // a real runtime takes a second or more to start
@@ -503,19 +618,27 @@ describe("last-known provider state", () => {
     ]);
     expect(r.body.providers[0].models.length).toBeGreaterThan(0);
     expect(Date.parse(r.body.providers[0].checkedAt)).toBeLessThan(asked);
-    expect(runtime.calls).toEqual([`ensure ${erinKey}`]); // started, not awaited
+    await Bun.sleep(300);
+    expect(runtime.calls).toEqual([]);
 
-    // Once it is up, the live state reaches the person's clients.
-    stream.events.length = 0;
+    // Opening the event stream starts it; reads meanwhile still answer at once from memory.
+    const stream = await listen(erin);
+    await until(() => runtime.calls.includes(`ensure ${erinKey}`));
+    const t1 = performance.now();
+    const during = await call(erin, "GET", "/v1/providers");
+    expect(performance.now() - t1).toBeLessThan(500);
+    expect(during.body.providers[0]).toMatchObject({ status: "connected" });
+    // Once it is up, the live state arrives on the stream.
     await until(() =>
-      stream.events.some(
-        (e) =>
-          e.event === "provider.updated" &&
-          Date.parse(e.data.provider.checkedAt) >= asked,
-      ),
+      stream
+        .updates()
+        .some((e) => Date.parse(e.data.provider.checkedAt) >= asked),
     );
     stream.close();
     runtime.startDelayMs = 0;
+    expect(runtime.calls.filter((c) => c === `ensure ${erinKey}`)).toHaveLength(
+      1,
+    );
     expect(gateway.people.get(erinKey)!.daemon).toBeDefined();
   });
 
@@ -530,13 +653,20 @@ describe("last-known provider state", () => {
         createdAt: Date.now(),
         content: [{ type: "text", text: "Not logged in · Please run /login" }],
         error: { code: "inference_failed", mode: { providerId: "claude" } },
-        failure: { kind: "internal", message: "Not logged in · Please run /login" },
+        failure: {
+          kind: "internal",
+          message: "Not logged in · Please run /login",
+        },
       },
     });
     const claude = async () =>
       (await call(erin, "GET", "/v1/providers")).body.providers[0];
     await until(async () => (await claude()).status === "not_connected");
-    expect(await claude()).toMatchObject({ method: null, account: null, models: [] });
+    expect(await claude()).toMatchObject({
+      method: null,
+      account: null,
+      models: [],
+    });
     expect(
       (await call(erin, "GET", "/v1/providers/claude/connect")).body.connection,
     ).toBeNull();
@@ -552,18 +682,33 @@ describe("last-known provider state", () => {
     expect(await claude()).toMatchObject({ status: "connected" });
   });
 
-  test("after a gateway restart nothing is remembered, so the first answer waits for the runtime", async () => {
+  test("after a gateway restart nothing is remembered: unknown at once, nothing started until the event stream opens", async () => {
+    await idleStop(erinKey);
     const restarted = createGateway(cfg, runtime, { log: () => {} });
-    runtime.startDelayMs = 300;
+    runtime.calls.length = 0;
     const t0 = performance.now();
     const res = await restarted.fetch(
       new Request(`${base}/v1/providers`, {
         headers: { authorization: `Bearer ${erin}` },
       }),
     );
-    runtime.startDelayMs = 0;
+    expect(performance.now() - t0).toBeLessThan(500);
     expect(res.status).toBe(200);
-    expect(performance.now() - t0).toBeGreaterThanOrEqual(300);
+    expect((await res.json()).providers).toEqual([
+      unknown("claude"),
+      unknown("codex"),
+    ]);
+    await Bun.sleep(300);
+    expect(runtime.calls).toEqual([]);
+
+    const stream = await listen(erin, restarted.fetch);
+    await until(() => stream.updates().length >= 2);
+    stream.close();
+    expect(runtime.calls).toContain(`ensure ${erinKey}`);
+    expect(
+      stream.updates().find((e) => e.data.provider.id === "claude")!.data
+        .provider,
+    ).toMatchObject({ status: "connected" });
   });
 
   test("what is remembered holds no credentials", () => {

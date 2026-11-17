@@ -222,11 +222,19 @@ describe("registering MCP servers", () => {
 
   test("registrations survive a gateway restart; a file edited inside the runtime is ignored", async () => {
     const again = createGateway(cfg, runtime, { log });
-    const res = await again.fetch(
-      new Request("http://x/v1/mcp-servers", {
-        headers: { authorization: `Bearer ${alice.token}` },
-      }),
+    const headers = { authorization: `Bearer ${alice.token}` };
+    // Reads never start a runtime: the app's event stream does, and reads wait for that start.
+    expect(
+      (await again.fetch(new Request("http://x/v1/mcp-servers", { headers })))
+        .status,
+    ).toBe(409);
+    const stream = await again.fetch(
+      new Request("http://x/v1/events", { headers }),
     );
+    const res = await again.fetch(
+      new Request("http://x/v1/mcp-servers", { headers }),
+    );
+    await stream.body!.cancel();
     expect((await res.json()).servers.map((s: any) => s.url)).toEqual([
       stub.url,
     ]);
@@ -238,11 +246,13 @@ describe("registering MCP servers", () => {
       sealed.replace(stub.url, "https://attacker.example/mcp"),
     );
     const third = createGateway(cfg, runtime, { log });
-    const r3 = await third.fetch(
-      new Request("http://x/v1/mcp-servers", {
-        headers: { authorization: `Bearer ${alice.token}` },
-      }),
+    const stream3 = await third.fetch(
+      new Request("http://x/v1/events", { headers }),
     );
+    const r3 = await third.fetch(
+      new Request("http://x/v1/mcp-servers", { headers }),
+    );
+    await stream3.body!.cancel();
     expect((await r3.json()).servers).toEqual([]);
     expect(logs.some((l) => l.startsWith("mcp registrations ignored"))).toBe(
       true,
@@ -700,7 +710,7 @@ describe("files read from the person's volume", () => {
   test("a read cut off by a runtime restart is an error, never an empty file", async () => {
     const grace = await devToken(cfg.devSecret, "grace");
     const k = key("grace");
-    expect((await call(grace, "GET", "/v1/providers")).status).toBe(200);
+    expect((await call(grace, "PUT", "/v1/instructions", { text: "" })).status).toBe(200);
     const registered = [
       { name: "app", url: stub.url, enabledTools: null, description: null },
     ];

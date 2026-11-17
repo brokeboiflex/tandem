@@ -7,6 +7,7 @@
 // Expects the defaults of .env.example (EGRESS_MODE=auto, read-only root, non-root user ...).
 import { devToken } from "../src/auth";
 import { runtimeKey } from "../src/runtime";
+import { sseFrames } from "../src/sse";
 
 const BASE = process.env.E2E_BASE_URL ?? "http://127.0.0.1:8787";
 const PREFIX = process.env.RUNTIME_PREFIX || "tandem";
@@ -42,12 +43,27 @@ const container = (subject: string) =>
 const inspect = (name: string, format: string) =>
   docker("inspect", "-f", format, name).out;
 
+/** Starts a person's runtime as an app does, by opening their event stream; resolves once it is up. */
 async function start(subject: string) {
   const token = await devToken(secret, subject);
-  const res = await fetch(`${BASE}/v1/providers`, {
-    headers: { authorization: `Bearer ${token}` },
-  });
-  return res.status;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 120_000);
+  try {
+    const res = await fetch(`${BASE}/v1/events`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: ac.signal,
+    });
+    if (!res.ok) return res.status;
+    // The first provider.updated is the live state, sent once the runtime is up.
+    for await (const f of sseFrames(res.body!))
+      if (f.event === "provider.updated") return res.status;
+    return 0;
+  } catch {
+    return 0;
+  } finally {
+    clearTimeout(timer);
+    ac.abort();
+  }
 }
 
 // --- Setup: two people, two runtimes ----------------------------------------------------------
