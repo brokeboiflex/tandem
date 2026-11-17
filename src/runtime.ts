@@ -44,6 +44,17 @@ export const ACTIVITY_COMMAND = [
   't=$(cat /home/agent/.happy/agent/token) && for p in projects/chats provider-clis/claude provider-clis/codex; do echo "authorization: Bearer $t" | curl -sf -m 10 -H @- --unix-socket /home/agent/.happy/agent/server.sock "http://runtime/v0/$p" && echo || exit 1; done',
 ];
 
+/**
+ * Claude Code's names for its models ("Opus 5.5" for the `opus` alias), read from the person's own
+ * signed-in Claude Code through its stream-json `initialize` request: no turn, nothing sent to a
+ * model. Happy's catalog names only the aliases ("Claude Code · Opus").
+ */
+export const CLAUDE_MODELS_COMMAND = [
+  "sh",
+  "-c",
+  `cd /tmp && echo '{"type":"control_request","request_id":"models","request":{"subtype":"initialize"}}' | timeout 20 claude -p --input-format stream-json --output-format stream-json --verbose 2>/dev/null | grep -m 1 '"control_response"'`,
+];
+
 /** A running runtime as the gateway sees it. `token` is the daemon's owner token: memory only. */
 export type RuntimeHandle = {
   key: string;

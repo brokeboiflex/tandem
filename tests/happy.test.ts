@@ -57,10 +57,31 @@ describe("live model catalog", () => {
     ]);
     expect(H.liveModels(codexFreeConfig, "codex")[0]).toEqual({
       id: "codex-cli/gpt-6-luna",
-      name: "Codex · GPT-6-Luna",
+      name: "GPT-6-Luna",
       efforts: ["low", "medium", "high", "xhigh", "max"],
       defaultEffort: "medium",
     });
+  });
+
+  test("Claude Code's own names replace the aliases Happy lists", async () => {
+    const names = H.claudeModelNames(
+      await Bun.file(
+        new URL("./fixtures/claude-initialize.json", import.meta.url),
+      ).text(),
+    );
+    expect(names["claude-code/default"]).toBe("Default · Sonnet 5.5");
+    expect(names["claude-code/opus"]).toBe("Opus 5.5");
+    expect(names["claude-code/claude-fable-5-2[1m]"]).toBe("Fable 5.2");
+    expect(names["claude-code/haiku"]).toBe("Haiku 5.5");
+    expect(H.claudeModelNames("")).toEqual({});
+    expect(H.claudeModelNames("not json\n{}")).toEqual({});
+    expect(
+      H.liveModels(config, "claude", names).map((m) => m.name),
+    ).toContain("Opus 5.5");
+    // Without names, Happy's own without the harness prefix.
+    expect(H.liveModels(config, "claude").map((m) => m.name)).toContain(
+      "Opus",
+    );
   });
 
   test("a signed-out provider offers no models; a connected one offers its live models", () => {

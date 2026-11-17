@@ -6,6 +6,7 @@ import { loadConfig, type Config } from "./config";
 import * as H from "./happy";
 import * as M from "./mcp";
 import {
+  CLAUDE_MODELS_COMMAND,
   DockerRuntime,
   runtimeKey,
   StaleRuntime,
@@ -50,6 +51,12 @@ class Person {
   known: Partial<
     Record<H.ProviderId, { view: H.ProviderView; checkedAt: number }>
   > = {};
+  /**
+   * Claude Code's own model names (H.claudeModelNames) for the account in `modelNamesFor`, read
+   * once per account and runtime start; until the first read models keep Happy's names.
+   */
+  modelNames: H.ModelNames = {};
+  modelNamesFor?: string;
   /** When (daemon time) a turn last failed for want of a provider's sign-in; a newer sign-in clears it. */
   signinRequired: Partial<Record<H.ProviderId, number>> = {};
   /** Registered MCP servers and title overrides, read once from the person's volume. */
@@ -146,6 +153,8 @@ export function createGateway(
       p.recovering = false;
     }
     p.daemon = d;
+    // A new runtime may run another Claude Code: its model names are read again.
+    p.modelNamesFor = undefined;
     subscribe(p, d);
     log(`runtime ready key=${p.key.slice(0, 8)} ms=${Date.now() - t0}`);
     // Streams opened during the recovery were answered `connecting`: send them the live state.
@@ -480,7 +489,10 @@ export function createGateway(
     const provider = H.providerView(id, cli, config, {
       restarting: !!p.restarting && p.accountRestart,
       signinRequired: id in p.signinRequired,
+      names: id === "claude" ? p.modelNames : undefined,
     });
+    if (id === "claude" && provider.status === "connected")
+      readModelNames(p, provider);
     const checkedAt = Date.now();
     // Only settled views are remembered: a sign-in in progress ends with its runtime.
     if (provider.status !== "connecting")
@@ -489,6 +501,26 @@ export function createGateway(
       provider: { ...provider, checkedAt: new Date(checkedAt).toISOString() },
       connection: connectionFor(p, id, cli, config),
     };
+  }
+
+  /**
+   * Reads Claude Code's model names for a newly connected account in the background, then sends
+   * the renamed models. Failing leaves Happy's names; the next account or runtime start retries.
+   */
+  function readModelNames(p: Person, provider: H.ProviderView) {
+    const account = `${provider.method}:${provider.account?.email ?? ""}`;
+    if (p.modelNamesFor === account) return;
+    p.modelNamesFor = account;
+    void runtime
+      .exec(p.key, CLAUDE_MODELS_COMMAND)
+      .then((r) => {
+        const names = r.exitCode === 0 ? H.claudeModelNames(r.stdout) : {};
+        if (p.modelNamesFor !== account || Object.keys(names).length === 0)
+          return;
+        p.modelNames = names;
+        return publish(p, "claude");
+      })
+      .catch(() => {});
   }
 
   /**
@@ -1090,7 +1122,8 @@ export function createGateway(
       permissionMode: cfg.permissionMode,
     };
     if (model !== undefined || effort !== undefined) {
-      const m = H.liveModels(await configOf(p), current.providerId).find(
+      const names = current.providerId === "claude" ? p.modelNames : undefined;
+      const m = H.liveModels(await configOf(p), current.providerId, names).find(
         (x) => x.id === (model ?? current.modelId),
       );
       if (!m)

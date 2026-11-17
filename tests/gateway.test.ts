@@ -285,6 +285,14 @@ describe("providers and sign-in", () => {
       method: "subscription",
     });
     expect(providers[0].models.length).toBeGreaterThan(0);
+    // Claude Code's own names arrive once read from the person's runtime.
+    let names: string[] = [];
+    await until(async () => {
+      names = (await call(alice, "GET", "/v1/providers")).body.providers[0]
+        .models.map((m: any) => m.name);
+      return names.includes("Opus 5.5");
+    });
+    expect(names).not.toContain("Claude Code · Opus");
   });
 
   test("disconnect signs out with the vendor CLI and restarts the runtime", async () => {
@@ -292,7 +300,10 @@ describe("providers and sign-in", () => {
     const r = await call(alice, "DELETE", "/v1/providers/codex");
     expect(r.status).toBe(200);
     const key = runtimeKey(cfg.serviceSecret, "alice");
-    expect(runtime.calls).toEqual([`exec ${key} sh`, `restart ${key}`]);
+    // The restarted runtime's Claude Code model names are read again, in the background.
+    expect(runtime.calls.filter((c) => !c.endsWith("claude-models"))).toEqual(
+      [`exec ${key} sh`, `restart ${key}`],
+    );
   });
 });
 

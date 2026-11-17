@@ -1,6 +1,12 @@
 // A small stateful stand-in for one person's Happy Agent daemon, served over real HTTP, plus a fake
 // Runtime that hands the gateway one such daemon per runtime key. Shapes follow tests/fixtures.
-import { StaleRuntime, type Runtime, type RuntimeHandle } from "../src/runtime";
+import { readFileSync } from "node:fs";
+import {
+  CLAUDE_MODELS_COMMAND,
+  StaleRuntime,
+  type Runtime,
+  type RuntimeHandle,
+} from "../src/runtime";
 
 const config = (
   await Bun.file(`${import.meta.dir}/fixtures/config-signed-out.json`).json()
@@ -281,6 +287,8 @@ export class FakeRuntime implements Runtime {
   files: { key: string; dir: string; name: string; content: string }[] = [];
   /** The volume as the runtime would see it: "<key>:<path>" -> content. */
   volume = new Map<string, string>();
+  /** Claude Code's answer to CLAUDE_MODELS_COMMAND (a recorded one). */
+  claudeInitialize = readFileSync(new URL("./fixtures/claude-initialize.json", import.meta.url), "utf8");
   /** When set, every `cat` ends with this exit code, as if killed by a restart. */
   failReads?: number;
   /** Source address a runtime's requests come from; tests change it to play a neighbour. */
@@ -323,7 +331,8 @@ export class FakeRuntime implements Runtime {
     return [];
   }
   async exec(key: string, cmd: string[]) {
-    this.calls.push(`exec ${key} ${cmd[0]}`);
+    const models = JSON.stringify(cmd) === JSON.stringify(CLAUDE_MODELS_COMMAND);
+    this.calls.push(`exec ${key} ${models ? "claude-models" : cmd[0]}`);
     this.execs.push([...cmd]);
     if (cmd[0] === "cat" && this.failReads)
       return { exitCode: this.failReads, stdout: "" };
@@ -333,6 +342,7 @@ export class FakeRuntime implements Runtime {
     }
     if (cmd[0] === "rm")
       for (const path of cmd.slice(1)) this.volume.delete(`${key}:${path}`);
+    if (models) return { exitCode: 0, stdout: this.claudeInitialize };
     return { exitCode: 0, stdout: "" };
   }
   async address(key: string) {

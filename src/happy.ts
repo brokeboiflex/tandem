@@ -171,15 +171,59 @@ export const COPY = {
     "Anthropic didn't accept that API key, or couldn't be reached. Check the key and try again.",
 };
 
-/** Models the signed-in account really offers: the daemon's live catalog (`config.models`). */
-export function liveModels(config: any, provider: ProviderId): Model[] {
+/** Model names by Happy model ID, read from the vendor's own agent (claudeModelNames). */
+export type ModelNames = Record<string, string>;
+
+/**
+ * Claude Code's names for the models a Happy catalog lists by alias: `claude-code/opus` is
+ * "Opus 5.5", and `claude-code/default` names the model it currently resolves to. `stdout` is
+ * Claude Code's answer to a stream-json `initialize` request (CLAUDE_MODELS_COMMAND).
+ */
+export function claudeModelNames(stdout: string): ModelNames {
+  let models: any[] = [];
+  for (const line of stdout.split("\n")) {
+    try {
+      const m = JSON.parse(line)?.response?.response?.models;
+      if (Array.isArray(m)) models = m;
+    } catch {}
+  }
+  const named = models.filter(
+    (m) =>
+      typeof m?.value === "string" &&
+      typeof m.resolvedModel === "string" &&
+      typeof m.displayName === "string",
+  );
+  // An alias's own name ("Default (recommended)") does not say which model it is.
+  const nameOf = (resolved: string) =>
+    named.find((m) => m.value !== "default" && m.resolvedModel === resolved)?.displayName;
+  const names: ModelNames = {};
+  for (const m of named) {
+    const name =
+      m.value === "default"
+        ? nameOf(m.resolvedModel) && `Default · ${nameOf(m.resolvedModel)}`
+        : m.displayName;
+    if (!name) continue;
+    names[`claude-code/${m.value}`] ??= name;
+    names[`claude-code/${m.resolvedModel}`] ??= name;
+    // Happy lists a long-context variant as `<model>[1m]`.
+    names[`claude-code/${m.resolvedModel}[1m]`] ??= name;
+  }
+  return names;
+}
+
+/**
+ * Models the signed-in account really offers: the daemon's live catalog (`config.models`). Names
+ * come from `names` when the vendor reported them, otherwise Happy's own without its harness
+ * prefix ("Codex · GPT-6-Luna" is "GPT-6-Luna"): clients show models under their provider.
+ */
+export function liveModels(config: any, provider: ProviderId, names: ModelNames = {}): Model[] {
   const catalog = config?.models ?? {};
   const refs: any[] = config?.providers?.[provider]?.models ?? [];
   return refs
     .filter((r) => r.enabled && !r.hidden && catalog[r.id])
     .map((r) => ({
       id: r.id,
-      name: catalog[r.id].name,
+      name: names[r.id] ?? String(catalog[r.id].name).replace(/^[^·]*· /, ""),
       efforts: catalog[r.id].efforts,
       defaultEffort: catalog[r.id].defaultEffort,
     }));
@@ -197,7 +241,7 @@ export function providerView(
   id: ProviderId,
   cli: any,
   config: any,
-  opts: { restarting?: boolean; signinRequired?: boolean } = {},
+  opts: { restarting?: boolean; signinRequired?: boolean; names?: ModelNames } = {},
 ) {
   const op = cli?.operation?.kind === "sign_in" ? cli.operation : null;
   const apiKey = id === "claude" && usesApiKey(config);
@@ -219,7 +263,7 @@ export function providerView(
               email: cli.signIn.account?.email ?? null,
               plan: cli.signIn.account?.plan ?? null,
             },
-    models: status === "connected" ? liveModels(config, id) : [],
+    models: status === "connected" ? liveModels(config, id, opts.names) : [],
   };
 }
 

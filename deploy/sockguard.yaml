@@ -64,6 +64,8 @@ request_body:
       # and the egress proxy (this proxy redacts container environments), and whether the daemon of a
       # runtime the gateway cannot reach is still working (the token goes to curl on standard input).
       - ["sh", "-c", 'echo "$HAPPY_BRIDGE_ALLOW" "$MCP_PROXY_URL" "$HTTPS_PROXY"']
+      # Claude Code's model names (src/runtime.ts CLAUDE_MODELS_COMMAND): an initialize request, no turn.
+      - ["sh", "-c", 'cd /tmp && echo ''{"type":"control_request","request_id":"models","request":{"subtype":"initialize"}}'' | timeout 20 claude -p --input-format stream-json --output-format stream-json --verbose 2>/dev/null | grep -m 1 ''"control_response"''']
       - ["sh", "-c", 't=$(cat /home/agent/.happy/agent/token) && for p in projects/chats provider-clis/claude provider-clis/codex; do echo "authorization: Bearer $t" | curl -sf -m 10 -H @- --unix-socket /home/agent/.happy/agent/server.sock "http://runtime/v0/$p" && echo || exit 1; done']
   container_archive:
     # The gateway's private folder, and AGENTS.md/CLAUDE.md in the chat workspace (instructions).
