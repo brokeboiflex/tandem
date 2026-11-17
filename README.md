@@ -61,6 +61,9 @@ bun scripts/e2e.ts                  # against the running stack (restarts its ga
 E2E_REAL_SUBJECT=<person> bun scripts/e2e.ts   # plus real turns, MCP tool calls included, for a person
                                     # whose volume holds real sign-ins
 bun scripts/e2e-hardening.ts        # proves the protections below against the running stack
+bun scripts/e2e-gateway-restart.ts  # recreates the gateway and the egress proxy (see Operations) with
+                                    # event streams open: nothing is restarted, everything reconnects;
+                                    # E2E_REAL_SUBJECT=<person> keeps a one-word turn in flight meanwhile
 bun scripts/page-check.ts           # drives /connect in headless Chromium, screenshots to evidence/
                                     # (BROWSER_EXECUTABLE=/path/to/chromium if Playwright has none)
 ```
@@ -210,6 +213,44 @@ and `GATEWAY_PORT`). The hardening settings are described under [Security](#secu
 Each runtime keeps all its state on its volume: Happy's database, the conversations, the vendor sign-ins
 and the agents' working folder. Tandem has no database of its own.
 
+## Operations and upgrades
+
+**Restarting or redeploying.** The gateway and the egress proxy can be recreated at any time, together
+or alone and in any order (`docker compose up -d`, with or without `--force-recreate` or `--no-deps`).
+Running runtimes are not restarted and runs in progress continue. A runtime reaches both by address
+(gVisor has no DNS), so each one keeps a fixed address on every runtime network: the gateway the
+subnet's last address, the egress proxy the one before it. Docker gives every other container the
+lowest free address, so nothing else takes them while either container is being recreated. At startup
+and every 30 seconds the gateway puts itself and the egress proxy back at the addresses each running
+runtime was created with, also when a recreated egress proxy got the gateway's address in the meantime.
+What a restart does interrupt:
+
+- Open `/v1/events` streams close. Reconnect them (as `EventSource` does); the first
+  `provider.updated` per provider after reconnecting is the live state.
+- `mcpAuth` credentials live in the gateway's memory only. Until the next message brings them again,
+  MCP tool calls answer `Sign-in for <name> expired or is missing`.
+- A recreated egress proxy drops the outbound connections that were open through it, and the vendor
+  CLIs retry them. Under gVisor, new connections work again only after about 30 seconds (up to a
+  minute): each sandbox notices the proxy's new hardware address at the same IP address only when its
+  neighbour entry expires. Under runc they work at once. The gateway is reachable from runtimes at once
+  either way, so a gateway-only redeploy has no such pause.
+
+**When an address cannot be restored.** If another container holds the address a running runtime
+expects, or the Docker Engine refuses fixed addresses (29.0 releases before 29.0.4 and 29.1 releases
+before 29.1.3 do, moby#51583), the gateway logs a `WARNING:` and restarts that runtime at the current
+addresses once nothing in it would be cut off: no run and no sign-in in progress. A question or a code
+that waits for the person does not hold it up, because the person cannot answer it before the
+restart. Meanwhile the person's providers show `connecting` and their requests answer
+`503 runtime_unavailable`; then the live state follows on the stream. The volume is kept.
+
+**Upgrading** from a version without fixed addresses: pull, rebuild the images (Quick start) and run
+`docker compose up -d --no-build`. Running runtimes need nothing else: the new gateway reads from inside
+each one the gateway and egress proxy addresses it was created with and takes them again, moving the
+egress proxy if an earlier restart left it on the gateway's address, and they keep running. Runtimes
+started afterwards get the fixed addresses. With the socket proxy, recreate the proxy together with the
+gateway so that its new policy is active first (Compose does not notice a changed mounted file):
+`docker compose -f compose.yaml -f compose.socket-proxy.yaml up -d --no-build --force-recreate docker-proxy gateway`.
+
 ## Security
 
 The threat Tandem is built against: an agent with a shell inside its runtime (possibly steered by
@@ -288,13 +329,19 @@ or anything but its own few commands. Notes:
   `$XDG_RUNTIME_DIR/docker.sock`.
 - Relaxing a runtime setting (another user, capabilities, no limits, another OCI runtime) needs the
   matching change in `deploy/sockguard.yaml`.
+- The policy lets the gateway give itself and the egress proxy fixed addresses on runtime networks
+  (`endpoint_config.allow_static_addressing`; MAC addresses, links and endpoint driver options stay
+  refused), and run two read-only commands inside runtimes: one that prints the addresses a runtime
+  was created with (the proxy hides container environments) and one that asks its daemon whether a run
+  is in progress (see Operations).
 - Containers created before switching to the proxy lack the label: remove the stopped
   `<prefix>-rt-*` containers once (they hold no data); volumes keep working.
 
 ### 4. Network isolation and egress control
 
 Each runtime gets its own internal Docker network (`<prefix>-net-<id>`) shared only with the gateway
-and the egress proxy: no route out, no access to other runtimes, other apps' containers or the host.
+and the egress proxy, at fixed addresses (see Operations): no route out, no access to other runtimes,
+other apps' containers or the host.
 On Docker Engine 28+ the network is created in isolated gateway mode, so the host has no address on
 it either; older Engines keep one and the gateway warns that services listening on all host
 interfaces are reachable. Networks are removed when a runtime stops. If Docker runs out of address
@@ -367,6 +414,8 @@ package at build time; prebuilt images containing it must not be published. See 
   (sign-in flows, Claude Code's Bash tool against a stand-in API and Codex's sandbox were).
 - The Docker runtime controller is for a single host. A Kubernetes implementation of the `Runtime`
   interface (`src/runtime.ts`) is the path to multiple hosts.
+- Under gVisor, new outbound connections from running runtimes pause for about 30 seconds (up to a
+  minute) after the egress proxy container is recreated (see Operations).
 - Happy generates a conversation's title from its first messages, which include that message's
   `context`; set a `title` (or `PATCH` it) when the context must not show up there. Happy has no rename,
   so `PATCH` titles are kept by the gateway in the person's volume.

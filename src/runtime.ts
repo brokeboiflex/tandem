@@ -5,18 +5,44 @@ import { hostname } from "node:os";
 import type { Config } from "./config";
 import { DockerError, dockerClient, type ExecResult } from "./docker";
 import {
+  chooseAddresses,
   chooseOciRuntime,
   dockerApiAccess,
   inCidr,
   isAddressPoolExhausted,
   ISOLATED_GATEWAY,
+  peerAddresses,
+  pinPlan,
+  reservedAddresses,
   runtimeContainerSpec,
   runtimeNetworkSpec,
+  type LaunchValues,
+  type Peer,
+  type PeerAddresses,
   type Posture,
 } from "./security";
 
 export const BRIDGE_PORT = 24790;
 const TOKEN_PATH = "/home/agent/.happy/agent/token";
+/**
+ * The settings that name a runtime's peers, read inside the runtime: a Docker API proxy redacts
+ * container environments (deploy/sockguard.yaml allowlists this exact command).
+ */
+export const LAUNCH_VALUES_COMMAND = [
+  "sh",
+  "-c",
+  'echo "$HAPPY_BRIDGE_ALLOW" "$MCP_PROXY_URL" "$HTTPS_PROXY"',
+];
+/**
+ * The daemon's runs and sign-ins, asked over its own socket inside the runtime: this answers also
+ * when the gateway cannot reach the runtime's bridge. Read-only; the token goes through a shell
+ * builtin to curl's standard input, never into a process's arguments.
+ */
+export const ACTIVITY_COMMAND = [
+  "sh",
+  "-c",
+  't=$(cat /home/agent/.happy/agent/token) && for p in projects/chats provider-clis/claude provider-clis/codex; do echo "authorization: Bearer $t" | curl -sf -m 10 -H @- --unix-socket /home/agent/.happy/agent/server.sock "http://runtime/v0/$p" && echo || exit 1; done',
+];
 
 /** A running runtime as the gateway sees it. `token` is the daemon's owner token: memory only. */
 export type RuntimeHandle = {
@@ -26,8 +52,18 @@ export type RuntimeHandle = {
   startedAt: number;
 };
 
+/**
+ * A running runtime was created with gateway or egress proxy addresses on its network that cannot
+ * be restored (another container holds them, or the Engine refuses fixed addresses), so it cannot
+ * reach the gateway or the Internet. It works again only once restarted.
+ */
+export class StaleRuntime extends Error {}
+
 export interface Runtime {
-  /** Creates and starts the runtime when needed; resolves once its daemon token is readable. */
+  /**
+   * Creates and starts the runtime when needed; resolves once its daemon token is readable.
+   * Rejects with StaleRuntime for a running runtime that must be restarted to be reachable.
+   */
   ensure(key: string): Promise<RuntimeHandle>;
   stop(key: string): Promise<void>;
   restart(key: string): Promise<RuntimeHandle>;
@@ -43,6 +79,11 @@ export interface Runtime {
     name: string,
     content: string,
   ): Promise<void>;
+  /**
+   * The daemon's project (GET /v0/projects/chats) and provider CLIs, read inside the runtime, also
+   * when its bridge is unreachable. Null when the daemon does not answer.
+   */
+  activity?(key: string): Promise<{ project: any; clis: any[] } | null>;
   /** Which protections this host provides (detected once). */
   posture?(): Promise<Posture>;
   /** Housekeeping on the idle sweep: releases private networks of runtimes that stopped. */
@@ -68,6 +109,9 @@ type Setup = {
   egress: { host: string } | null;
 };
 
+const ipv4Config = (n: any) =>
+  (n?.IPAM?.Config ?? []).find((c: any) => /^\d+\.\d+\.\d+\.\d+\//.test(c?.Subnet ?? ""));
+
 export class DockerRuntime implements Runtime {
   private docker;
   private tokens = new Map<string, string>();
@@ -79,6 +123,10 @@ export class DockerRuntime implements Runtime {
   private warned = new Set<string>();
   /** False once the Engine refused isolated gateway mode (Docker Engine before 28). */
   private isolatedGateway = true;
+  /** Changes to one network's members, one at a time. */
+  private queues = new Map<string, Promise<void>>();
+  /** What each runtime container was created with (by container ID): it never changes. */
+  private launched = new Map<string, LaunchValues>();
 
   constructor(
     private cfg: Config,
@@ -197,16 +245,132 @@ export class DockerRuntime implements Runtime {
     }));
   }
 
-  /** Attaches the gateway and the egress proxy (by name: it may be recreated) to a network. */
-  private async attach(network: string, s: Setup) {
-    for (const id of [s.self?.id, s.egress?.host])
-      if (id)
-        await this.docker
-          .json("POST", `/networks/${network}/connect`, { Container: id })
-          .catch((e) => {
-            if (!(e instanceof DockerError && /already/i.test(e.message)))
-              throw e;
-          });
+  /** Runs changes to one network's members one at a time (pins and removals). */
+  private serial<T>(network: string, job: () => Promise<T>): Promise<T> {
+    const run = (this.queues.get(network) ?? Promise.resolve()).then(job, job);
+    const tail = run.then(
+      () => {},
+      () => {},
+    );
+    this.queues.set(network, tail);
+    void tail.then(() => {
+      if (this.queues.get(network) === tail) this.queues.delete(network);
+    });
+    return run;
+  }
+
+  /**
+   * Puts the gateway and the egress proxy (by name: it may have been recreated) on a runtime network
+   * at their addresses: those its running runtimes were created with, or the reserved ones on a
+   * network nobody runs on yet. Either one somewhere else, for example a recreated egress proxy that
+   * Docker gave the gateway's old address, leaves and joins again at its own. Resolves to the
+   * network as it is afterwards.
+   */
+  private pin(network: string, s: Setup): Promise<any> {
+    return this.serial(network, () => this.pinNow(network, s));
+  }
+
+  private async pinNow(network: string, s: Setup) {
+    const n = await this.docker.json("GET", `/networks/${network}`);
+    const config = ipv4Config(n);
+    const refs: [Peer, string, (id: string, m: any) => boolean][] = [];
+    if (s.self) refs.push(["gateway", s.self.id, (id) => id === s.self!.id]);
+    if (s.egress)
+      refs.push(["egress", s.egress.host, (_, m) => m.Name === s.egress!.host]);
+    const members = Object.entries<any>(n?.Containers ?? {}).map(([id, m]) => ({
+      id,
+      name: String(m.Name ?? ""),
+      ip: String(m.IPv4Address ?? "").split("/")[0]!,
+      peer: refs.find(([, , is]) => is(id, m))?.[0],
+    }));
+    let want: PeerAddresses = {};
+    if (config?.Subnet) {
+      const current: PeerAddresses = {};
+      for (const m of members) if (m.peer) current[m.peer] = m.ip;
+      const launched = await Promise.all(
+        members
+          .filter(
+            (m) => !m.peer && m.name.startsWith(`${this.cfg.runtimePrefix}-rt-`),
+          )
+          .map((m) => this.launchValues(m.id)),
+      );
+      const expected = launched
+        .filter((v): v is LaunchValues => !!v)
+        .map((v) => peerAddresses(v, config.Subnet));
+      const unknown = expected.length < launched.length;
+      want = chooseAddresses(
+        current,
+        expected,
+        reservedAddresses(config.Subnet, config.Gateway ? [config.Gateway] : []),
+      );
+      // A runtime whose settings could not be read may depend on where a peer is now: move nothing.
+      if (unknown) Object.assign(want, current);
+    }
+    const plan = pinPlan(
+      members,
+      refs.map(([peer]) => peer),
+      want,
+    );
+    for (const peer of plan.blocked)
+      this.warnOnce(
+        `The ${peer} cannot take its address ${want[peer]} on ${network}: another container holds it. Runtimes there that expect it are restarted once idle.`,
+      );
+    if (!plan.disconnect.length && !plan.connect.length) return n;
+    const ref = (peer: Peer) => refs.find(([p]) => p === peer)![1];
+    for (const peer of plan.disconnect)
+      await this.docker
+        .json("POST", `/networks/${network}/disconnect`, { Container: ref(peer) })
+        .catch((e) => {
+          if (!(e instanceof DockerError && /not connected/i.test(e.message)))
+            throw e;
+        });
+    for (const { peer, ip } of plan.connect) {
+      await this.connect(network, ref(peer), ip);
+      const was = members.find((m) => m.peer === peer)?.ip;
+      if (was)
+        this.log(`${peer} moved on ${network}: ${was} -> ${ip ?? "any"}`);
+    }
+    return this.docker.json("GET", `/networks/${network}`);
+  }
+
+  /** Joins a network at `ip`; where Docker puts it when the Engine (or its API proxy) refuses that. */
+  private async connect(network: string, container: string, ip?: string) {
+    const join = (endpoint?: object) =>
+      this.docker
+        .json("POST", `/networks/${network}/connect`, {
+          Container: container,
+          ...(endpoint ? { EndpointConfig: endpoint } : {}),
+        })
+        .catch((e) => {
+          if (!(e instanceof DockerError && /already exists/i.test(e.message)))
+            throw e;
+        });
+    if (!ip) return join();
+    try {
+      await join({ IPAMConfig: { IPv4Address: ip } });
+    } catch (e) {
+      if (!(e instanceof DockerError)) throw e;
+      this.warnOnce(
+        `Docker refused a fixed address on a runtime network (${e.message.slice(0, 160)}), so runtimes running while the gateway or the egress proxy is recreated may have to be restarted once idle (README, Operations).`,
+      );
+      await join();
+    }
+  }
+
+  /** What a runtime container was created with, read once inside it; null while it cannot be read. */
+  private async launchValues(id: string): Promise<LaunchValues | null> {
+    const known = this.launched.get(id);
+    if (known) return known;
+    const r = await this.docker
+      .exec(id, LAUNCH_VALUES_COMMAND, this.cfg.runtimeUser || "agent")
+      .catch(() => null);
+    if (r?.exitCode !== 0) return null;
+    const [allow = "", mcpProxyUrl = "", httpsProxy = ""] = r.stdout
+      .replace(/\n$/, "")
+      .split(" ");
+    const v = { allow, mcpProxyUrl, httpsProxy };
+    this.launched.set(id, v);
+    return v;
   }
 
   /**
@@ -214,11 +378,11 @@ export class DockerRuntime implements Runtime {
    * the egress proxy's. Runtimes get addresses, not names: Docker's embedded DNS does not answer
    * inside gVisor sandboxes.
    */
-  private async addressesOn(
+  private addressesOn(
     network: string,
+    n: any,
     s: Setup,
-  ): Promise<{ allow: string; gateway?: string; egress?: string }> {
-    const n = await this.docker.json("GET", `/networks/${network}`);
+  ): { allow: string; gateway?: string; egress?: string } {
     for (const c of n?.IPAM?.Config ?? []) {
       if (c?.Subnet) this.subnets.add(c.Subnet);
       if (c?.Gateway && n.Internal)
@@ -244,11 +408,31 @@ export class DockerRuntime implements Runtime {
     return { allow: `${gateway}/32`, gateway, egress };
   }
 
+  /**
+   * Rejoins a running runtime's network where the runtime expects the gateway and the egress proxy
+   * (after either was recreated). StaleRuntime when those addresses cannot be restored.
+   */
+  private async rejoin(c: any, s: Setup) {
+    const network = c.HostConfig.NetworkMode;
+    const n = await this.pin(network, s);
+    const at = this.addressesOn(network, n, s);
+    const subnet = ipv4Config(n)?.Subnet;
+    const v = subnet ? await this.launchValues(c.Id) : null;
+    const want = v ? peerAddresses(v, subnet) : {};
+    const lost = (["gateway", "egress"] as const).filter(
+      (peer) => want[peer] && want[peer] !== at[peer],
+    );
+    if (lost.length)
+      throw new StaleRuntime(
+        `${lost.join(" and ")} no longer at ${lost.map((p) => want[p]).join(", ")} on ${network}`,
+      );
+  }
+
   /** Creates (or reuses) the network a stopped runtime will start on; `fresh` when just created. */
   private async networkFor(
     key: string,
     s: Setup,
-  ): Promise<{ name: string; fresh: boolean }> {
+  ): Promise<{ name: string; fresh: boolean; n: any }> {
     const own = s.posture.network === "per_runtime";
     const name = own ? this.ownNetwork(key) : this.cfg.runtimeNetwork;
     const spec = runtimeNetworkSpec(
@@ -316,22 +500,22 @@ export class DockerRuntime implements Runtime {
           .catch((e2) => {
             if (!(e2 instanceof DockerError && e2.status === 409)) throw e2;
           });
-        await this.attach(shared, s);
-        return { name: shared, fresh: false };
+        return { name: shared, fresh: false, n: await this.pin(shared, s) };
       } else throw e;
     }
-    await this.attach(name, s);
-    return { name, fresh };
+    return { name, fresh, n: await this.pin(name, s) };
   }
 
-  private async removeNetwork(name: string, s: Setup) {
-    for (const id of [s.egress?.host, s.self?.id])
-      if (id)
-        await this.docker
-          .json("POST", `/networks/${name}/disconnect`, { Container: id })
-          .catch(() => {});
-    await this.docker.raw("DELETE", `/networks/${name}`).catch((e) => {
-      if (!(e instanceof DockerError && e.status === 404)) throw e;
+  private removeNetwork(name: string, s: Setup) {
+    return this.serial(name, async () => {
+      for (const id of [s.egress?.host, s.self?.id])
+        if (id)
+          await this.docker
+            .json("POST", `/networks/${name}/disconnect`, { Container: id })
+            .catch(() => {});
+      await this.docker.raw("DELETE", `/networks/${name}`).catch((e) => {
+        if (!(e instanceof DockerError && e.status === 404)) throw e;
+      });
     });
   }
 
@@ -364,8 +548,7 @@ export class DockerRuntime implements Runtime {
     let c = await this.inspect(key);
     if (c?.State?.Running) {
       // After a gateway restart: rejoin the runtime's network so it is reachable again.
-      await this.attach(c.HostConfig.NetworkMode, s);
-      await this.addressesOn(c.HostConfig.NetworkMode, s);
+      await this.rejoin(c, s);
       return this.handle(key);
     }
     const image = await this.docker.json(
@@ -373,7 +556,7 @@ export class DockerRuntime implements Runtime {
       `/images/${encodeURIComponent(this.cfg.runtimeImage)}/json`,
     );
     const network = await this.networkFor(key, s);
-    const at = await this.addressesOn(network.name, s);
+    const at = this.addressesOn(network.name, network.n, s);
     const spec = runtimeContainerSpec(this.cfg, {
       key,
       volume,
@@ -484,10 +667,16 @@ export class DockerRuntime implements Runtime {
     const c = await this.inspect(key);
     if (c?.HostConfig?.NetworkMode !== network || c.State?.Running) return;
     await this.docker.raw("DELETE", `/containers/${this.container(key)}`);
-    await this.removeNetwork(network, s);
+    // Another container still on it keeps the network: the sweep removes it later.
+    await this.removeNetwork(network, s).catch((e) =>
+      this.log(`network kept for now: ${(e as Error).message}`),
+    );
   }
 
   async restart(key: string) {
+    // Restarting keeps the runtime's settings, so it cannot help one that lost its peers' addresses.
+    const c = await this.inspect(key);
+    if (c?.State?.Running) await this.rejoin(c, await this.setup());
     await this.docker.raw(
       "POST",
       `/containers/${this.container(key)}/restart?t=30`,
@@ -495,19 +684,27 @@ export class DockerRuntime implements Runtime {
     return this.handle(key);
   }
 
-  async listRunning() {
+  private async running() {
     const filters = JSON.stringify({
       label: [`${this.label("runtime")}=1`],
       status: ["running"],
     });
-    const list = await this.docker.json<any[]>(
+    return this.docker.json<any[]>(
       "GET",
       `/containers/json?filters=${encodeURIComponent(filters)}`,
     );
-    return list.map((c) => c.Labels[this.label("key")]).filter(Boolean);
   }
 
-  /** Removes private networks whose runtime is not running (stopped outside the gateway). */
+  async listRunning() {
+    return (await this.running())
+      .map((c) => c.Labels[this.label("key")])
+      .filter(Boolean);
+  }
+
+  /**
+   * Removes private networks whose runtime is not running (stopped outside the gateway), and puts the
+   * gateway and the egress proxy back where the runtimes still running expect them.
+   */
   async sweep() {
     const s = await this.setup();
     const filters = JSON.stringify({
@@ -517,13 +714,18 @@ export class DockerRuntime implements Runtime {
       "GET",
       `/networks?filters=${encodeURIComponent(filters)}`,
     );
-    const running = new Set(await this.listRunning());
+    const containers = await this.running();
+    const running = new Set(
+      containers.map((c) => c.Labels[this.label("key")]).filter(Boolean),
+    );
+    for (const id of this.launched.keys())
+      if (!containers.some((c) => c.Id === id)) this.launched.delete(id);
     for (const n of networks) {
       const key = n.Labels?.[this.label("key")];
       if (key && !running.has(key) && !this.busy.has(key))
         await this.removeNetwork(n.Name, s).catch(() => {});
-      // A recreated egress proxy (compose up) is attached again to the networks still in use.
-      else await this.attach(n.Name, s).catch(() => {});
+      // A recreated egress proxy (compose up) joins the networks still in use at its address.
+      else await this.pin(n.Name, s).catch(() => {});
     }
   }
 
@@ -539,6 +741,23 @@ export class DockerRuntime implements Runtime {
       cmd,
       this.cfg.runtimeUser || "agent",
     );
+  }
+
+  async activity(key: string) {
+    const r = await this.exec(key, ACTIVITY_COMMAND).catch(() => null);
+    if (r?.exitCode !== 0) return null;
+    try {
+      const [project, ...clis] = r.stdout
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      return {
+        project: project.project,
+        clis: clis.map((c) => c.providerCli),
+      };
+    } catch {
+      return null;
+    }
   }
 
   writePrivateFile(key: string, dir: string, name: string, content: string) {

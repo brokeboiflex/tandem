@@ -1,6 +1,6 @@
 // A small stateful stand-in for one person's Happy Agent daemon, served over real HTTP, plus a fake
 // Runtime that hands the gateway one such daemon per runtime key. Shapes follow tests/fixtures.
-import type { Runtime, RuntimeHandle } from "../src/runtime";
+import { StaleRuntime, type Runtime, type RuntimeHandle } from "../src/runtime";
 
 const config = (
   await Bun.file(`${import.meta.dir}/fixtures/config-signed-out.json`).json()
@@ -287,6 +287,10 @@ export class FakeRuntime implements Runtime {
   addresses = new Map<string, string>();
   /** How long starting a runtime takes (a real one takes a second or more). */
   startDelayMs = 0;
+  /** Running runtimes that lost their network addresses: unreachable until stopped. */
+  stale = new Set<string>();
+  /** What a runtime's daemon reports from inside (activity), by key. */
+  agents = new Map<string, any[]>();
   private token = "t".repeat(43);
 
   private handle(key: string): RuntimeHandle {
@@ -297,14 +301,23 @@ export class FakeRuntime implements Runtime {
   async ensure(key: string) {
     this.calls.push(`ensure ${key}`);
     await Bun.sleep(this.startDelayMs);
+    if (this.stale.has(key))
+      throw new StaleRuntime("gateway no longer at 172.30.0.1");
     return this.handle(key);
   }
   async restart(key: string) {
     this.calls.push(`restart ${key}`);
+    if (this.stale.has(key))
+      throw new StaleRuntime("gateway no longer at 172.30.0.1");
     return this.handle(key);
   }
   async stop(key: string) {
     this.calls.push(`stop ${key}`);
+    this.stale.delete(key);
+  }
+  async activity(key: string) {
+    this.calls.push(`activity ${key}`);
+    return { project: { agents: this.agents.get(key) ?? [] }, clis: [] };
   }
   async listRunning() {
     return [];

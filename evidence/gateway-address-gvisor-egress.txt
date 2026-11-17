@@ -1,0 +1,27 @@
+# Why a recreated egress proxy takes about 30 s to be reachable again under gVisor (README, Operations)
+# 2026-11-17. The egress proxy keeps its fixed IP address on the runtime network, but Docker gives the
+# new container a new hardware (MAC) address. Probe (scratch script, procedure below): one runtime with
+# its event stream open has just made a CONNECT through its egress proxy; then
+#   docker compose up -d --no-build --force-recreate --no-deps egress
+# and the new egress proxy is attached at once at the same IP address (as the gateway does), after which
+# the runtime retries `curl -m 3 -x $HTTPS_PROXY https://api.anthropic.com/` until CONNECT answers 200.
+
+## Lima VM tandem-gv (Docker 29.10.0), runtime under gVisor (runsc release-20261116.0)
+runtime runsc egress before: 172.20.255.253 3a:da:fa:cc:cf:f0 CONNECT 200
+new MAC (Docker's random): egress 172.20.255.253 ba:d2:84:30:4d:fb (was 172.20.255.253 3a:da:fa:cc:cf:f0); CONNECT 200 after 30.7 s
+second trial (MacAddress in the connect request): egress 172.20.255.253 fa:cf:c8:a7:bf:f9 (was 172.20.255.253 ba:d2:84:30:4d:fb); CONNECT 200 after 30.7 s
+
+## Docker Desktop 29.6.1, the same probe, runtime under runc
+runtime runc egress before: 172.30.255.253 9a:e8:6c:c5:c0:4b CONNECT 200
+new MAC (Docker's random): egress 172.30.255.253 da:d8:3c:6f:88:fe (was 172.30.255.253 9a:e8:6c:c5:c0:4b); CONNECT 200 after 0.2 s
+
+## Keeping the MAC address is not possible: the Engine ignores MacAddress when connecting a running container
+## (Docker 29.10.0, POST /networks/{id}/connect with IPAMConfig.IPv4Address and MacAddress 02:42:ac:14:ff:fa)
+v1.44 connect -> 200, endpoint MAC 8e:2d:76:f2:cf:74
+v1.48 connect -> 200, endpoint MAC 9e:08:dc:37:7c:b1
+v1.52 connect -> 200, endpoint MAC 0e:cb:6b:e0:a9:c7
+
+# gVisor's network stack keeps a neighbour entry until it expires (about 30 s) and does not take the new
+# address from Docker's announcements; Linux (runc) does at once. The gateway is not affected: it opens
+# the connections to its runtimes, and its address requests update their entries immediately (phase 1
+# and 2 MCP checks under gVisor). A gateway-only redeploy never recreates the egress proxy.

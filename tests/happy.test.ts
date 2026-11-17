@@ -627,3 +627,31 @@ describe("daemon route allowlist", () => {
     expect(calls).toBe(0);
   });
 });
+
+describe("work a restart would cut off", () => {
+  const agent = (status: string, pendingQuestionId: string | null = null) => ({
+    id: "m1",
+    status,
+    pendingQuestionId,
+  });
+  const op = (status: string) => ({ operation: { kind: "sign_in", status } });
+  test("an idle stop waits for runs, questions and sign-ins", () => {
+    expect(H.hasWork({ agents: [agent("idle")] }, [{ operation: null }])).toBe(
+      false,
+    );
+    expect(H.hasWork({ agents: [agent("working")] }, [])).toBe(true);
+    expect(H.hasWork({ agents: [agent("working", "q1")] }, [])).toBe(true);
+    expect(H.hasWork({ agents: [] }, [op("running")])).toBe(true);
+    expect(H.hasWork({ agents: [] }, [op("waiting")])).toBe(true);
+    expect(H.hasWork({ agents: [] }, [op("succeeded")])).toBe(false);
+  });
+  test("a restart of an unreachable runtime waits only for what finishes on its own", () => {
+    expect(H.hasWork({ agents: [agent("working")] }, [], false)).toBe(true);
+    expect(H.hasWork({ agents: [agent("working", "q1")] }, [], false)).toBe(
+      false,
+    );
+    expect(H.hasWork({ agents: [] }, [op("running")], false)).toBe(true);
+    expect(H.hasWork({ agents: [] }, [op("waiting")], false)).toBe(false);
+    expect(H.hasWork(undefined, [], false)).toBe(false);
+  });
+});

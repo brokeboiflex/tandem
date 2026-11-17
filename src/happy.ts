@@ -113,6 +113,22 @@ export class Daemon {
   }
 }
 
+/**
+ * Whether stopping the runtime now would cut work off: a run or a sign-in in progress and, unless
+ * `waiting` is false, a question or a sign-in that waits for the person. `project` is
+ * GET /v0/projects/chats, `clis` the providers' GET /v0/provider-clis/:id.
+ */
+export function hasWork(project: any, clis: any[], waiting = true) {
+  if (
+    project?.agents?.some((a: any) =>
+      a.pendingQuestionId ? waiting : a.status !== "idle",
+    )
+  )
+    return true;
+  const busy = waiting ? ["running", "waiting"] : ["running"];
+  return clis.some((c) => busy.includes(c?.operation?.status));
+}
+
 // ---------------------------------------------------------------------------------------------
 // Providers and sign-in.
 

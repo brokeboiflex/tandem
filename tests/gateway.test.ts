@@ -573,6 +573,53 @@ describe("conversations and isolation between people", () => {
     expect(runtime.calls).toContain(`stop ${key}`);
   });
 
+  test("a runtime that lost its network addresses restarts once idle, never mid-run; meanwhile the person sees connecting", async () => {
+    const key = runtimeKey(cfg.serviceSecret, "rita");
+    const rita = await tokenFor("rita");
+    const agent = { id: "busyconvo", status: "working", pendingQuestionId: null };
+    runtime.stale.add(key);
+    runtime.agents.set(key, [agent]);
+    runtime.calls.length = 0;
+    const stream = await listen(rita);
+    await until(() => stream.updates().length >= 2);
+    const statuses = (list: any[]) => list.map((p) => p.status);
+    expect(statuses(stream.updates().map((u) => u.data.provider))).toEqual([
+      "connecting",
+      "connecting",
+    ]);
+    expect(
+      statuses((await call(rita, "GET", "/v1/providers")).body.providers),
+    ).toEqual(["connecting", "connecting"]);
+    const change = await call(rita, "PUT", "/v1/instructions", { text: "x" });
+    expect([change.status, change.body.error]).toEqual([
+      503,
+      "runtime_unavailable",
+    ]);
+    // A run in progress holds the restart up.
+    await until(
+      () => runtime.calls.filter((c) => c === `activity ${key}`).length >= 2,
+      10_000,
+    );
+    expect(runtime.calls).not.toContain(`stop ${key}`);
+    // A question that waits for the person does not: they cannot answer it before the restart.
+    agent.pendingQuestionId = "q1" as any;
+    await until(() => runtime.calls.includes(`stop ${key}`), 10_000);
+    // Then it starts at the current addresses, and the open stream gets the live state.
+    await until(
+      () =>
+        stream
+          .updates()
+          .some((u) => u.data.provider.status === "not_connected"),
+      10_000,
+    );
+    const calls = runtime.calls.filter((c) => !c.startsWith("activity"));
+    expect(calls).toEqual([`ensure ${key}`, `stop ${key}`, `ensure ${key}`]);
+    expect(
+      statuses((await call(rita, "GET", "/v1/providers")).body.providers),
+    ).toEqual(["not_connected", "not_connected"]);
+    stream.close();
+  });
+
   test("runtime names come from HMAC(secret, subject)", () => {
     const a = runtimeKey(cfg.serviceSecret, "alice");
     expect(a).toMatch(/^[0-9a-f]{24}$/);

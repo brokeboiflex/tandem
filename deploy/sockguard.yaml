@@ -60,12 +60,21 @@ request_body:
       - ["cat", "/home/agent/.agent-runtime/titles.json"]
       - ["cat", "/home/agent/.agent-runtime/instructions.md"]
       - ["rm", "-f", "/home/agent/.agent-runtime/instructions.md", "/home/agent/projects/chats/AGENTS.md", "/home/agent/projects/chats/CLAUDE.md"]
+      # Read-only (src/runtime.ts): the addresses a running runtime was created with for the gateway
+      # and the egress proxy (this proxy redacts container environments), and whether the daemon of a
+      # runtime the gateway cannot reach is still working (the token goes to curl on standard input).
+      - ["sh", "-c", 'echo "$HAPPY_BRIDGE_ALLOW" "$MCP_PROXY_URL" "$HTTPS_PROXY"']
+      - ["sh", "-c", 't=$(cat /home/agent/.happy/agent/token) && for p in projects/chats provider-clis/claude provider-clis/codex; do echo "authorization: Bearer $t" | curl -sf -m 10 -H @- --unix-socket /home/agent/.happy/agent/server.sock "http://runtime/v0/$p" && echo || exit 1; done']
   container_archive:
     # The gateway's private folder, and AGENTS.md/CLAUDE.md in the chat workspace (instructions).
     allowed_paths: ["/home/agent/.agent-runtime", "/home/agent/projects/chats"]
   network:
     # Runtime networks are created in isolated gateway mode (no host address on the bridge).
     allow_driver_options: true
+    endpoint_config:
+      # The gateway and the egress proxy join each runtime network at fixed addresses (README,
+      # Operations). MAC pinning, links and endpoint driver options stay refused.
+      allow_static_addressing: true
 rules:
   - { match: { method: GET, path: "/_ping" }, action: allow }
   - { match: { method: GET, path: "/version" }, action: allow }

@@ -5,7 +5,12 @@ import { devToken, verifier, type Principal } from "./auth";
 import { loadConfig, type Config } from "./config";
 import * as H from "./happy";
 import * as M from "./mcp";
-import { DockerRuntime, runtimeKey, type Runtime } from "./runtime";
+import {
+  DockerRuntime,
+  runtimeKey,
+  StaleRuntime,
+  type Runtime,
+} from "./runtime";
 import { sseComment, sseEncode, sseFrames } from "./sse";
 
 class HttpError extends Error {
@@ -28,6 +33,8 @@ class Person {
   restarting?: Promise<void>;
   /** The pending restart reloads vendor accounts (shown as `connecting`), not just config. */
   accountRestart = false;
+  /** Restarting a runtime that lost its network addresses (shown as `connecting`). */
+  recovering = false;
   events?: AbortController;
   lastUsed = Date.now();
   clients = new Set<Client>();
@@ -64,6 +71,10 @@ const ID = "[a-z][a-z0-9]{1,95}";
 const newId = () => "m" + crypto.randomUUID().replaceAll("-", "").slice(0, 31);
 const json = (data: unknown, status = 200) =>
   Response.json(data, { status, headers: { "cache-control": "no-store" } });
+const UNAVAILABLE =
+  "Your workspace isn't reachable right now. Try again in a moment.";
+/** How often a runtime waiting to be restarted is asked whether it is still working. */
+const RECOVERY_POLL_MS = 2000;
 
 export function createGateway(
   cfg: Config,
@@ -101,6 +112,10 @@ export function createGateway(
   function daemonFor(p: Person): Promise<H.Daemon> {
     p.lastUsed = Date.now();
     if (p.daemon) return Promise.resolve(p.daemon);
+    if (p.recovering)
+      return Promise.reject(
+        new HttpError(503, "runtime_unavailable", UNAVAILABLE),
+      );
     return (p.starting ??= start(p, false).finally(
       () => (p.starting = undefined),
     ));
@@ -109,21 +124,70 @@ export function createGateway(
   async function start(p: Person, restart: boolean) {
     const t0 = Date.now();
     await p.stopping;
-    const handle = restart
-      ? await runtime.restart(p.key)
-      : await runtime.ensure(p.key);
-    const d = new H.Daemon(handle, opts.fetchImpl);
-    for (const until = Date.now() + 90_000; ; await Bun.sleep(250)) {
-      const health = await d.call("GET", "/v0/health").catch(() => null);
-      if (health?.ready) break;
-      if (Date.now() > until) throw new Error("runtime did not become ready");
+    let recovered = false;
+    let d: H.Daemon;
+    try {
+      const handle = await (
+        restart ? runtime.restart(p.key) : runtime.ensure(p.key)
+      ).catch(async (e) => {
+        if (!(e instanceof StaleRuntime)) throw e;
+        recovered = p.recovering = true;
+        await recover(p, e.message);
+        return runtime.ensure(p.key);
+      });
+      d = new H.Daemon(handle, opts.fetchImpl);
+      for (const until = Date.now() + 90_000; ; await Bun.sleep(250)) {
+        const health = await d.call("GET", "/v0/health").catch(() => null);
+        if (health?.ready) break;
+        if (Date.now() > until) throw new Error("runtime did not become ready");
+      }
+      await bootstrap(d, p);
+    } finally {
+      p.recovering = false;
     }
-    await bootstrap(d, p);
     p.daemon = d;
     subscribe(p, d);
     log(`runtime ready key=${p.key.slice(0, 8)} ms=${Date.now() - t0}`);
+    // Streams opened during the recovery were answered `connecting`: send them the live state.
+    if (recovered) H.PROVIDER_IDS.forEach((id) => void publish(p, id));
     return d;
   }
+
+  /**
+   * A running runtime that lost the addresses it was created with for the gateway or the egress
+   * proxy (another container holds them, or the Engine refuses fixed addresses) is unreachable. It
+   * is restarted at the current addresses once nothing in it would be cut off: no run or sign-in in
+   * progress. A question or a code that waits for the person does not hold it up, because the person
+   * cannot answer before then. Until it is up again (`p.recovering`, set by start()) the person sees
+   * `connecting` and requests answer 503.
+   */
+  async function recover(p: Person, why: string) {
+    log(
+      `runtime must restart key=${p.key.slice(0, 8)} (${why}); waiting until it is idle`,
+    );
+    for (const id of H.PROVIDER_IDS)
+      emit(p, "provider.updated", recovering(p, id));
+    for (;;) {
+      const work = await runtime.activity?.(p.key).catch(() => null);
+      if (!work || !H.hasWork(work.project, work.clis, false)) break;
+      await Bun.sleep(RECOVERY_POLL_MS);
+    }
+    proxy.clear(p.key); // credentials last only while the runtime runs
+    await runtime.stop(p.key);
+    log(`runtime stopped key=${p.key.slice(0, 8)} (restarting)`);
+  }
+
+  /** The provider state while a runtime waits to restart: the last-known one, `connecting`. */
+  const recovering = (p: Person, id: H.ProviderId) => ({
+    provider: {
+      ...lastKnown(p, id),
+      status: "connecting" as const,
+      method: null,
+      account: null,
+      models: [],
+    },
+    connection: null,
+  });
 
   /** Idempotent on every daemon start: no admin bot, and the one project conversations live in. */
   async function bootstrap(d: H.Daemon, p: Person) {
@@ -246,18 +310,12 @@ export function createGateway(
 
   async function isBusy(d: H.Daemon) {
     const { project } = await d.call("GET", `/v0/projects/${H.PROJECT_ID}`);
-    if (
-      project.agents?.some(
-        (a: any) => a.status !== "idle" || a.pendingQuestionId,
-      )
-    )
-      return true;
-    for (const id of H.PROVIDER_IDS) {
-      const { providerCli } = await d.call("GET", `/v0/provider-clis/${id}`);
-      if (["running", "waiting"].includes(providerCli.operation?.status))
-        return true;
-    }
-    return false;
+    const clis = [];
+    for (const id of H.PROVIDER_IDS)
+      clis.push(
+        (await d.call("GET", `/v0/provider-clis/${id}`)).providerCli,
+      );
+    return H.hasWork(project, clis);
   }
 
   /**
@@ -540,7 +598,11 @@ export function createGateway(
    */
   async function listProviders({ p }: Ctx) {
     if (!p.daemon && !p.restarting)
-      return json({ providers: H.PROVIDER_IDS.map((id) => lastKnown(p, id)) });
+      return json({
+        providers: H.PROVIDER_IDS.map((id) =>
+          p.recovering ? recovering(p, id).provider : lastKnown(p, id),
+        ),
+      });
     const states = await Promise.all(
       H.PROVIDER_IDS.map((id) => state(p, id, true, false)),
     );
@@ -784,7 +846,7 @@ export function createGateway(
         for (const id of H.PROVIDER_IDS)
           void state(p, id).then(
             (s) => send?.("provider.updated", s),
-            () => {},
+            () => p.recovering && send?.("provider.updated", recovering(p, id)),
           );
       },
       cancel: leave,
@@ -1431,11 +1493,7 @@ export function createGateway(
         String((e as Error)?.message ?? "").slice(0, 160),
       );
       return json(
-        {
-          error: "runtime_unavailable",
-          message:
-            "Your workspace isn't reachable right now. Try again in a moment.",
-        },
+        { error: "runtime_unavailable", message: UNAVAILABLE },
         503,
       );
     }

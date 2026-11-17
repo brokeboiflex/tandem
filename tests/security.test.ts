@@ -4,14 +4,23 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { hostname } from "node:os";
 import { loadConfig, type Config } from "../src/config";
 import { proxyToken } from "../src/mcp";
-import { DockerRuntime } from "../src/runtime";
+import {
+  ACTIVITY_COMMAND,
+  DockerRuntime,
+  LAUNCH_VALUES_COMMAND,
+  StaleRuntime,
+} from "../src/runtime";
 import { socketProxyPolicy } from "./fake-daemon";
 import {
+  chooseAddresses,
   chooseOciRuntime,
   dockerApiAccess,
   egressEnv,
   inCidr,
   isAddressPoolExhausted,
+  peerAddresses,
+  pinPlan,
+  reservedAddresses,
   runtimeContainerSpec,
   runtimeNetworkSpec,
   RUNTIME_TMPDIR,
@@ -300,6 +309,20 @@ describe("generated specs", () => {
 
 type Call = { method: string; path: string; body: any };
 
+const frame = (text: string) => {
+  const out = new TextEncoder().encode(text);
+  const f = new Uint8Array(8 + out.length);
+  f[0] = 1;
+  new DataView(f.buffer).setUint32(4, out.length);
+  f.set(out, 8);
+  return f;
+};
+
+/**
+ * A small Docker Engine. Networks hand out addresses like Docker 29 (the lowest free one, a fixed one
+ * on request, Docker's own errors), runtime containers join their network when they start, and exec
+ * answers the controller's commands from the container's own settings.
+ */
 function fakeEngine(opts: {
   runtimes?: string[];
   plugins?: number;
@@ -307,6 +330,8 @@ function fakeEngine(opts: {
   egressRunning?: boolean;
   /** An Engine before 28: no isolated gateway mode, so the host keeps an address on the bridge. */
   oldEngine?: boolean;
+  /** Docker Engine 29.0.0-29.0.3: no fixed addresses on networks without a configured subnet. */
+  noFixedAddresses?: boolean;
 }) {
   const calls: Call[] = [];
   const containers = new Map<string, any>();
@@ -317,8 +342,57 @@ function fakeEngine(opts: {
     Name: "/tandem-egress",
     State: { Running: opts.egressRunning ?? true },
   };
-  let ip = 1;
+  /** Other containers on runtime networks (a neighbour, a debugging container). */
+  const others: any[] = [];
+  /** What a runtime's daemon answers inside it (ACTIVITY_COMMAND), by container name. */
+  const activity = new Map<string, string>();
+  const execs = new Map<string, { c: any; cmd: string[] }>();
+  let subnets = 0;
+  const find = (ref: string) =>
+    [self, egress, ...others, ...containers.values()].find(
+      (c) => c.Id === ref || c.Name === `/${ref}`,
+    );
   const json = (data: unknown, status = 200) => Response.json(data, { status });
+  const subnetOf = (n: any) => n.IPAM.Config[0].Subnet as string;
+  /** Docker 29's choice: the address asked for, or the lowest free one. */
+  function allocate(n: any, want?: string): string | Response {
+    const used = new Set(
+      Object.values<any>(n.Containers).map((m) => m.IPv4Address.split("/")[0]),
+    );
+    if (n.IPAM.Config[0].Gateway) used.add(n.IPAM.Config[0].Gateway);
+    const prefix = subnetOf(n).split(".").slice(0, 3).join(".");
+    if (want) {
+      if (opts.noFixedAddresses)
+        return json(
+          {
+            message:
+              "invalid endpoint settings:\nuser specified IP address is supported only when connecting to networks with user configured subnets",
+          },
+          400,
+        );
+      if (!inCidr(want, subnetOf(n)))
+        return json(
+          {
+            message: `invalid endpoint settings:\nno configured subnet contains IP address ${want}`,
+          },
+          400,
+        );
+      if (used.has(want)) return json({ message: "Address already in use" }, 403);
+      return want;
+    }
+    for (let i = 1; i < 255; i++)
+      if (!used.has(`${prefix}.${i}`)) return `${prefix}.${i}`;
+    return json({ message: "no available IPv4 addresses" }, 500);
+  }
+  function join(n: any, c: any, want?: string) {
+    const ip = allocate(n, want);
+    if (ip instanceof Response) return ip;
+    n.Containers[c.Id] = { Name: c.Name.slice(1), IPv4Address: `${ip}/24` };
+    return ip;
+  }
+  const leave = (c: any) => {
+    for (const n of networks.values()) delete n.Containers[c.Id];
+  };
   const server = Bun.serve({
     port: 0,
     async fetch(req) {
@@ -337,7 +411,6 @@ function fakeEngine(opts: {
         });
       if (path === "/plugins") return json([], opts.plugins ?? 200);
       if (path === `/containers/${hostname()}/json`) return json(self);
-      if (path === "/containers/tandem-egress/json") return json(egress);
       if ((m = path.match(/^\/images\/(.+)\/json$/)))
         return json({ Id: "sha256:img" });
       if (path === "/networks/create") {
@@ -351,7 +424,7 @@ function fakeEngine(opts: {
           );
         if (opts.oldEngine && body.Options)
           return json({ message: "invalid gateway mode: isolated" }, 400);
-        const subnet = `172.30.${networks.size}`;
+        const subnet = `172.30.${++subnets}`;
         networks.set(body.Name, {
           ...body,
           Containers: {},
@@ -370,23 +443,36 @@ function fakeEngine(opts: {
         const n = networks.get(m[1]!);
         if (!n) return json({ message: "no such network" }, 404);
         // Like the Engine: accepts an ID or a name, keys endpoints by ID.
-        const who = [self, egress].find(
-          (c) => c.Id === body.Container || c.Name === `/${body.Container}`,
-        );
+        const who = find(body.Container);
         if (!who) return json({ message: "no such container" }, 404);
-        if (m[2] === "connect") {
-          if (n.Containers[who.Id])
-            return json({ message: "endpoint already exists in network" }, 403);
-          n.Containers[who.Id] = {
-            Name: who.Name.slice(1),
-            IPv4Address: `172.30.0.${++ip}/24`,
-          };
-        } else delete n.Containers[who.Id];
-        return new Response(null, { status: 200 });
+        if (m[2] === "disconnect") {
+          if (!n.Containers[who.Id])
+            return json(
+              {
+                message: `container ${who.Id} is not connected to network ${m[1]}`,
+              },
+              500,
+            );
+          delete n.Containers[who.Id];
+          return new Response(null, { status: 200 });
+        }
+        if (n.Containers[who.Id])
+          return json(
+            {
+              message: `endpoint with name ${who.Name.slice(1)} already exists in network ${m[1]}`,
+            },
+            403,
+          );
+        const joined = join(n, who, body.EndpointConfig?.IPAMConfig?.IPv4Address);
+        return joined instanceof Response
+          ? joined
+          : new Response(null, { status: 200 });
       }
       if ((m = path.match(/^\/networks\/([^/]+)$/))) {
         const n = networks.get(m[1]!);
         if (req.method === "DELETE") {
+          if (n && Object.keys(n.Containers).length)
+            return json({ message: "network has active endpoints" }, 403);
           networks.delete(m[1]!);
           return new Response(null, { status: n ? 204 : 404 });
         }
@@ -404,35 +490,45 @@ function fakeEngine(opts: {
         const name = url.searchParams.get("name")!;
         containers.set(name, {
           Id: name,
+          Name: `/${name}`,
           Image: "sha256:img",
           Config: { Labels: body.Labels, Env: body.Env },
           HostConfig: body.HostConfig,
-          NetworkSettings: {
-            Networks: {
-              [body.HostConfig.NetworkMode]: { IPAddress: `172.30.0.${++ip}` },
-            },
-          },
+          NetworkSettings: { Networks: {} },
           State: { Running: false },
         });
         return json({ Id: name }, 201);
       }
-      if ((m = path.match(/^\/containers\/([^/]+)\/(start|stop)$/))) {
+      if ((m = path.match(/^\/containers\/([^/]+)\/(start|stop|restart)$/))) {
         const c = containers.get(m[1]!);
         if (!c) return json({ message: "no such container" }, 404);
+        const net = c.HostConfig.NetworkMode;
+        leave(c);
+        c.NetworkSettings.Networks = {};
+        if (m[2] !== "stop") {
+          const n = networks.get(net);
+          if (!n) return json({ message: `network ${net} not found` }, 404);
+          const ip = join(n, c);
+          if (ip instanceof Response) return ip;
+          c.NetworkSettings.Networks[net] = { IPAddress: ip };
+        }
         c.State = {
-          Running: m[2] === "start",
+          Running: m[2] !== "stop",
           StartedAt: new Date().toISOString(),
         };
         return new Response(null, { status: 204 });
       }
       if ((m = path.match(/^\/containers\/([^/]+)\/json$/))) {
-        const c = containers.get(m[1]!);
+        const c = find(m[1]!);
         return c ? json(c) : json({ message: "no such container" }, 404);
       }
       if (
         (m = path.match(/^\/containers\/([^/]+)$/)) &&
         req.method === "DELETE"
       ) {
+        const c = containers.get(m[1]!);
+        if (c?.State.Running)
+          return json({ message: "container is running" }, 409);
         containers.delete(m[1]!);
         return new Response(null, { status: 204 });
       }
@@ -440,23 +536,60 @@ function fakeEngine(opts: {
         return json(
           [...containers.values()]
             .filter((c) => c.State.Running)
-            .map((c) => ({ Labels: c.Config.Labels })),
+            .map((c) => ({ Id: c.Id, Labels: c.Config.Labels })),
         );
-      if ((m = path.match(/^\/containers\/([^/]+)\/exec$/)))
-        return json({ Id: "e1" }, 201);
-      if (path === "/exec/e1/start") {
-        const out = new TextEncoder().encode("t".repeat(43));
-        const frame = new Uint8Array(8 + out.length);
-        frame[0] = 1;
-        new DataView(frame.buffer).setUint32(4, out.length);
-        frame.set(out, 8);
-        return new Response(frame, { headers: { connection: "close" } });
+      if ((m = path.match(/^\/containers\/([^/]+)\/exec$/))) {
+        const c = find(decodeURIComponent(m[1]!));
+        if (!c?.State?.Running)
+          return json({ message: "container is not running" }, 409);
+        const id = `e${execs.size + 1}`;
+        execs.set(id, { c, cmd: body.Cmd });
+        return json({ Id: id }, 201);
       }
-      if (path === "/exec/e1/json") return json({ ExitCode: 0 });
+      if ((m = path.match(/^\/exec\/([^/]+)\/start$/))) {
+        const { c, cmd } = execs.get(m[1]!)!;
+        const env = (name: string) =>
+          (c.Config?.Env ?? [])
+            .find((e: string) => e.startsWith(`${name}=`))
+            ?.slice(name.length + 1) ?? "";
+        let out = "";
+        if (cmd[0] === "cat") out = "t".repeat(43);
+        else if (JSON.stringify(cmd) === JSON.stringify(LAUNCH_VALUES_COMMAND))
+          out = `${env("HAPPY_BRIDGE_ALLOW")} ${env("MCP_PROXY_URL")} ${env("HTTPS_PROXY")}\n`;
+        else if (JSON.stringify(cmd) === JSON.stringify(ACTIVITY_COMMAND))
+          out =
+            activity.get(c.Name.slice(1)) ??
+            `${JSON.stringify({ project: { agents: [] } })}\n${JSON.stringify({ providerCli: { id: "claude", operation: null } })}\n${JSON.stringify({ providerCli: { id: "codex", operation: null } })}\n`;
+        return new Response(frame(out), { headers: { connection: "close" } });
+      }
+      if ((m = path.match(/^\/exec\/([^/]+)\/json$/))) return json({ ExitCode: 0 });
       return json({ message: `fake engine: ${req.method} ${path}` }, 500);
     },
   });
-  return { server, calls, containers, networks, self, egress };
+  /** `docker compose up --force-recreate`: a new container under the same name, on no runtime network. */
+  const recreate = (c: { Id: string }, id: string) => {
+    leave(c);
+    c.Id = id.padEnd(64, "0");
+  };
+  /** A container that is not Tandem's, attached to a runtime network at `ip`. */
+  const intruder = (network: string, ip?: string) => {
+    const c = { Id: `x${others.length}`.padEnd(64, "0"), Name: `/intruder-${others.length}` };
+    others.push(c);
+    return join(networks.get(network), c, ip);
+  };
+  return {
+    server,
+    calls,
+    containers,
+    networks,
+    self,
+    egress,
+    activity,
+    recreate,
+    intruder,
+    join: (network: string, c: any, ip?: string) =>
+      join(networks.get(network), c, ip),
+  };
 }
 
 const engines: ReturnType<typeof fakeEngine>[] = [];
@@ -475,6 +608,23 @@ function controller(
   return { rt: new DockerRuntime(cfg, (...a) => logs.push(a.join(" "))), logs };
 }
 
+/** Each container's address on a network, by container name. */
+const addresses = (engine: ReturnType<typeof fakeEngine>, network: string) =>
+  Object.fromEntries(
+    Object.values<any>(engine.networks.get(network).Containers).map((m) => [
+      m.Name,
+      m.IPv4Address.split("/")[0],
+    ]),
+  );
+
+/** Calls that start, stop, restart or remove a runtime container. */
+const lifecycle = (engine: ReturnType<typeof fakeEngine>, key: string) =>
+  engine.calls.filter(
+    (c) =>
+      c.path.startsWith(`/containers/tandem-rt-${key}`) &&
+      !/\/(json|exec)$/.test(c.path),
+  );
+
 describe("Docker runtime controller", () => {
   const KEY = "a".repeat(24);
 
@@ -492,15 +642,22 @@ describe("Docker runtime controller", () => {
     await rt.ensure(KEY);
     const net = engine.networks.get(`tandem-net-${KEY}`);
     expect(net.Internal).toBe(true);
-    expect(Object.keys(net.Containers).sort()).toEqual(
-      [engine.egress.Id, engine.self.Id].sort(),
-    );
     const c = engine.containers.get(`tandem-rt-${KEY}`);
+    expect(Object.keys(net.Containers).sort()).toEqual(
+      [engine.egress.Id, engine.self.Id, c.Id].sort(),
+    );
     expect(c.HostConfig.NetworkMode).toBe(`tandem-net-${KEY}`);
     expect(c.HostConfig.Runtime).toBe("runsc");
-    const gatewayIp = net.Containers[engine.self.Id].IPv4Address.split("/")[0];
+    // The gateway and the egress proxy take the network's last two addresses; the runtime the first.
+    const subnet = net.IPAM.Config[0].Subnet.replace(/\.0\/24$/, "");
+    expect(addresses(engine, `tandem-net-${KEY}`)).toEqual({
+      "tandem-gateway": `${subnet}.254`,
+      "tandem-egress": `${subnet}.253`,
+      [`tandem-rt-${KEY}`]: `${subnet}.1`,
+    });
+    const gatewayIp = `${subnet}.254`;
     expect(c.Config.Labels["tandem.bridge-allow"]).toBe(`${gatewayIp}/32`);
-    const egressIp = net.Containers[engine.egress.Id].IPv4Address.split("/")[0];
+    const egressIp = `${subnet}.253`;
     const env: string[] = engine.calls.find((x) =>
       x.path.startsWith("/containers/create"),
     )!.body.Env;
@@ -526,11 +683,180 @@ describe("Docker runtime controller", () => {
     expect(engine.containers.get(`tandem-rt-${KEY}`).State.Running).toBe(true);
   });
 
+  test("a recreated gateway and egress proxy return to the addresses a running runtime was created with, without restarting it", async () => {
+    const engine = fakeEngine({});
+    await controller(engine).rt.ensure(KEY);
+    const net = `tandem-net-${KEY}`;
+    const before = addresses(engine, net);
+    const started = engine.containers.get(`tandem-rt-${KEY}`).State.StartedAt;
+    // `docker compose up -d --force-recreate gateway egress`, the hostile way: the new egress proxy
+    // joins first and takes the gateway's address.
+    engine.recreate(engine.egress, "egress2");
+    engine.recreate(engine.self, "self2");
+    engine.join(net, engine.egress, before["tandem-gateway"]);
+    engine.calls.length = 0;
+    const { rt, logs } = controller(engine); // the new gateway process
+    expect((await rt.ensure(KEY)).key).toBe(KEY);
+    expect(addresses(engine, net)).toEqual(before);
+    expect(lifecycle(engine, KEY)).toEqual([]);
+    expect(engine.containers.get(`tandem-rt-${KEY}`).State.StartedAt).toBe(
+      started,
+    );
+    expect(logs.join("\n")).toContain(
+      `egress moved on ${net}: ${before["tandem-gateway"]} -> ${before["tandem-egress"]}`,
+    );
+    // Moving them is a disconnect and fixed-address connects, nothing else.
+    expect(
+      engine.calls
+        .filter((c) => c.method === "POST" && c.path.startsWith("/networks/"))
+        .map((c) => `${c.path.split("/").at(-1)} ${c.body.EndpointConfig?.IPAMConfig?.IPv4Address ?? ""}`.trim()),
+    ).toEqual([
+      "disconnect",
+      `connect ${before["tandem-gateway"]}`,
+      `connect ${before["tandem-egress"]}`,
+    ]);
+    // A plain gateway restart (--no-deps) changes nothing else either.
+    engine.recreate(engine.self, "self3");
+    engine.calls.length = 0;
+    await controller(engine).rt.ensure(KEY);
+    expect(addresses(engine, net)).toEqual(before);
+    expect(lifecycle(engine, KEY)).toEqual([]);
+  });
+
+  test("a runtime from an older Tandem keeps working: the gateway takes the addresses it was created with", async () => {
+    const engine = fakeEngine({});
+    const { rt: old } = controller(engine);
+    await old.ensure(KEY);
+    // Recreate the runtime the way Tandem did before fixed addresses: gateway, egress proxy and
+    // runtime took the lowest free addresses, in that order.
+    const net = `tandem-net-${KEY}`;
+    const n = engine.networks.get(net);
+    const c = engine.containers.get(`tandem-rt-${KEY}`);
+    n.Containers = {};
+    const gw = engine.join(net, engine.self) as string;
+    const eg = engine.join(net, engine.egress) as string;
+    engine.join(net, c);
+    c.Config.Env = c.Config.Env.map((e: string) =>
+      e
+        .replace(/^(HAPPY_BRIDGE_ALLOW=).*/, `$1${gw}/32`)
+        .replace(/^(MCP_PROXY_URL=http:\/\/)[^:]+/, `$1${gw}`)
+        .replace(/^(HTTPS_PROXY=http:\/\/)[^:]+/, `$1${eg}`),
+    );
+    // The upgrade recreated both; the new egress proxy got the gateway's old address first.
+    engine.recreate(engine.egress, "egress2");
+    engine.recreate(engine.self, "self2");
+    engine.join(net, engine.egress);
+    expect(addresses(engine, net)["tandem-egress"]).toBe(gw);
+    engine.calls.length = 0;
+    await controller(engine).rt.ensure(KEY);
+    expect(addresses(engine, net)).toMatchObject({
+      "tandem-gateway": gw,
+      "tandem-egress": eg,
+    });
+    expect(lifecycle(engine, KEY)).toEqual([]);
+  });
+
+  test("addresses another container holds: StaleRuntime until the runtime is stopped; its volume is never touched", async () => {
+    const engine = fakeEngine({});
+    await controller(engine).rt.ensure(KEY);
+    const net = `tandem-net-${KEY}`;
+    const gw = addresses(engine, net)["tandem-gateway"];
+    engine.recreate(engine.self, "self2");
+    engine.intruder(net, gw);
+    engine.calls.length = 0;
+    const { rt, logs } = controller(engine);
+    expect(rt.ensure(KEY)).rejects.toBeInstanceOf(StaleRuntime);
+    await Bun.sleep(50);
+    // A restart keeps the runtime's settings, so it would not help: refused before restarting.
+    expect(rt.restart(KEY)).rejects.toBeInstanceOf(StaleRuntime);
+    await Bun.sleep(50);
+    expect(lifecycle(engine, KEY)).toEqual([]);
+    expect(logs.join("\n")).toContain("another container holds it");
+    // The gateway stops it once idle (src/gateway.ts). The intruder keeps the network, so the next
+    // start reuses it with the gateway wherever Docker puts it, and the new runtime expects that.
+    await rt.stop(KEY);
+    expect(logs.join("\n")).toContain("network kept for now");
+    await rt.ensure(KEY);
+    const c = engine.containers.get(`tandem-rt-${KEY}`);
+    expect(c.State.Running).toBe(true);
+    expect(c.Config.Env).toContain(
+      `HAPPY_BRIDGE_ALLOW=${addresses(engine, net)["tandem-gateway"]}/32`,
+    );
+    expect(
+      engine.calls.filter((c) => c.path.startsWith("/volumes") && c.method !== "POST" && c.method !== "GET"),
+    ).toEqual([]);
+  });
+
+  test("the sweep puts a recreated egress proxy back at its address", async () => {
+    const engine = fakeEngine({});
+    const { rt } = controller(engine);
+    await rt.ensure(KEY);
+    const net = `tandem-net-${KEY}`;
+    const before = addresses(engine, net);
+    engine.recreate(engine.egress, "egress2"); // compose up -d --force-recreate --no-deps egress
+    expect(addresses(engine, net)["tandem-egress"]).toBeUndefined();
+    await rt.sweep();
+    expect(addresses(engine, net)).toEqual(before);
+    // The address a runtime was created with is read once per container (inside it: a Docker API
+    // proxy redacts environments).
+    await rt.sweep();
+    const reads = engine.calls.filter(
+      (c) =>
+        c.path.endsWith("/exec") &&
+        JSON.stringify(c.body.Cmd) === JSON.stringify(LAUNCH_VALUES_COMMAND),
+    );
+    expect(reads).toHaveLength(1);
+  });
+
+  test("an Engine that refuses fixed addresses still works, with a warning; a lost address makes the runtime stale", async () => {
+    const engine = fakeEngine({ noFixedAddresses: true });
+    const { rt, logs } = controller(engine);
+    await rt.ensure(KEY);
+    expect(engine.containers.get(`tandem-rt-${KEY}`).State.Running).toBe(true);
+    expect(logs.join("\n")).toContain("Docker refused a fixed address");
+    const net = `tandem-net-${KEY}`;
+    const before = addresses(engine, net);
+    // The hostile order still recovers: once the egress proxy leaves the gateway's address, it is
+    // the lowest free one again.
+    engine.recreate(engine.egress, "egress2");
+    engine.recreate(engine.self, "self2");
+    engine.join(net, engine.egress);
+    expect(addresses(engine, net)["tandem-egress"]).toBe(
+      before["tandem-gateway"],
+    );
+    await controller(engine).rt.ensure(KEY);
+    expect(addresses(engine, net)).toEqual(before);
+    // Another container that took the gateway's address meanwhile cannot be worked around.
+    engine.recreate(engine.self, "self3");
+    engine.intruder(net);
+    expect(controller(engine).rt.ensure(KEY)).rejects.toBeInstanceOf(
+      StaleRuntime,
+    );
+    await Bun.sleep(50);
+  });
+
+  test("the daemon's activity is read inside the runtime", async () => {
+    const engine = fakeEngine({});
+    const { rt } = controller(engine);
+    await rt.ensure(KEY);
+    expect(await rt.activity(KEY)).toEqual({
+      project: { agents: [] },
+      clis: [
+        { id: "claude", operation: null },
+        { id: "codex", operation: null },
+      ],
+    });
+    engine.activity.set(`tandem-rt-${KEY}`, "not json\n");
+    expect(await rt.activity(KEY)).toBeNull();
+  });
+
   test("a network left by a runtime stopped outside the gateway is swept; the runtime is recreated on its next start", async () => {
     const engine = fakeEngine({});
     const { rt } = controller(engine);
     await rt.ensure(KEY);
-    engine.containers.get(`tandem-rt-${KEY}`).State = { Running: false }; // docker stop
+    const c = engine.containers.get(`tandem-rt-${KEY}`);
+    c.State = { Running: false }; // docker stop
+    for (const n of engine.networks.values()) delete n.Containers[c.Id];
     await rt.sweep();
     expect(engine.networks.has(`tandem-net-${KEY}`)).toBe(false);
     await rt.ensure(KEY);
@@ -555,22 +881,37 @@ describe("Docker runtime controller", () => {
     const gatewayIp = engine.networks
       .get("tandem-runtimes")
       .Containers[engine.self.Id].IPv4Address.split("/")[0];
+    expect(gatewayIp).toEndWith(".254"); // fixed there as well
     expect(c.Config.Env).toContain(
       `MCP_PROXY_URL=http://${gatewayIp}:8790/mcp/${KEY}`,
     );
     expect(await rt.address(KEY)).toBe(
       c.NetworkSettings.Networks["tandem-runtimes"].IPAddress,
     );
+    // A second runtime shares it; after a gateway restart both find it where they expect it.
+    const OTHER = "b".repeat(24);
+    await rt.ensure(OTHER);
+    engine.recreate(engine.self, "self2");
+    const { rt: next } = controller(engine);
+    await next.ensure(KEY);
+    await next.ensure(OTHER);
+    expect(addresses(engine, "tandem-runtimes")["tandem-gateway"]).toBe(
+      gatewayIp,
+    );
+    expect(lifecycle(engine, KEY)).toHaveLength(1); // its one start
   });
 
   test("the controller's own exec runs as the runtime user and is allowlisted for the socket proxy", async () => {
     const engine = fakeEngine({});
     const { rt } = controller(engine);
     await rt.ensure(KEY);
+    engine.recreate(engine.self, "self2");
+    await controller(engine).rt.ensure(KEY); // reads what the runtime was created with
+    await rt.activity(KEY);
     const execs = engine.calls
       .filter((c) => /^\/containers\/[^/]+\/exec$/.test(c.path))
       .map((c) => c.body);
-    expect(execs.length).toBeGreaterThan(0);
+    expect(new Set(execs.map((e) => e.Cmd[0] + " " + (e.Cmd[2] ?? e.Cmd[1]).slice(0, 4))).size).toBe(3);
     const policy = await socketProxyPolicy();
     for (const e of execs) {
       expect(e.User).toBe("10001:10001");
@@ -638,6 +979,10 @@ describe("Docker runtime controller", () => {
     expect(engine.containers.get(`tandem-rt-${KEY}`).State.Running).toBe(true);
     expect(engine.networks.get(`tandem-net-${KEY}`).Internal).toBe(true);
     expect(logs.join("\n")).toContain("host-side address");
+    // The bridge keeps the first address; the gateway still takes the last.
+    expect(addresses(engine, `tandem-net-${KEY}`)["tandem-gateway"]).toEndWith(
+      ".254",
+    );
   });
 
   test("egress off: runtime networks get a route out and runtimes no proxy variables", async () => {
@@ -649,5 +994,150 @@ describe("Docker runtime controller", () => {
       c.path.startsWith("/containers/create"),
     )!.body.Env;
     expect(env.some((e) => e.startsWith("HTTPS_PROXY="))).toBe(false);
+    // Only the gateway is pinned; a gateway restart still finds the runtime reachable.
+    engine.recreate(engine.self, "self2");
+    await controller(engine, { EGRESS_MODE: "off" }).rt.ensure(KEY);
+    expect(lifecycle(engine, KEY)).toHaveLength(1);
+  });
+});
+
+describe("fixed addresses on runtime networks", () => {
+  test("the gateway and the egress proxy take the subnet's last two addresses", () => {
+    expect(reservedAddresses("172.25.0.0/16")).toEqual({
+      gateway: "172.25.255.254",
+      egress: "172.25.255.253",
+    });
+    expect(reservedAddresses("192.168.16.0/20")).toEqual({
+      gateway: "192.168.31.254",
+      egress: "192.168.31.253",
+    });
+    expect(reservedAddresses("10.9.8.0/29")).toEqual({
+      gateway: "10.9.8.6",
+      egress: "10.9.8.5",
+    });
+    expect(reservedAddresses("10.9.8.0/29", ["10.9.8.6"])).toEqual({
+      gateway: "10.9.8.5",
+      egress: "10.9.8.4",
+    });
+    expect(reservedAddresses("10.9.8.0/30")).toBeNull();
+    expect(reservedAddresses("fd00::/64")).toBeNull();
+  });
+
+  test("what a runtime was created with, read from its own settings", () => {
+    const subnet = "172.25.0.0/16";
+    const key = "k".repeat(24);
+    // Before fixed addresses (as on the main stack before this change) and after.
+    expect(
+      peerAddresses(
+        {
+          allow: "172.25.0.1/32",
+          mcpProxyUrl: `http://172.25.0.1:8790/mcp/${key}`,
+          httpsProxy: "http://172.25.0.2:4750",
+        },
+        subnet,
+      ),
+    ).toEqual({ gateway: "172.25.0.1", egress: "172.25.0.2" });
+    // BRIDGE_ALLOW as a range: the MCP proxy URL names the gateway.
+    expect(
+      peerAddresses(
+        {
+          allow: "172.16.0.0/12",
+          mcpProxyUrl: `http://172.25.255.254:8790/mcp/${key}`,
+          httpsProxy: "http://172.25.255.253:4750",
+        },
+        subnet,
+      ),
+    ).toEqual({ gateway: "172.25.255.254", egress: "172.25.255.253" });
+    // An operator's MCP_PROXY_URL, egress off, a gateway outside Docker: nothing on this network.
+    expect(
+      peerAddresses(
+        {
+          allow: "192.168.1.10/32",
+          mcpProxyUrl: `http://mcp-proxy.internal:9000/mcp/${key}`,
+          httpsProxy: "",
+        },
+        subnet,
+      ),
+    ).toEqual({});
+  });
+
+  test("where each one belongs: where the running runtimes expect it, else the reserved address", () => {
+    const reserved = { gateway: "10.0.0.254", egress: "10.0.0.253" };
+    expect(chooseAddresses({}, [], reserved)).toEqual(reserved);
+    expect(
+      chooseAddresses({ gateway: "10.0.0.7" }, [{}], reserved),
+    ).toEqual(reserved);
+    expect(
+      chooseAddresses(
+        { gateway: "10.0.0.2", egress: "10.0.0.1" },
+        [{ gateway: "10.0.0.1", egress: "10.0.0.2" }],
+        reserved,
+      ),
+    ).toEqual({ gateway: "10.0.0.1", egress: "10.0.0.2" });
+    // A shared network of runtimes from before and after an old gateway restart: where it is now
+    // when some expect that (nothing moves), otherwise where most expect it.
+    const mixed = [
+      { gateway: "10.0.0.1" },
+      { gateway: "10.0.0.5" },
+      { gateway: "10.0.0.5" },
+    ];
+    expect(chooseAddresses({ gateway: "10.0.0.1" }, mixed, reserved).gateway).toBe(
+      "10.0.0.1",
+    );
+    expect(chooseAddresses({ gateway: "10.0.0.9" }, mixed, reserved).gateway).toBe(
+      "10.0.0.5",
+    );
+  });
+
+  test("the moves that put each one at its address", () => {
+    const want = { gateway: "10.0.0.1", egress: "10.0.0.2" };
+    const both = ["gateway", "egress"] as const;
+    const rt = { ip: "10.0.0.3" };
+    expect(
+      pinPlan(
+        [{ peer: "gateway", ip: "10.0.0.1" }, { peer: "egress", ip: "10.0.0.2" }, rt],
+        [...both],
+        want,
+      ),
+    ).toEqual({ disconnect: [], connect: [], blocked: [] });
+    // A new gateway: it joins at its address.
+    expect(pinPlan([{ peer: "egress", ip: "10.0.0.2" }, rt], [...both], want)).toEqual({
+      disconnect: [],
+      connect: [{ peer: "gateway", ip: "10.0.0.1" }],
+      blocked: [],
+    });
+    // The bug: the new egress proxy took the gateway's address and the gateway the proxy's.
+    expect(
+      pinPlan(
+        [{ peer: "egress", ip: "10.0.0.1" }, { peer: "gateway", ip: "10.0.0.2" }, rt],
+        [...both],
+        want,
+      ),
+    ).toEqual({
+      disconnect: ["gateway", "egress"],
+      connect: [
+        { peer: "gateway", ip: "10.0.0.1" },
+        { peer: "egress", ip: "10.0.0.2" },
+      ],
+      blocked: [],
+    });
+    // The egress proxy on the gateway's address, the gateway not there yet.
+    expect(pinPlan([{ peer: "egress", ip: "10.0.0.1" }, rt], [...both], want)).toEqual({
+      disconnect: ["egress"],
+      connect: [
+        { peer: "gateway", ip: "10.0.0.1" },
+        { peer: "egress", ip: "10.0.0.2" },
+      ],
+      blocked: [],
+    });
+    // Another container holds the gateway's address: nothing is moved for it.
+    expect(
+      pinPlan([{ ip: "10.0.0.1" }, { peer: "gateway", ip: "10.0.0.4" }, { peer: "egress", ip: "10.0.0.2" }], [...both], want),
+    ).toEqual({ disconnect: [], connect: [], blocked: ["gateway"] });
+    expect(pinPlan([{ ip: "10.0.0.1" }, { peer: "egress", ip: "10.0.0.2" }], [...both], want)).toEqual({
+      disconnect: [],
+      connect: [{ peer: "gateway" }],
+      blocked: ["gateway"],
+    });
   });
 });

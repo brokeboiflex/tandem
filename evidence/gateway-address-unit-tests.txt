@@ -1,0 +1,28 @@
+$ bun run typecheck && bun test ./tests
+$ tsc --noEmit
+bun test v1.3.9 (cf6cdbbb)
+ 103 pass
+ 0 fail
+ 573 expect() calls
+Ran 103 tests across 4 files. [13.23s]
+# tests/gateway.test.ts: 25 pass 
+# tests/happy.test.ts: 22 pass 
+# tests/mcp.test.ts: 21 pass 
+# tests/security.test.ts: 35 pass 
+
+# New in this change (all pass):
+  tests/gateway.test.ts: a runtime that lost its network addresses restarts once idle, never mid-run; meanwhile the person sees connecting
+  tests/happy.test.ts: describe work a restart would cut off
+  tests/happy.test.ts: an idle stop waits for runs, questions and sign-ins
+  tests/happy.test.ts: a restart of an unreachable runtime waits only for what finishes on its own
+  tests/security.test.ts: a recreated gateway and egress proxy return to the addresses a running runtime was created with, without restarting it
+  tests/security.test.ts: a runtime from an older Tandem keeps working: the gateway takes the addresses it was created with
+  tests/security.test.ts: addresses another container holds: StaleRuntime until the runtime is stopped; its volume is never touched
+  tests/security.test.ts: the sweep puts a recreated egress proxy back at its address
+  tests/security.test.ts: an Engine that refuses fixed addresses still works, with a warning; a lost address makes the runtime stale
+  tests/security.test.ts: the daemon's activity is read inside the runtime
+  tests/security.test.ts: describe fixed addresses on runtime networks
+  tests/security.test.ts: the gateway and the egress proxy take the subnet's last two addresses
+  tests/security.test.ts: what a runtime was created with, read from its own settings
+  tests/security.test.ts: where each one belongs: where the running runtimes expect it, else the reserved address
+  tests/security.test.ts: the moves that put each one at its address
