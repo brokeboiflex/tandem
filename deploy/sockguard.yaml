@@ -58,6 +58,9 @@ request_body:
       - ["sh", "-c", 'codex logout >/dev/null 2>&1; rm -f "$HOME/.codex/auth.json"']
       - ["sh", "-c", 'grok logout >/dev/null 2>&1; rm -f "$HOME/.grok/"auth.json*']
       - ["rm", "-f", "/home/agent/.agent-runtime/openrouter-api-key"]
+      - ["rm", "-f", "/home/agent/.agent-runtime/gemini-api-key"]
+      # Whether Google accepts a Gemini API key (src/runtime.ts GEMINI_KEY_COMMAND): its model list.
+      - ["sh", "-c", 'k=$(cat /home/agent/.agent-runtime/gemini-api-key) && echo "x-goog-api-key: $k" | curl -sf -m 15 -o /dev/null -H @- "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1"']
       # MCP registrations, conversation titles and standing instructions (src/gateway.ts).
       - ["cat", "/home/agent/.agent-runtime/mcp-servers.json"]
       - ["cat", "/home/agent/.agent-runtime/titles.json"]

@@ -2,7 +2,7 @@
 // Happy Agent 2026.11.6-preview.7 daemon (tests/fixtures).
 import { describe, expect, test } from "bun:test";
 import * as H from "../src/happy";
-import { ACTIVITY_COMMAND } from "../src/runtime";
+import { ACTIVITY_COMMAND, GEMINI_KEY_COMMAND } from "../src/runtime";
 import { socketProxyPolicy } from "./fake-daemon";
 
 const fixture = (name: string) =>
@@ -786,7 +786,7 @@ describe("work a restart would cut off", () => {
   });
 });
 
-describe("Grok and OpenRouter", () => {
+describe("Grok, OpenRouter and Gemini", () => {
   const grokSignedIn = cli("grok", {
     signIn: {
       status: "signed_in",
@@ -803,7 +803,13 @@ describe("Grok and OpenRouter", () => {
   });
 
   test("Grok signs in through its CLI; OpenRouter takes only an API key", () => {
-    expect(H.PROVIDER_IDS).toEqual(["claude", "codex", "grok", "openrouter"]);
+    expect(H.PROVIDER_IDS).toEqual([
+      "claude",
+      "codex",
+      "grok",
+      "openrouter",
+      "gemini",
+    ]);
     expect(H.CLI_IDS).toEqual(["claude", "codex", "grok"]);
     expect(H.apiKeyOf("openrouter")).toMatchObject({
       file: "openrouter-api-key",
@@ -892,12 +898,12 @@ describe("Grok and OpenRouter", () => {
       account: { email: null, plan: "API key" },
     });
     // The models runtime/happy.toml lists, named and sized from OpenRouter's /models.
-    expect(view.models).toHaveLength(8);
+    expect(view.models).toHaveLength(6);
     expect(view.models[0]).toEqual({
-      id: "anthropic/claude-sonnet-5.5",
-      name: "Anthropic: Claude Sonnet 5.5",
+      id: "deepseek/deepseek-v4.1-flash-1017",
+      name: "DeepSeek: DeepSeek V4.1 Flash 1017",
       default: false,
-      efforts: ["low", "medium", "high", "xhigh", "max"],
+      efforts: ["off", "low", "high", "max"],
       defaultEffort: "high",
     });
     expect(
@@ -932,11 +938,75 @@ describe("Grok and OpenRouter", () => {
     ).toBeNull();
   });
 
+  test("Gemini is the Antigravity harness's account, connected exactly when it runs on the person's key", () => {
+    expect(H.happyId("gemini")).toBe("antigravity");
+    expect(H.providerOf("antigravity")).toBe("gemini");
+    expect(H.providerOf("gemini")).toBeNull();
+    expect(H.CLI_IDS).not.toContain("gemini");
+    expect(H.providerMethod("gemini")).toBeNull();
+    expect(H.providerView("gemini", null, providers)).toMatchObject({
+      status: "not_connected",
+      models: [],
+    });
+    const view = H.providerView(
+      "gemini",
+      null,
+      withName("antigravity", "Gemini API key"),
+    );
+    expect(view).toMatchObject({
+      id: "gemini",
+      status: "connected",
+      method: "api_key",
+      account: { email: null, plan: "API key" },
+    });
+    // The models agy reported for a Gemini API key, live (captured from the pinned daemon).
+    expect(view.models.map((m) => m.id)).toEqual([
+      "antigravity/gemini-4-carbon",
+      "antigravity/gemini-4-hydrogen",
+      "antigravity/gemini-4-argon",
+      "antigravity/gemini-3.8-flash",
+      "antigravity/gemini-3.7-flash",
+      "antigravity/gemini-3.6-flash",
+      "antigravity/gemini-3.1-pro",
+    ]);
+    expect(view.models[0]).toEqual({
+      id: "antigravity/gemini-4-carbon",
+      name: "Gemini 4 Carbon",
+      default: false,
+      efforts: ["low", "medium", "high"],
+      defaultEffort: "medium",
+    });
+  });
+
+  test("turns on the Antigravity account belong to Gemini", () => {
+    const agent = { id: "m1", status: "idle", createdAt: 0 };
+    expect(
+      H.conversationView(agent, {
+        providerId: "antigravity",
+        modelId: "antigravity/gemini-3.8-flash",
+      }).provider,
+    ).toBe("gemini");
+    const message = {
+      id: "f1",
+      role: "service",
+      createdAt: 5,
+      error: { mode: { providerId: "antigravity" } },
+      failure: { kind: "signin_missing", message: "" },
+    };
+    expect(
+      H.signinFailure({ type: "message.created", payload: { message } }),
+    ).toEqual({ provider: "gemini", at: 5 });
+    expect(H.classifyFailure(message.failure, "antigravity").message).toContain(
+      "Your Gemini account",
+    );
+  });
+
   test("every sign-out and the activity check are allowlisted for the socket proxy", async () => {
     const policy = await socketProxyPolicy();
     for (const id of H.PROVIDER_IDS)
       expect(policy.commands.has(JSON.stringify(H.SIGN_OUT[id]))).toBe(true);
     expect(policy.commands.has(JSON.stringify(ACTIVITY_COMMAND))).toBe(true);
+    expect(policy.commands.has(JSON.stringify(GEMINI_KEY_COMMAND))).toBe(true);
     // It reads every provider CLI the gateway signs in with.
     for (const id of H.CLI_IDS)
       expect(ACTIVITY_COMMAND[2]).toMatch(new RegExp(`provider-clis/${id}[ ;]`));

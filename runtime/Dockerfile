@@ -1,7 +1,7 @@
 # Tandem runtime: one container runs one standalone Happy Agent daemon for one person.
 # Build with BuildKit (docker buildx) for linux/arm64 and/or linux/amd64. Every download is pinned
 # per architecture and verified by checksum. Do not publish images built from this file: they
-# contain Claude Code and the Grok CLI (see THIRD_PARTY.md).
+# contain Claude Code, the Grok CLI and Google's Antigravity CLI (see THIRD_PARTY.md).
 
 # Multi-arch index digest (covers linux/amd64 and linux/arm64).
 ARG BASE=debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
@@ -34,6 +34,12 @@ ARG CLAUDE_CODE_SHA512_AMD64=956f8c8544e19d4da1afa42743dc600fc73a3960096d836988c
 ARG GROK_VERSION=1.0.89
 ARG GROK_SHA256_ARM64=20496afea9dcec8ff1a3e3742a2966980888770d4ee845f80e5f0e5db56acb8b
 ARG GROK_SHA256_AMD64=404456474906572060fa36745266caf1e967e9084e656da9572b42d35febf342
+# Google's Antigravity CLI (agy) for the antigravity harness (`agy acp`), which runs Gemini on the
+# person's own Gemini API key (sha512 from the vendor's release manifests). The release path names
+# the version and its build.
+ARG AGY_RELEASE=1.5.11-6132547114106880
+ARG AGY_SHA512_ARM64=5f703c88e01851061c87c07b1a4ca54c1f5a6826ffada9fb005974a099e9a552ddb1f9ba2fe1194e2829803482c86084babf8cf91530a528bc7f659613600585
+ARG AGY_SHA512_AMD64=dad3c015e8964fcdc1639b13b7152f4cb84cb1bde385707e2bcdf095d6f1831f4f6521199aec499cc052f9e99906b7fdbc52c273df064d5cb7c84b068ba3ce50
 
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
  && rm -rf /var/lib/apt/lists/* && mkdir /out
@@ -44,12 +50,14 @@ RUN set -eu; \
              codex=aarch64-unknown-linux-musl; codex_sha=$CODEX_SHA256_ARM64; \
              host_sha=$CODEX_CODE_MODE_HOST_SHA256_ARM64; \
              claude=linux-arm64; claude_sha=$CLAUDE_CODE_SHA512_ARM64; \
-             grok=linux-aarch64; grok_sha=$GROK_SHA256_ARM64 ;; \
+             grok=linux-aarch64; grok_sha=$GROK_SHA256_ARM64; \
+             agy=linux-arm/cli_linux_arm64; agy_sha=$AGY_SHA512_ARM64 ;; \
       amd64) happy=linux-x64; happy_sha=$HAPPY_AGENT_SHA256_AMD64; \
              codex=x86_64-unknown-linux-musl; codex_sha=$CODEX_SHA256_AMD64; \
              host_sha=$CODEX_CODE_MODE_HOST_SHA256_AMD64; \
              claude=linux-x64; claude_sha=$CLAUDE_CODE_SHA512_AMD64; \
-             grok=linux-x86_64; grok_sha=$GROK_SHA256_AMD64 ;; \
+             grok=linux-x86_64; grok_sha=$GROK_SHA256_AMD64; \
+             agy=linux-x64/cli_linux_x64; agy_sha=$AGY_SHA512_AMD64 ;; \
       *) echo "unsupported TARGETARCH '$TARGETARCH': build with docker buildx --platform linux/arm64 or linux/amd64" >&2; exit 1 ;; \
     esac; \
     curl -fsSL -o /tmp/codex.tar.gz \
@@ -72,6 +80,11 @@ RUN set -eu; \
     echo "${grok_sha}  /tmp/grok.gz" | sha256sum -c -; \
     gunzip -c /tmp/grok.gz > /out/grok; \
     chmod 0755 /out/grok; \
+    curl -fsSL -o /tmp/agy.tar.gz \
+      "https://storage.googleapis.com/antigravity-public/antigravity-cli/${AGY_RELEASE}/${agy}.tar.gz"; \
+    echo "${agy_sha}  /tmp/agy.tar.gz" | sha512sum -c -; \
+    tar -xzf /tmp/agy.tar.gz -C /tmp antigravity; \
+    install -m 0755 /tmp/antigravity /out/agy; \
     curl -fsSL -o /tmp/happy-agent.tar.gz \
       "https://github.com/slopus/happy-agent/releases/download/v${HAPPY_AGENT_VERSION}/happy-agent-${HAPPY_AGENT_VERSION}-${happy}.tar.gz"; \
     echo "${happy_sha}  /tmp/happy-agent.tar.gz" | sha256sum -c -; \
@@ -87,10 +100,10 @@ RUN apt-get update \
 COPY --from=fetch /out/ /usr/local/bin/
 
 # Version sanity checks with a throwaway HOME so nothing lands in the image's home directories.
-RUN export HOME=/tmp/version-check DISABLE_AUTOUPDATER=1 \
+RUN export HOME=/tmp/version-check DISABLE_AUTOUPDATER=1 AGY_CLI_DISABLE_AUTO_UPDATE=true \
  && mkdir -p "$HOME" \
  && happy-agent --version && codex --version 2>/dev/null && claude --version \
- && grok --version \
+ && grok --version && agy --version \
  && rm -rf "$HOME"
 
 RUN useradd --create-home --home-dir /home/agent --uid 10001 --user-group --shell /bin/bash agent \
@@ -104,6 +117,9 @@ RUN chmod 0644 /opt/agent-runtime/happy.toml \
 
 USER agent
 WORKDIR /home/agent
+# The pinned CLIs stay as built: Claude Code's updater is off, and agy's (which otherwise starts a
+# background download whenever its folder is writable) is off with exactly this value.
 ENV HOME=/home/agent \
-    DISABLE_AUTOUPDATER=1
+    DISABLE_AUTOUPDATER=1 \
+    AGY_CLI_DISABLE_AUTO_UPDATE=true
 ENTRYPOINT ["/usr/local/bin/agent-runtime-entrypoint"]

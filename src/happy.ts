@@ -2,8 +2,14 @@
 // from Happy objects to the gateway's /v1 façade. Pinned to Happy Agent 2026.11.6-preview.7.
 import type { RuntimeHandle } from "./runtime";
 
-export type ProviderId = "claude" | "codex" | "grok" | "openrouter";
-export const PROVIDER_IDS: ProviderId[] = ["claude", "codex", "grok", "openrouter"];
+export type ProviderId = "claude" | "codex" | "grok" | "openrouter" | "gemini";
+export const PROVIDER_IDS: ProviderId[] = [
+  "claude",
+  "codex",
+  "grok",
+  "openrouter",
+  "gemini",
+];
 export const PROJECT_ID = "chats";
 export const PROJECT_PATH = "/home/agent/projects/chats";
 /** The gateway's private folder in the person's volume (not the agents' workspace). */
@@ -23,13 +29,15 @@ type ApiKey = {
 };
 
 /**
- * Each façade provider, which is also its account in Happy and the provider CLI that signs it in:
- * its sign-in method and flow (no method: it takes only the person's own API key), the vendor named
- * in messages, and the person's own API key when it takes one.
+ * Each façade provider: its account in Happy when that has another ID (else the same), which with a
+ * sign-in method is also the provider CLI that signs it in (no method: it takes only the person's
+ * own API key), its flow, the vendor named in messages, and the person's own API key when it takes
+ * one.
  */
 const PROVIDERS: Record<
   ProviderId,
   {
+    happy?: string;
     method: "browser" | "device" | null;
     flow: Connection["flow"];
     vendor: string;
@@ -68,17 +76,35 @@ const PROVIDERS: Record<
       hint: "It starts with sk-or-.",
     },
   },
+  // The Antigravity harness's account: Google's own agent on the person's Gemini API key.
+  gemini: {
+    happy: "antigravity",
+    method: null,
+    flow: "api_key",
+    vendor: "Gemini",
+    apiKey: {
+      file: "gemini-api-key",
+      account: "Gemini API key",
+      issuer: "Google",
+      hint: "It starts with AIza.",
+    },
+  },
 };
 
 /** The providers whose vendor CLI signs them in (GET /v0/provider-clis/:id). */
 export const CLI_IDS = PROVIDER_IDS.filter((id) => PROVIDERS[id].method);
 export const apiKeyOf = (id: ProviderId) => PROVIDERS[id].apiKey;
+/** Happy's account for a façade provider. */
+export const happyId = (id: ProviderId) => PROVIDERS[id].happy ?? id;
+/** The façade provider of a Happy account, or null for any other account. */
+export const providerOf = (account: unknown) =>
+  PROVIDER_IDS.find((id) => happyId(id) === account) ?? null;
 
 /**
  * How disconnecting signs a person out (run inside the runtime; deploy/sockguard.yaml allowlists
  * each exactly): the vendor CLI's own sign-out where it has one, then no credential file is left
  * on the volume. Grok can leave a copy of its sign-in file beside it (`auth.json.corrupt.*`); an
- * OpenRouter key is only the gateway's file.
+ * OpenRouter or Gemini key is only the gateway's file.
  */
 export const SIGN_OUT: Record<ProviderId, string[]> = {
   claude: [
@@ -97,6 +123,7 @@ export const SIGN_OUT: Record<ProviderId, string[]> = {
     `grok logout >/dev/null 2>&1; rm -f "$HOME/.grok/"auth.json*`,
   ],
   openrouter: ["rm", "-f", `${RUNTIME_DIR}/openrouter-api-key`],
+  gemini: ["rm", "-f", `${RUNTIME_DIR}/gemini-api-key`],
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -300,7 +327,7 @@ const isDefault = (id: string) => id.endsWith("/default");
  */
 export function liveModels(config: any, provider: ProviderId, names: ModelNames = {}): Model[] {
   const catalog = config?.models ?? {};
-  const refs: any[] = config?.providers?.[provider]?.models ?? [];
+  const refs: any[] = config?.providers?.[happyId(provider)]?.models ?? [];
   return refs
     .filter((r) => r.enabled && !r.hidden && catalog[r.id])
     .map((r) => ({
@@ -317,7 +344,7 @@ export function liveModels(config: any, provider: ProviderId, names: ModelNames 
 /** Whether the runtime configured the person's own API key for this provider's account. */
 export function usesApiKey(config: any, id: ProviderId) {
   const key = PROVIDERS[id].apiKey;
-  return !!key && config?.providers?.[id]?.name === key.account;
+  return !!key && config?.providers?.[happyId(id)]?.name === key.account;
 }
 
 /**
@@ -505,10 +532,11 @@ const MODEL =
 /**
  * Happy reports signed-out and expired accounts as kind "internal" with the vendor's raw text
  * (not the documented `signin_missing`), so classify by kind first, then by the vendor's words.
+ * `providerId` is Happy's account.
  */
 export function classifyFailure(failure: any, providerId?: string): Failure {
   const text = `${failure?.message ?? ""} ${failure?.detail ?? ""}`;
-  const vendor = PROVIDERS[providerId as ProviderId]?.vendor ?? "Claude";
+  const vendor = PROVIDERS[providerOf(providerId) ?? "claude"].vendor;
   if (failure?.kind === "signin_missing" || SIGNIN.test(text))
     return {
       code: "signin_required",
@@ -547,9 +575,10 @@ export function signinFailure(ev: {
   const m = ev.payload?.message;
   if (!["message.created", "message.updated"].includes(ev.type)) return null;
   if (m?.role !== "service" || !m.failure) return null;
-  const provider = m.error?.mode?.providerId ?? m.failure?.provider?.id;
-  if (!PROVIDER_IDS.includes(provider)) return null;
-  if (classifyFailure(m.failure, provider).code !== "signin_required") return null;
+  const account = m.error?.mode?.providerId ?? m.failure?.provider?.id;
+  const provider = providerOf(account);
+  if (!provider) return null;
+  if (classifyFailure(m.failure, account).code !== "signin_required") return null;
   return { provider, at: Number(m.createdAt) || Date.now() };
 }
 
@@ -696,7 +725,7 @@ export function conversationView(agent: any, mode: any, title?: string) {
   return {
     id: agent.id as string,
     title: title ?? agent.title ?? null,
-    provider: (mode?.providerId ?? null) as ProviderId | null,
+    provider: providerOf(mode?.providerId),
     model: mode?.modelId ?? null,
     effort: mode?.effort ?? null,
     status: agent.pendingQuestionId

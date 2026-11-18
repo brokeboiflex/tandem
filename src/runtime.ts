@@ -55,6 +55,18 @@ export const CLAUDE_MODELS_COMMAND = [
   `cd /tmp && echo '{"type":"control_request","request_id":"models","request":{"subtype":"initialize"}}' | timeout 20 claude -p --input-format stream-json --output-format stream-json --verbose 2>/dev/null | grep -m 1 '"control_response"'`,
 ];
 
+/**
+ * Whether Google accepts the person's Gemini API key: its free model list, asked from inside the
+ * runtime through the egress proxy. The key goes from its file to curl's standard input through a
+ * shell builtin, never into a process's arguments. (Happy's provider check cannot vouch for the
+ * Antigravity account on an API key: it looks for Antigravity's own sign-in.)
+ */
+export const GEMINI_KEY_COMMAND = [
+  "sh",
+  "-c",
+  'k=$(cat /home/agent/.agent-runtime/gemini-api-key) && echo "x-goog-api-key: $k" | curl -sf -m 15 -o /dev/null -H @- "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1"',
+];
+
 /** A running runtime as the gateway sees it. `token` is the daemon's owner token: memory only. */
 export type RuntimeHandle = {
   key: string;

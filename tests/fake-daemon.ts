@@ -1,9 +1,15 @@
 // A small stateful stand-in for one person's Happy Agent daemon, served over real HTTP, plus a fake
 // Runtime that hands the gateway one such daemon per runtime key. Shapes follow tests/fixtures.
 import { readFileSync } from "node:fs";
-import { apiKeyOf, RUNTIME_DIR, type ProviderId } from "../src/happy";
+import {
+  apiKeyOf,
+  happyId,
+  RUNTIME_DIR,
+  type ProviderId,
+} from "../src/happy";
 import {
   CLAUDE_MODELS_COMMAND,
+  GEMINI_KEY_COMMAND,
   StaleRuntime,
   type Runtime,
   type RuntimeHandle,
@@ -19,11 +25,12 @@ const OPENING = [
 export const GOOD_CODE_PREFIX = "goodcode";
 /** An API key the fake vendors accept. */
 export const GOOD_KEY_PREFIX = "goodkey";
-const KEYED: ProviderId[] = ["claude", "openrouter"];
+const KEYED: ProviderId[] = ["claude", "openrouter", "gemini"];
 
 /**
  * `file` reads the person's volume: like the runtime entrypoint, each start (boot) gives an account
- * whose API key file exists its key's display name.
+ * whose API key file exists its key's display name; without a Gemini key the Antigravity account is
+ * off (as the pinned daemon reports it then).
  */
 export function fakeDaemon(
   token: string,
@@ -34,7 +41,12 @@ export function fakeDaemon(
     config = structuredClone(signedOut);
     for (const id of KEYED)
       if (file(`${RUNTIME_DIR}/${apiKeyOf(id)!.file}`))
-        config.providers[id].name = apiKeyOf(id)!.account;
+        config.providers[happyId(id)].name = apiKeyOf(id)!.account;
+      else if (id === "gemini")
+        Object.assign(config.providers.antigravity, {
+          enabled: false,
+          models: [],
+        });
   };
   boot();
   const requests: { method: string; path: string; body: string }[] = [];
@@ -434,6 +446,16 @@ export class FakeRuntime implements Runtime {
     if (cmd[0] === "rm")
       for (const path of cmd.slice(1)) this.volume.delete(`${key}:${path}`);
     if (models) return { exitCode: 0, stdout: this.claudeInitialize };
+    // Google accepts only a good key (curl -f: 22 for its 400).
+    if (JSON.stringify(cmd) === JSON.stringify(GEMINI_KEY_COMMAND))
+      return {
+        exitCode: this.volume
+          .get(`${key}:${RUNTIME_DIR}/${apiKeyOf("gemini")!.file}`)
+          ?.startsWith(GOOD_KEY_PREFIX)
+          ? 0
+          : 22,
+        stdout: "",
+      };
     return { exitCode: 0, stdout: "" };
   }
   async address(key: string) {

@@ -405,6 +405,26 @@ check(
   "openrouter: connects only with an API key",
 );
 
+// --- 4c. Own Gemini API key (bogus): checked against Google's model list from inside the runtime ----
+t0 = performance.now();
+r = await alice.call("POST", "/v1/providers/gemini/connect", {
+  method: "api_key",
+  apiKey: `AIza${"0".repeat(35)}`,
+});
+check(
+  r.body.connection?.status === "failed" &&
+    r.body.connection.error?.code === "invalid_api_key",
+  "gemini: a bogus API key is refused and removed",
+  seconds(t0),
+);
+check(
+  (await alice.call("GET", "/v1/providers")).body.providers.find(
+    (p: any) => p.id === "gemini",
+  ).status === "not_connected" &&
+    inRuntime(alice.subject, 'test -e "$HOME/.agent-runtime/gemini-api-key" && echo kept') === "",
+  "gemini: still not connected, and the key is gone from the volume",
+);
+
 // --- 5. A second person sees nothing of the first ----------------------------------------------------
 await bob.listen();
 await bob.live();
@@ -509,6 +529,7 @@ if (realSubject) {
     codex: ["codex-cli/gpt-6-luna"],
     grok: ["xai/grok-4.5"],
     openrouter: ["deepseek/deepseek-v4.1-flash-1017"],
+    gemini: ["antigravity/gemini-3.8-flash"],
   };
   const questions: string[] = [];
   const ask = async (id: string, text: string, extra: Record<string, unknown> = {}) => {

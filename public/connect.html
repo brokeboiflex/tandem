@@ -225,7 +225,7 @@
       <h1>Connect your AI accounts</h1>
       <p class="lede">
         Sign in with your own Claude, ChatGPT and Grok accounts, or use your own
-        API keys. Your sign-in stays in your private workspace; passwords are
+        API keys (Anthropic, OpenRouter, Gemini). Your sign-in stays in your private workspace; passwords are
         entered only on the vendor's own pages.
       </p>
 
@@ -264,6 +264,11 @@
           id="card-openrouter"
           aria-labelledby="title-openrouter"
         ></article>
+        <article
+          class="card"
+          id="card-gemini"
+          aria-labelledby="title-gemini"
+        ></article>
       </section>
       <p class="visually-hidden" aria-live="polite" id="announce"></p>
     </main>
@@ -275,14 +280,16 @@
         codex: "ChatGPT (Codex)",
         grok: "Grok",
         openrouter: "OpenRouter",
+        gemini: "Gemini",
       };
       const VENDOR = {
         claude: "Claude",
         codex: "ChatGPT",
         grok: "Grok",
         openrouter: "OpenRouter",
+        gemini: "Gemini",
       };
-      // Providers that take the person's own API key; OpenRouter takes nothing else.
+      // Providers that take the person's own API key; OpenRouter and Gemini take nothing else.
       const KEYS = {
         claude: {
           label: "Anthropic API key",
@@ -292,10 +299,20 @@
           label: "OpenRouter API key",
           help: "Create a key at openrouter.ai/keys. Usage is billed to that key.",
         },
+        gemini: {
+          label: "Gemini API key",
+          help: "Create a key in Google AI Studio (aistudio.google.com/apikey). Usage is billed to that key's Google Cloud project.",
+        },
       };
-      const KEY_ONLY = new Set(["openrouter"]);
+      const KEY_ONLY = new Set(["openrouter", "gemini"]);
       // { provider, connection, busy, ui }
-      const state = { claude: {}, codex: {}, grok: {}, openrouter: {} };
+      const state = {
+        claude: {},
+        codex: {},
+        grok: {},
+        openrouter: {},
+        gemini: {},
+      };
       let token = null,
         listening = null;
 

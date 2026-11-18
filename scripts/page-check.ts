@@ -15,6 +15,7 @@ const claude = page.locator("#card-claude");
 const codex = page.locator("#card-codex");
 const grok = page.locator("#card-grok");
 const openrouter = page.locator("#card-openrouter");
+const gemini = page.locator("#card-gemini");
 const step = (text: string) => console.log(`PASS  ${text}`);
 
 await page.goto(`${BASE}/connect`);
@@ -26,6 +27,7 @@ await claude.getByText("Not connected").waitFor();
 await codex.getByText("Not connected").waitFor();
 await grok.getByText("Not connected").waitFor();
 await openrouter.getByText("Not connected").waitFor();
+await gemini.getByText("Not connected").waitFor();
 await page.screenshot({ path: out("1-not-connected") });
 step("every card renders Not connected");
 
@@ -101,5 +103,10 @@ await openrouter
 await openrouter.getByLabel("OpenRouter API key").waitFor();
 await openrouter.screenshot({ path: out("8-openrouter-api-key") });
 step("OpenRouter asks only for the person's own API key");
+
+await gemini.getByRole("button", { name: "Add your Gemini API key" }).click();
+await gemini.getByLabel("Gemini API key").waitFor();
+await gemini.screenshot({ path: out("9-gemini-api-key") });
+step("Gemini asks only for the person's own API key");
 
 await browser.close();

@@ -11,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as H from "../src/happy";
+import { GEMINI_KEY_COMMAND } from "../src/runtime";
 
 const runtimeDir = new URL("../runtime/", import.meta.url).pathname;
 const policyText = await Bun.file(join(runtimeDir, "happy.toml")).text();
@@ -53,12 +54,17 @@ function render(files: Record<string, string> = {}) {
   expect(r.exitCode).toBe(0);
   const text = readFileSync(join(home, "happy/config/happy.toml"), "utf8");
   const env = readFileSync(join(home, "daemon-env"), "utf8");
-  return { text, toml: Bun.TOML.parse(text) as any, env };
+  const settings = readFileSync(
+    join(home, ".gemini/antigravity-cli/settings.json"),
+    "utf8",
+  );
+  return { text, toml: Bun.TOML.parse(text) as any, env, settings };
 }
 
 const keyFile = (id: H.ProviderId) => `.agent-runtime/${H.apiKeyOf(id)!.file}`;
 const anthropicKey = `sk-ant-api03-${"a".repeat(40)}`;
 const openrouterKey = `sk-or-v1-${"b".repeat(64)}`;
+const geminiKey = `AIza${"c".repeat(35)}`;
 
 describe("runtime/happy.toml policy", () => {
   test("only the person's own accounts, none enabled by default", () => {
@@ -70,11 +76,12 @@ describe("runtime/happy.toml policy", () => {
       expect(policy.providers[id].enabled).toBe(true);
   });
 
-  test("Happy's own loop runs only Grok and OpenRouter; Claude and Codex keep their own agents", () => {
+  test("Happy's own loop runs only Grok and OpenRouter; Claude, Codex and Gemini run their vendors' own agents", () => {
     expect(policy.harnesses).toEqual({
       happy: { providers: ["grok", "openrouter"], subagent_harnesses: [] },
       claude_code: { providers: ["claude"], subagent_harnesses: [] },
       codex_cli: { providers: ["codex"], subagent_harnesses: [] },
+      antigravity: { subagent_harnesses: [] },
     });
     expect(policy.defaults).toEqual({
       provider: "claude",
@@ -102,14 +109,24 @@ describe("runtime/happy.toml policy", () => {
   });
 });
 
+describe("runtime/happy.toml policy: Gemini", () => {
+  test("the gateway's key check reads the file the gateway writes for Gemini", () => {
+    expect(GEMINI_KEY_COMMAND[2]).toContain(
+      `$(cat ${H.RUNTIME_DIR}/${H.apiKeyOf("gemini")!.file})`,
+    );
+    // The key travels on curl's standard input, never in its arguments.
+    expect(GEMINI_KEY_COMMAND[2]).toContain("-H @-");
+  });
+});
+
 describe("runtime entrypoint", () => {
   test("reads each API key from the file the gateway writes", () => {
     for (const id of H.PROVIDER_IDS.filter((p) => H.apiKeyOf(p)))
       expect(entrypoint).toContain(`"$HOME/${keyFile(id)}"`);
   });
 
-  test("without keys: no credential, and an OpenRouter account that names an unset variable", () => {
-    const { toml } = render();
+  test("without keys: no credential, an OpenRouter account that names an unset variable, and Gemini off", () => {
+    const { toml, settings } = render();
     expect(toml.providers.claude.api_key).toBeUndefined();
     expect(toml.providers.claude.name).toBeUndefined();
     expect(toml.providers.openrouter).toMatchObject({
@@ -118,14 +135,24 @@ describe("runtime entrypoint", () => {
     });
     expect(toml.providers.openrouter.api_key).toBeUndefined();
     expect(H.usesApiKey({ providers: toml.providers }, "openrouter")).toBe(false);
+    expect(toml.harnesses.antigravity).toEqual({
+      enabled: false,
+      subagent_harnesses: [],
+    });
+    // Antigravity's CLI is pointed at the Gemini API either way, never at its own sign-in.
+    expect(JSON.parse(settings)).toEqual({ modelProvider: "gemini" });
     // Everything else is the shipped policy.
-    expect(toml.harnesses).toEqual(policy.harnesses);
+    expect({ ...toml.harnesses, antigravity: undefined }).toEqual({
+      ...policy.harnesses,
+      antigravity: undefined,
+    });
   });
 
   test("with keys: each becomes its account's api_key under the name the gateway reads back, never in the daemon's environment", () => {
-    const { toml, env } = render({
+    const { toml, env, settings } = render({
       [keyFile("claude")]: `${anthropicKey}\n`,
       [keyFile("openrouter")]: `${openrouterKey}\n`,
+      [keyFile("gemini")]: `${geminiKey}\n`,
     });
     expect(toml.providers.claude).toMatchObject({
       name: H.apiKeyOf("claude")!.account,
@@ -136,10 +163,19 @@ describe("runtime entrypoint", () => {
       api_key: openrouterKey,
     });
     expect(toml.providers.openrouter.api_key_env).toBeUndefined();
+    // The Gemini key goes to the Antigravity harness, which hands it to agy as GEMINI_API_KEY.
+    expect(toml.harnesses.antigravity).toEqual({
+      name: H.apiKeyOf("gemini")!.account,
+      api_key: geminiKey,
+      subagent_harnesses: [],
+    });
+    expect(H.usesApiKey({ providers: { antigravity: { name: toml.harnesses.antigravity.name } } }, "gemini")).toBe(true);
+    expect(JSON.parse(settings)).toEqual({ modelProvider: "gemini" });
     expect(H.usesApiKey({ providers: toml.providers }, "openrouter")).toBe(true);
     expect(H.usesApiKey({ providers: toml.providers }, "claude")).toBe(true);
     expect(env).not.toContain(openrouterKey);
     expect(env).not.toContain(anthropicKey);
+    expect(env).not.toContain(geminiKey);
   });
 
   test("a key with any other character is ignored instead of breaking the file", () => {

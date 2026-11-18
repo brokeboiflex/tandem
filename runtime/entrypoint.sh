@@ -4,7 +4,8 @@
 set -eu
 umask 077
 
-mkdir -p "$HOME/happy/config" "$HOME/.codex" "$HOME/projects/chats" "$HOME/.agent-runtime"
+mkdir -p "$HOME/happy/config" "$HOME/.codex" "$HOME/projects/chats" "$HOME/.agent-runtime" \
+  "$HOME/.gemini/antigravity-cli"
 # The gateway points TMPDIR into the volume: the root filesystem may be read-only, and Happy unpacks
 # its 341 MiB Claude Code binary there (once per volume instead of once per container).
 mkdir -p "${TMPDIR:-/tmp}"
@@ -12,9 +13,10 @@ mkdir -p "${TMPDIR:-/tmp}"
 # Install the gateway-owned config. API keys the person chose (written by the gateway to the
 # private files below) become Happy's documented `api_key` of their account, with a display name
 # the gateway reads back from GET /v0/config: an Anthropic key for the built-in Claude account, an
-# OpenRouter key for the OpenRouter account. Without an OpenRouter key that account names a
-# variable nothing sets, so it has no credential. Shell builtins only, so a key never appears in
-# any process's argv or environment.
+# OpenRouter key for the OpenRouter account, a Gemini key for the Antigravity harness's account.
+# Without an OpenRouter key that account names a variable nothing sets, so it has no credential;
+# without a Gemini key the Antigravity harness is off. Shell builtins only, so a key never appears
+# in any process's argv, and only agy gets one in its environment (GEMINI_API_KEY, from Happy).
 read_key() {
   key=""
   if [ -s "$1" ]; then
@@ -26,6 +28,8 @@ read_key "$HOME/.agent-runtime/anthropic-api-key"
 anthropic_key=$key
 read_key "$HOME/.agent-runtime/openrouter-api-key"
 openrouter_key=$key
+read_key "$HOME/.agent-runtime/gemini-api-key"
+gemini_key=$key
 key=""
 while IFS= read -r line; do
   printf '%s\n' "$line"
@@ -37,10 +41,20 @@ while IFS= read -r line; do
     else
       printf 'name = "OpenRouter"\napi_key_env = "OPENROUTER_API_KEY"\n'
     fi
+  elif [ "$line" = "[harnesses.antigravity]" ]; then
+    if [ -n "$gemini_key" ]; then
+      printf 'name = "Gemini API key"\napi_key = "%s"\n' "$gemini_key"
+    else
+      printf 'enabled = false\n'
+    fi
   fi
 done < /opt/agent-runtime/happy.toml > "$HOME/happy/config/happy.toml"
 anthropic_key=""
 openrouter_key=""
+gemini_key=""
+# Antigravity's CLI uses the Gemini API with GEMINI_API_KEY, never its own Google sign-in, once its
+# settings name that backend. The gateway owns these settings: they are rewritten on every start.
+printf '{ "modelProvider": "gemini" }\n' > "$HOME/.gemini/antigravity-cli/settings.json"
 # The daemon writes live overrides (Tailcat, remote connections, defaults) to a generated
 # runtime.toml that wins over happy.toml. Nothing here uses them, so the controller's policy is
 # re-applied on every start.
@@ -59,8 +73,8 @@ else
 fi
 
 # Standing instructions (PUT /v1/instructions): the gateway keeps the canonical copy and the
-# chat workspace gets it as AGENTS.md (Codex, and Happy's own loop for Grok and OpenRouter) and
-# CLAUDE.md (Claude Code), restored on every start.
+# chat workspace gets it as AGENTS.md (Codex, Gemini's Antigravity CLI, and Happy's own loop for Grok
+# and OpenRouter) and CLAUDE.md (Claude Code), restored on every start.
 instructions="$HOME/.agent-runtime/instructions.md"
 if [ -f "$instructions" ]; then
   cp "$instructions" "$HOME/projects/chats/AGENTS.md"

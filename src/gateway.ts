@@ -8,6 +8,7 @@ import * as M from "./mcp";
 import {
   CLAUDE_MODELS_COMMAND,
   DockerRuntime,
+  GEMINI_KEY_COMMAND,
   runtimeKey,
   StaleRuntime,
   type Runtime,
@@ -648,7 +649,7 @@ export function createGateway(
         throw new HttpError(
           400,
           "invalid_request",
-          "Only Claude and OpenRouter accept an API key.",
+          "Only Claude, OpenRouter and Gemini accept an API key.",
         );
       return json({ connection: await connectApiKey(p, id, body.apiKey) });
     }
@@ -707,12 +708,18 @@ export function createGateway(
     // becomes Happy's documented `api_key` for the provider's account on the next daemon start.
     await runtime.writePrivateFile(p.key, H.RUNTIME_DIR, spec.file, `${key}\n`);
     await restartRuntime(p, 2 * 60_000);
-    const verdict = await (
-      await daemonFor(p)
-    )
-      .call("POST", `/v0/providers/${id}/verify`, { level: "authentication" })
-      .catch(() => null);
-    if (verdict?.status === "passed") {
+    // Happy checks its own accounts; it cannot check a Gemini key on the Antigravity account.
+    const passed =
+      id === "gemini"
+        ? (await runtime.exec(p.key, GEMINI_KEY_COMMAND)).exitCode === 0
+        : (
+            await (await daemonFor(p))
+              .call("POST", `/v0/providers/${id}/verify`, {
+                level: "authentication",
+              })
+              .catch(() => null)
+          )?.status === "passed";
+    if (passed) {
       delete p.apiKeyFailures[id];
       delete p.signinRequired[id];
       void publish(p, id);
@@ -961,7 +968,7 @@ export function createGateway(
       ...(title ? { title } : {}),
     });
     const mode = {
-      providerId: provider,
+      providerId: H.happyId(provider),
       modelId: model,
       effort: chosenEffort,
       serviceTier: null,
@@ -1129,10 +1136,11 @@ export function createGateway(
       permissionMode: cfg.permissionMode,
     };
     if (model !== undefined || effort !== undefined) {
-      const names = current.providerId === "claude" ? p.modelNames : undefined;
-      const m = H.liveModels(await configOf(p), current.providerId, names).find(
-        (x) => x.id === (model ?? current.modelId),
-      );
+      const provider = H.providerOf(current.providerId);
+      const names = provider === "claude" ? p.modelNames : undefined;
+      const m = (
+        provider ? H.liveModels(await configOf(p), provider, names) : []
+      ).find((x) => x.id === (model ?? current.modelId));
       if (!m)
         throw new HttpError(
           422,
@@ -1352,8 +1360,8 @@ export function createGateway(
   }
 
   /**
-   * Standing instructions for every conversation: AGENTS.md (Codex, and Happy's own loop for Grok
-   * and OpenRouter) and CLAUDE.md (Claude Code).
+   * Standing instructions for every conversation: AGENTS.md (Codex, Gemini's Antigravity CLI, and
+   * Happy's own loop for Grok and OpenRouter) and CLAUDE.md (Claude Code).
    */
   async function putInstructions({ p, body }: Ctx) {
     const { text } = body;
@@ -1383,11 +1391,11 @@ export function createGateway(
 
   const routes: [string, RegExp, (c: Ctx) => Response | Promise<Response>][] = [
     ["GET", /^\/v1\/providers$/, listProviders],
-    ["POST", /^\/v1\/providers\/(claude|codex|grok|openrouter)\/connect$/, startConnect],
-    ["GET", /^\/v1\/providers\/(claude|codex|grok|openrouter)\/connect$/, getConnect],
-    ["POST", /^\/v1\/providers\/(claude|codex|grok|openrouter)\/connect\/code$/, submitCode],
-    ["DELETE", /^\/v1\/providers\/(claude|codex|grok|openrouter)\/connect$/, cancelConnect],
-    ["DELETE", /^\/v1\/providers\/(claude|codex|grok|openrouter)$/, disconnect],
+    ["POST", /^\/v1\/providers\/(claude|codex|grok|openrouter|gemini)\/connect$/, startConnect],
+    ["GET", /^\/v1\/providers\/(claude|codex|grok|openrouter|gemini)\/connect$/, getConnect],
+    ["POST", /^\/v1\/providers\/(claude|codex|grok|openrouter|gemini)\/connect\/code$/, submitCode],
+    ["DELETE", /^\/v1\/providers\/(claude|codex|grok|openrouter|gemini)\/connect$/, cancelConnect],
+    ["DELETE", /^\/v1\/providers\/(claude|codex|grok|openrouter|gemini)$/, disconnect],
     ["GET", /^\/v1\/events$/, events],
     ["POST", /^\/v1\/conversations$/, createConversation],
     ["GET", /^\/v1\/conversations$/, listConversations],

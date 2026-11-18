@@ -22,7 +22,7 @@ enabled = false
 enabled = false
 
 # Only the person's own vendor accounts: signed in through the vendors' own CLIs, or the person's
-# own API key.
+# own API key. Gemini is the account of the Antigravity harness, below.
 [providers]
 default_enable = false
 
@@ -46,17 +46,17 @@ include_subagent_models = []
 # OpenRouter with the person's own API key. The entrypoint adds the credential: the key the gateway
 # wrote to the person's volume as `api_key`, or without one an `api_key_env` that nothing sets
 # (Happy requires one of the two), so the account has no credential. Only chat models that support
-# tool calling; Happy reads their names, context windows and efforts from OpenRouter's /models.
+# tool calling and need no reasoning signatures passed back between tool calls, which Happy does not
+# keep (Gemini's and Claude's do); Happy reads their names, context windows and efforts from
+# OpenRouter's /models, and checks a new key with the first.
 [providers.openrouter]
 type = "openai_compatible"
 enabled = true
 base_url = "https://openrouter.ai/api/v1"
 models = [
-  "anthropic/claude-sonnet-5.5",
-  "openai/gpt-6.2-sol",
-  "google/gemini-4-carbon",
-  "x-ai/grok-4.7",
   "deepseek/deepseek-v4.1-flash-1017",
+  "openai/gpt-6.2-sol",
+  "x-ai/grok-4.7",
   "qwen/qwen4-max",
   "moonshotai/kimi-k3.1-pro",
   "z-ai/glm-5.3-prime",
@@ -89,4 +89,11 @@ subagent_harnesses = []
 # Codex itself, through `codex app-server` (the pinned /usr/local/bin/codex on PATH).
 [harnesses.codex_cli]
 providers = ["codex"]
+subagent_harnesses = []
+
+# Gemini through Google's own Antigravity CLI (`agy acp`, the pinned /usr/local/bin/agy), offered as
+# the account "antigravity". It runs only on the person's own Gemini API key: the entrypoint adds the
+# key as `api_key` (agy gets it as GEMINI_API_KEY) and points agy at the Gemini API, so agy's own
+# Google sign-in is never used; without a key it turns this harness off. Its sub-agents stay on it.
+[harnesses.antigravity]
 subagent_harnesses = []

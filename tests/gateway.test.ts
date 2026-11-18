@@ -4,7 +4,7 @@ import { devToken } from "../src/auth";
 import type { Config } from "../src/config";
 import { createGateway } from "../src/gateway";
 import { PROVIDER_IDS } from "../src/happy";
-import { runtimeKey } from "../src/runtime";
+import { GEMINI_KEY_COMMAND, runtimeKey } from "../src/runtime";
 import { sseFrames } from "../src/sse";
 import {
   FakeRuntime,
@@ -135,8 +135,8 @@ describe("façade surface", () => {
       ["GET", "/v1/config"],
       ["GET", "/v1/bots"],
       ["GET", "/v1/connections"],
-      ["POST", "/v1/providers/gemini/connect"],
       ["POST", "/v1/providers/antigravity/connect"],
+      ["POST", "/v1/providers/bedrock/connect"],
       ["DELETE", "/v1/providers/bedrock"],
       ["PATCH", "/v1/providers"],
       ["GET", "/v1/providers/claude"],
@@ -195,6 +195,7 @@ describe("providers and sign-in", () => {
     ).toEqual([
       ["claude", "not_connected", 0],
       ["codex", "not_connected", 0],
+      ["gemini", "not_connected", 0],
       ["grok", "not_connected", 0],
       ["openrouter", "not_connected", 0],
     ]);
@@ -206,6 +207,7 @@ describe("providers and sign-in", () => {
       ["codex", "not_connected", 0],
       ["grok", "not_connected", 0],
       ["openrouter", "not_connected", 0],
+      ["gemini", "not_connected", 0],
     ]);
     const d = runtime.daemons.get(key)!;
     expect(
@@ -433,7 +435,7 @@ describe("Grok and OpenRouter", () => {
       }),
     ).toMatchObject({
       status: 400,
-      body: { message: "Only Claude and OpenRouter accept an API key." },
+      body: { message: "Only Claude, OpenRouter and Gemini accept an API key." },
     });
     runtime.daemons.get(key)!.approveDevice("grok");
     await until(async () => (await provider(gina, "grok")).status === "connected");
@@ -591,10 +593,10 @@ describe("Grok and OpenRouter", () => {
       method: "api_key",
       account: { email: null, plan: "API key" },
     });
-    expect(openrouter.models).toHaveLength(8);
+    expect(openrouter.models).toHaveLength(6);
     expect(openrouter.models[0]).toMatchObject({
-      id: "anthropic/claude-sonnet-5.5",
-      name: "Anthropic: Claude Sonnet 5.5",
+      id: "deepseek/deepseek-v4.1-flash-1017",
+      name: "DeepSeek: DeepSeek V4.1 Flash 1017",
       default: false,
     });
 
@@ -662,6 +664,140 @@ describe("Grok and OpenRouter", () => {
     expect(
       daemon.requests.slice(seen).filter((r) => r.path.startsWith("/v0/provider-clis/") && r.method === "POST"),
     ).toEqual([]);
+  });
+});
+
+describe("Gemini (the person's own Gemini API key, run by Antigravity's agent)", () => {
+  const provider = async (token: string) =>
+    (await call(token, "GET", "/v1/providers")).body.providers.find(
+      (p: any) => p.id === "gemini",
+    );
+  const path = "/home/agent/.agent-runtime/gemini-api-key";
+
+  test("connects only with an API key, which Google checks from inside the runtime; a refused one is removed", async () => {
+    const gwen = await tokenFor("gwen");
+    const key = runtimeKey(cfg.serviceSecret, "gwen");
+    await wake(gwen);
+    expect(
+      await call(gwen, "POST", "/v1/providers/gemini/connect", {}),
+    ).toMatchObject({ status: 400, body: { error: "invalid_request" } });
+    expect(
+      await call(gwen, "POST", "/v1/providers/gemini/connect", {
+        method: "api_key",
+        apiKey: "AIza-short",
+      }),
+    ).toEqual({
+      status: 400,
+      body: {
+        error: "invalid_api_key_format",
+        message: "Paste the whole key. It starts with AIza.",
+      },
+    });
+    responses.length = 0;
+    logs.length = 0;
+    runtime.execs.length = 0;
+    const refused = await call(gwen, "POST", "/v1/providers/gemini/connect", {
+      method: "api_key",
+      apiKey: `AIzaSECRETGEM${"0".repeat(26)}`,
+    });
+    expect(refused.body.connection).toMatchObject({
+      status: "failed",
+      flow: "api_key",
+      error: {
+        code: "invalid_api_key",
+        message:
+          "Google didn't accept that API key, or couldn't be reached. Check the key and try again.",
+      },
+    });
+    expect(runtime.execs).toEqual([
+      GEMINI_KEY_COMMAND,
+      ["rm", "-f", path],
+    ]);
+    expect(runtime.volume.has(`${key}:${path}`)).toBe(false);
+    // Happy's own provider check is never asked about this account.
+    expect(
+      runtime.daemons
+        .get(key)!
+        .requests.some((r) => r.path.endsWith("/verify")),
+    ).toBe(false);
+    expect((await provider(gwen)).status).toBe("not_connected");
+  });
+
+  test("an accepted key connects Gemini with the models agy reports, and its conversations run on the Antigravity account", async () => {
+    const gwen = await tokenFor("gwen");
+    const key = runtimeKey(cfg.serviceSecret, "gwen");
+    const accepted = await call(gwen, "POST", "/v1/providers/gemini/connect", {
+      method: "api_key",
+      apiKey: `${GOOD_KEY_PREFIX}SECRETGEM${"1".repeat(26)}`,
+    });
+    expect(accepted.body.connection).toEqual({
+      status: "connected",
+      flow: "api_key",
+      url: null,
+      userCode: null,
+      expiresAt: null,
+      error: null,
+      account: { email: null, plan: "API key" },
+    });
+    const gemini = await provider(gwen);
+    expect(gemini).toMatchObject({
+      status: "connected",
+      method: "api_key",
+      account: { email: null, plan: "API key" },
+    });
+    expect(gemini.models[0]).toMatchObject({
+      id: "antigravity/gemini-4-carbon",
+      name: "Gemini 4 Carbon",
+      default: false,
+    });
+    const created = await call(gwen, "POST", "/v1/conversations", {
+      provider: "gemini",
+      model: "antigravity/gemini-3.8-flash",
+    });
+    expect(created.status).toBe(201);
+    expect(created.body.conversation).toMatchObject({
+      provider: "gemini",
+      model: "antigravity/gemini-3.8-flash",
+      effort: "high",
+    });
+    const id = created.body.conversation.id;
+    const daemon = runtime.daemons.get(key)!;
+    const draft = daemon.requests.find(
+      (r) => r.method === "PUT" && r.path === `/v0/agents/${id}/draft`,
+    )!;
+    expect(JSON.parse(draft.body).draft.providerId).toBe("antigravity");
+    const sent = await call(gwen, "POST", `/v1/conversations/${id}/messages`, {
+      text: "hi",
+      effort: "low",
+    });
+    expect(sent.body.conversation).toMatchObject({
+      provider: "gemini",
+      effort: "low",
+    });
+    expect(
+      (await call(gwen, "GET", "/v1/conversations")).body.conversations[0]
+        .provider,
+    ).toBe("gemini");
+    // The key reached the person's volume only.
+    expect(responses.join("\n")).not.toContain("SECRETGEM");
+    expect(logs.join("\n")).not.toContain("SECRETGEM");
+    expect(daemon.requests.some((r) => r.body.includes("SECRETGEM"))).toBe(false);
+    const state = JSON.stringify([...gateway.people.values()], (_k, v) =>
+      v instanceof Map || v instanceof Set ? [...v] : v,
+    );
+    expect(state).not.toContain("SECRETGEM");
+  });
+
+  test("disconnecting removes the key and turns the account off again", async () => {
+    const gwen = await tokenFor("gwen");
+    runtime.execs.length = 0;
+    const r = await call(gwen, "DELETE", "/v1/providers/gemini");
+    expect(r.body.provider).toMatchObject({
+      id: "gemini",
+      status: "not_connected",
+      models: [],
+    });
+    expect(runtime.execs).toEqual([["rm", "-f", path]]);
   });
 });
 
@@ -959,6 +1095,7 @@ describe("last-known provider state", () => {
       ["codex", "not_connected"],
       ["grok", "not_connected"],
       ["openrouter", "not_connected"],
+      ["gemini", "not_connected"],
     ]);
     expect(r.body.providers[0].models.length).toBeGreaterThan(0);
     expect(Date.parse(r.body.providers[0].checkedAt)).toBeLessThan(asked);

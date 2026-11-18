@@ -23,6 +23,9 @@ cli-chat-proxy.grok.com
 # OpenRouter: chat completions with the person's own key, and the model details Happy reads.
 openrouter.ai
 
+# Google: the Gemini API with the person's own key (Antigravity's CLI, and the gateway's key check).
+generativelanguage.googleapis.com
+
 # GitHub: Codex plugin sync and git.
 github.com
 *.github.com
