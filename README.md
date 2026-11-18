@@ -1,22 +1,24 @@
 # Tandem
 
-Tandem gives every person their own private, always-resumable Claude Code and Codex workspace behind
-one small HTTP API. Each person signs in with **their own** Claude or ChatGPT account through the vendor's
-own sign-in, inside **their own** Linux container. Your application talks to Tandem; Tandem never
-sees passwords and never shares an account between people.
+Tandem gives every person their own private, always-resumable AI workspace behind one small HTTP API:
+Claude Code, Codex, Grok and OpenRouter models. Each person signs in with **their own** Claude,
+ChatGPT or Grok account through the vendor's own sign-in, or brings **their own** Anthropic or
+OpenRouter API key, inside **their own** Linux container. Your application talks to Tandem; Tandem
+never sees passwords and never shares an account between people.
 
 Under the hood each workspace runs one unmodified [Happy Agent](https://github.com/slopus/happy-agent)
-daemon with the official Claude Code and Codex CLIs. Tandem adds the parts a multi-user service needs:
-authentication, one container per person, start-on-demand and idle stop, a narrow façade over Happy's
-owner-level API, and a friendlier sign-in flow.
+daemon with the official Claude Code, Codex and Grok CLIs. Tandem adds the parts a multi-user service
+needs: authentication, one container per person, start-on-demand and idle stop, a narrow façade over
+Happy's owner-level API, and a friendlier sign-in flow.
 
 ## How it is isolated
 
 - **One container and one volume per person.** Names are `tandem-rt-<id>` and `tandem-home-<id>`,
   where `<id>` is an HMAC of the person's id (`sub` of the service JWT) under `SERVICE_SECRET`. The
   gateway derives the runtime only from the verified token, so one person can never address another's.
-- **Vendor credentials stay in the person's volume.** `claude auth login` and `codex login` run inside
-  the container and store their sign-in there. Tandem does not read, copy or log them.
+- **Vendor credentials stay in the person's volume.** `claude auth login`, `codex login` and
+  `grok login --device-auth` run inside the container and store their sign-in there, and the gateway
+  writes a person's own API key there. Tandem does not read, copy or log them.
 - **The daemon token never leaves the gateway.** Happy's owner token (shutdown, drain, debug, config,
   bots, remote connections) is read once per runtime through the Docker exec API and kept in memory. The
   gateway can send only an allowlisted set of daemon requests (`src/happy.ts`).
@@ -30,9 +32,10 @@ owner-level API, and a friendlier sign-in flow.
   a per-runtime token from that runtime's own address and adds the person's latest credential on the way
   out (see [Connecting your app's MCP server](#connecting-your-apps-mcp-server)).
 - **Hardened defaults.** Built-in admin bot archived on every start, Happy relay/mobile/Tailcat off,
-  sub-agents limited to their own harness (a Claude chat cannot start Codex work), gVisor when the host
-  has it, a non-root user without Linux capabilities, `no-new-privileges`, a read-only root filesystem,
-  memory/CPU/process limits and an egress allowlist.
+  sub-agents limited to their own harness (a Claude chat cannot start Codex work) and none at all on
+  Grok and OpenRouter (see [Happy's own agent loop](#happys-own-agent-loop-grok-and-openrouter)), gVisor
+  when the host has it, a non-root user without Linux capabilities, `no-new-privileges`, a read-only
+  root filesystem, memory/CPU/process limits and an egress allowlist.
 
 ## Quick start (local)
 
@@ -87,12 +90,12 @@ While a stream is open, a runtime that stops on its own (a crash, `docker stop`)
 
 | Method and path | Purpose |
 | --- | --- |
-| `GET /v1/providers` | `{ providers: [{ id: "claude"\|"codex", status: "connected"\|"not_connected"\|"connecting"\|"unknown", method: "subscription"\|"api_key"\|null, account: { email, plan }\|null, models: [{ id, name, default, efforts, defaultEffort }], checkedAt }] }`. Models come from the account's live catalog and are empty until connected. A model's `name` is what the vendor calls it, without a harness prefix ("Opus 5.5", "GPT-6-Luna"); Claude's are read from the person's own Claude Code shortly after it connects and arrive as `provider.updated`, until then Claude's aliases ("Opus"). `default: true` marks the vendor's default (Claude's `claude-code/default`): its `name` is the model it currently resolves to ("Sonnet 5.5"), or `null` until known, and the client labels it as the default in its own language. `checkedAt` (ISO time) is when this was read from the person's runtime. Never starts the runtime. While it is stopped or starting, the answer comes at once from the gateway's memory, with that older `checkedAt`; open `/v1/events` to start it and receive the live state as `provider.updated` once it is up. A provider not read since the gateway started (after a gateway restart, until the person's runtime has run) is `status: "unknown"` with `checkedAt: null`, `method: null`, `account: null` and no models: show it as loading, not as signed out. A provider whose turn failed with `signin_required` reports `not_connected` until the person signs in again. |
-| `POST /v1/providers/:id/connect` | Starts the vendor sign-in, answers `{ connection }` once the vendor page is ready. Claude also accepts `{ "method": "api_key", "apiKey": "sk-ant-…" }`. |
+| `GET /v1/providers` | `{ providers: [{ id: "claude"\|"codex"\|"grok"\|"openrouter", status: "connected"\|"not_connected"\|"connecting"\|"unknown", method: "subscription"\|"api_key"\|null, account: { email, plan }\|null, models: [{ id, name, default, efforts, defaultEffort }], checkedAt }] }`. Models come from the account's live catalog and are empty until connected. A model's `name` is what the vendor calls it, without a harness prefix ("Opus 5.5", "GPT-6-Luna"); Claude's are read from the person's own Claude Code shortly after it connects and arrive as `provider.updated`, until then Claude's aliases ("Opus"); OpenRouter's are OpenRouter's own ("Anthropic: Claude Sonnet 5.5"). `default: true` marks the vendor's default (Claude's `claude-code/default`; the other vendors have none): its `name` is the model it currently resolves to ("Sonnet 5.5"), or `null` until known, and the client labels it as the default in its own language. `checkedAt` (ISO time) is when this was read from the person's runtime. Never starts the runtime. While it is stopped or starting, the answer comes at once from the gateway's memory, with that older `checkedAt`; open `/v1/events` to start it and receive the live state as `provider.updated` once it is up. A provider not read since the gateway started (after a gateway restart, until the person's runtime has run) is `status: "unknown"` with `checkedAt: null`, `method: null`, `account: null` and no models: show it as loading, not as signed out. A provider whose turn failed with `signin_required` reports `not_connected` until the person signs in again. |
+| `POST /v1/providers/:id/connect` | Starts the vendor sign-in, answers `{ connection }` once the vendor page is ready. Claude also accepts `{ "method": "api_key", "apiKey": "sk-ant-…" }`; OpenRouter accepts only `{ "method": "api_key", "apiKey": "sk-or-…" }`. |
 | `GET /v1/providers/:id/connect` | Current `{ connection }` (or `null`). |
 | `POST /v1/providers/:id/connect/code` | `{ code }` from the Claude page. A rejected code answers `status: "waiting"` with `error.code: "wrong_code"`. |
 | `DELETE /v1/providers/:id/connect` | Cancels the sign-in. |
-| `DELETE /v1/providers/:id` | Signs out with the vendor CLI and removes its credentials from the volume. |
+| `DELETE /v1/providers/:id` | Signs out with the vendor CLI and removes its credentials from the volume (for OpenRouter: the key). |
 | `GET /v1/events` | Server-Sent Events for this person only: `provider.updated`, `conversation.run`, `conversation.message`, `conversation.delta`, `conversation.question`, `conversation.context` (`{ conversationId, context }`, the same `context` as above after each measurement, `null` after compaction). Opening it starts the person's runtime, and it keeps the runtime from stopping while it is open. Its first `provider.updated` for each provider is the live state, sent once the runtime is up. The stream closes when the token expires; reconnect with a fresh one. |
 | `POST /v1/conversations` | `{ provider, model, effort?, title? }` → `201 { conversation }`. |
 | `GET /v1/conversations` | `{ conversations, nextCursor }`, newest activity first. `?limit=` (1-200, default 50), `?cursor=<nextCursor>` for the next page, `?query=` to search titles (case-insensitive). |
@@ -106,7 +109,7 @@ While a stream is open, a runtime that stops on its own (a crash, `docker stop`)
 | `PUT /v1/mcp-servers/:name` | `{ url, enabledTools?, description? }` → `201` (new) or `200 { server }`. Registers a Streamable HTTP MCP server for this person; no credentials here. `name`: a lowercase letter, then up to 31 lowercase letters, digits or `_`. `url`: `http` or `https`, an origin allowed by `MCP_ALLOWED_ORIGINS`. `enabledTools`: only these tools are offered and callable. At most 20 servers. |
 | `DELETE /v1/mcp-servers/:name` | Removes the server and forgets its credential → `204`. |
 | `GET /v1/instructions` | `{ text }`: the person's standing instructions (empty when none). |
-| `PUT /v1/instructions` | `{ text }` (at most 64 000 characters; empty clears them) → `{ text }`. Written into the chat workspace as `AGENTS.md` (Codex) and `CLAUDE.md` (Claude Code), so both harnesses load them in new conversations. |
+| `PUT /v1/instructions` | `{ text }` (at most 64 000 characters; empty clears them) → `{ text }`. Written into the chat workspace as `AGENTS.md` (Codex, and Happy's own loop for Grok and OpenRouter) and `CLAUDE.md` (Claude Code), so every agent loads them in new conversations. |
 
 `connection` is `{ status: "waiting"|"connected"|"failed"|"cancelled"|"expired", flow: "paste_code"|"device_code"|"api_key", url, userCode, expiresAt, error: { code: "wrong_code"|"expired"|"sign_in_failed"|"unavailable"|"invalid_api_key", message }|null, account }`.
 
@@ -128,11 +131,15 @@ Other unauthenticated routes: `GET /healthz`, `GET /connect` (demo page), and `P
    the person pastes it and you send it to `/connect/code`. A code Claude refuses comes back as
    `wrong_code` with the sign-in still waiting. When Anthropic itself refuses the code, Tandem starts a
    fresh attempt automatically and returns its new `url` with the same `wrong_code` status.
-3. **Codex** (`flow: "device_code"`): show `userCode` large, with a copy button and a link to `url`, and a
-   countdown to `expiresAt`. The connection turns `connected` on its own; listen for `provider.updated`.
-4. **Claude with an API key**: `POST /connect` with `method: "api_key"`. The key is written to the
-   person's volume, becomes Happy's documented `api_key` setting for the Claude account, and is verified
-   with Happy's own provider check; a refused key is removed again.
+3. **Codex** and **Grok** (`flow: "device_code"`): show `userCode` large, with a copy button and a link to
+   `url`, and a countdown to `expiresAt`. The connection turns `connected` on its own; listen for
+   `provider.updated`. Grok runs the Grok CLI's own `grok login --device-auth`; the person confirms the
+   code on xAI's page.
+4. **Claude or OpenRouter with an API key**: `POST /connect` with `method: "api_key"` (OpenRouter has no
+   other way). The key is written to the person's volume, becomes Happy's documented `api_key` setting
+   for that account, and is verified with Happy's own provider check; a refused key is removed again.
+   For OpenRouter the check is one minimal request to the first model in `runtime/happy.toml`, billed
+   to that key (an account without credits is refused too).
 5. After any successful sign-in Tandem restarts that runtime once it is idle, so the vendor harnesses
    load the new account and its real model list. This is invisible apart from a few seconds of
    `connecting`.
@@ -195,8 +202,9 @@ The agent calls your tools as `mcp__app__<tool>`. How a call travels:
 
 MCP tools need `PERMISSION_MODE=auto` (the default): on Happy Agent 2026.11.6-preview.7 every MCP tool is
 refused in `read_only` and `workspace_write`, even when the person allows the call. In `auto` the harness's
-own reviewer (Claude Code's auto classifier, Codex's Guardian) decides each call; what it hands off becomes
-a permission question.
+own reviewer (Claude Code's auto classifier, Codex's Guardian, and for Grok and OpenRouter Happy's own
+Auto review, which runs on the conversation's own model and account) decides each call; what it hands
+off becomes a permission question.
 
 ## Configuration
 
@@ -284,7 +292,9 @@ docker info --format '{{json .Runtimes}}'               # must list "runsc"; the
 
 Happy Agent, Claude Code (including its Bash tool) and Codex run under gVisor; Codex's own
 bubblewrap sandbox works there too, while under `runc` it cannot create namespaces (the container
-remains the boundary). Docker's embedded DNS does not answer inside gVisor sandboxes, so runtimes get
+remains the boundary). Grok and OpenRouter conversations run shell commands in Happy's own sandbox,
+which needs the same user namespaces: under `runc` with the defaults below those commands fail
+(`create user namespace: Operation not permitted`), while chat, file tools and MCP tools work. Docker's embedded DNS does not answer inside gVisor sandboxes, so runtimes get
 the gateway and the egress proxy by address, never by name. Expect a slower first start of a fresh
 volume (Happy unpacks Claude Code once) and more processes per runtime in `docker stats`.
 
@@ -351,10 +361,12 @@ pools, runtimes fall back to one shared internal network with a warning
 
 All outbound traffic goes through the egress proxy, Stripe's
 [Smokescreen](https://github.com/stripe/smokescreen) (`egress/`), via `HTTPS_PROXY`/`HTTP_PROXY`, which
-Claude Code, Codex, Happy, git and curl honour (`NO_PROXY` lists the gateway). It allows only the
-hostnames in `egress/allowlist.txt` (Anthropic, OpenAI/ChatGPT, GitHub) and refuses private, loopback,
+Claude Code, Codex, the Grok CLI, Happy, git and curl honour (`NO_PROXY` lists the gateway). It allows
+only the hostnames in `egress/allowlist.txt` (Anthropic, OpenAI/ChatGPT, xAI's sign-in `auth.x.ai` and
+Grok endpoint `cli-chat-proxy.grok.com`, `openrouter.ai`, GitHub) and refuses private, loopback,
 link-local and CGNAT addresses in every mode. Vendor telemetry outside the list (for example Datadog
-log intake) is refused.
+log intake) is refused. People open the vendors' sign-in pages (`accounts.x.ai` for Grok) in their own
+browser, not in the runtime.
 
 | Setting | Default | Effect |
 | --- | --- | --- |
@@ -366,6 +378,25 @@ log intake) is refused.
 People's MCP servers keep working: runtimes reach them only through the gateway's MCP proxy (the
 gateway's address on the runtime's network, port `MCP_PROXY_PORT`, outside the egress proxy), and the
 gateway makes the upstream calls itself, only to `MCP_ALLOWED_ORIGINS`.
+
+### Happy's own agent loop (Grok and OpenRouter)
+
+Claude and Codex conversations run on the vendors' unmodified agents (Claude Code, Codex), as before.
+Grok and OpenRouter have no agent of their own that Happy can run, so `runtime/happy.toml` turns on
+Happy's own agent loop (`[harnesses.happy]`) for exactly those two accounts: their turns use Happy's
+prompt, tools, sandbox and compaction with the vendor's model. Consequences:
+
+- **Reviews.** In `auto`, Happy's own Auto review decides each shell command and MCP call that needs
+  one, on the conversation's own model and account (it uses the person's quota or credits).
+- **No sub-agents.** Happy chooses sub-agent routes per account, not per conversation, so a Grok
+  conversation could otherwise start OpenRouter work and the reverse. Both accounts therefore offer no
+  models for sub-agents (`include_subagent_models = []`), and Happy's loop reaches no other harness.
+- **OpenRouter models** are a fixed list in `runtime/happy.toml` (`[providers.openrouter] models`), each
+  of which must support tool calling; Happy reads their names, context windows and efforts from
+  OpenRouter. Edit the list and rebuild the image to change it.
+- **The OpenRouter key** is the person's own: written by the gateway to the person's volume and put into
+  the generated `happy.toml` as Happy's `api_key` at each start, like the Anthropic key, never into a
+  process environment. The person's own agent can read it, as it can every file on the volume.
 
 ### Other notes
 
@@ -393,25 +424,35 @@ gateway makes the upstream calls itself, only to `MCP_ALLOWED_ORIGINS`.
 ## Vendor terms
 
 Each person signs in with their own account to the unmodified official CLIs, through the vendors' own
-sign-in pages; Tandem never pools or shares accounts. Operators are responsible for complying with
-Anthropic's and OpenAI's terms for their deployment, including which accounts and plans may be used this
-way:
+sign-in pages, or uses their own API key; Tandem never pools or shares accounts. Operators are
+responsible for complying with Anthropic's, OpenAI's, xAI's and OpenRouter's terms for their deployment,
+including which accounts and plans may be used this way:
 
 - Claude Code: <https://code.claude.com/docs/en/legal-and-compliance>
 - Codex: <https://learn.chatgpt.com/docs/app-server#auth-endpoints>
+- Grok: <https://x.ai/legal/terms-of-service> (the Grok CLI's source: <https://github.com/xai-org/grok-build>)
+- OpenRouter: <https://openrouter.ai/terms>
 
 Claude Code is proprietary to Anthropic. The runtime image downloads it from Anthropic's official npm
 package at build time; prebuilt images containing it must not be published. See `THIRD_PARTY.md`.
 
 ## Limitations
 
-- Pinned to Happy Agent 2026.11.6-preview.7, Codex 0.160.1 and Claude Code 2.1.321, for linux/arm64 and
-  linux/amd64. `RUNTIME_PLATFORM` can run the non-native variant under emulation, which is slow and only
+- Pinned to Happy Agent 2026.11.6-preview.7, Codex 0.160.1, Claude Code 2.1.321 and the Grok CLI 1.0.89,
+  for linux/arm64 and linux/amd64. `RUNTIME_PLATFORM` can run the non-native variant under emulation, which is slow and only
   meant for testing.
 - Happy's `claude_code` harness always starts the Claude Code copy embedded in Happy Agent (byte-identical
   to the official 2.1.321 build) and ignores the `executable` setting in this version.
 - Claude Code and Codex turns with real accounts were not run under gVisor in this release's tests
-  (sign-in flows, Claude Code's Bash tool against a stand-in API and Codex's sandbox were).
+  (sign-in flows, Claude Code's Bash tool against a stand-in API and Codex's sandbox were). Grok and
+  OpenRouter were verified without real accounts: Grok's device sign-in up to the code, OpenRouter's key
+  check against OpenRouter, and Happy's own loop (Auto review, file and MCP tools) against a stand-in
+  OpenRouter API under `runc`.
+- Gemini through Google Antigravity is not offered. Happy Agent starts Antigravity's sign-in
+  (`agy -p`) with a pipe as its input, and the Antigravity CLI then refuses to sign in ("authentication
+  required"); it offers its Google sign-in only on a terminal. Google's terms also restrict using
+  consumer Antigravity sign-ins through third-party applications. Gemini models are available through
+  OpenRouter.
 - The Docker runtime controller is for a single host. A Kubernetes implementation of the `Runtime`
   interface (`src/runtime.ts`) is the path to multiple hosts.
 - Under gVisor, new outbound connections from running runtimes pause for about 30 seconds (up to a

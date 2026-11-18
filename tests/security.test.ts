@@ -559,7 +559,7 @@ function fakeEngine(opts: {
         else if (JSON.stringify(cmd) === JSON.stringify(ACTIVITY_COMMAND))
           out =
             activity.get(c.Name.slice(1)) ??
-            `${JSON.stringify({ project: { agents: [] } })}\n${JSON.stringify({ providerCli: { id: "claude", operation: null } })}\n${JSON.stringify({ providerCli: { id: "codex", operation: null } })}\n`;
+            `${JSON.stringify({ project: { agents: [] } })}\n${JSON.stringify({ providerCli: { id: "claude", operation: null } })}\n${JSON.stringify({ providerCli: { id: "codex", operation: null } })}\n${JSON.stringify({ providerCli: { id: "grok", operation: null } })}\n`;
         return new Response(frame(out), { headers: { connection: "close" } });
       }
       if ((m = path.match(/^\/exec\/([^/]+)\/json$/))) return json({ ExitCode: 0 });
@@ -844,6 +844,7 @@ describe("Docker runtime controller", () => {
       clis: [
         { id: "claude", operation: null },
         { id: "codex", operation: null },
+        { id: "grok", operation: null },
       ],
     });
     engine.activity.set(`tandem-rt-${KEY}`, "not json\n");

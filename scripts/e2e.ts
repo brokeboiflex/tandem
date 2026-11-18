@@ -12,7 +12,7 @@
 // reaches at E2E_STUB_URL (default http://host.docker.internal:8791/mcp); the gateway's
 // MCP_ALLOWED_ORIGINS must allow that origin.
 import { devToken } from "../src/auth";
-import { CONTEXT_OPEN } from "../src/happy";
+import { CONTEXT_OPEN, PROVIDER_IDS } from "../src/happy";
 import { COPY } from "../src/mcp";
 import { runtimeKey } from "../src/runtime";
 import { sseFrames } from "../src/sse";
@@ -91,14 +91,14 @@ async function client(subject: string) {
       } catch {}
     })();
   };
-  /** The live state of both providers, which the stream sends once the runtime is up. */
+  /** The live state of every provider, which the stream sends once the runtime is up. */
   const live = (since = 0, ms = 90_000) =>
     waitFor(() => {
       const latest = new Map<string, any>();
       for (const e of events.slice(since))
         if (e.event === "provider.updated")
           latest.set(e.data.provider.id, e.data.provider);
-      return latest.size >= 2
+      return latest.size >= PROVIDER_IDS.length
         ? [...latest.values()].sort((a, b) => a.id.localeCompare(b.id))
         : undefined;
     }, ms);
@@ -139,7 +139,7 @@ const running = async (subject: string) =>
   (await containerState(subject))?.Running === true;
 const allUnknown = (r: { status: number; body: any }) =>
   r.status === 200 &&
-  r.body.providers.length === 2 &&
+  r.body.providers.length === PROVIDER_IDS.length &&
   r.body.providers.every((p: any) => p.status === "unknown" && p.checkedAt === null);
 /** Engine events about one person's runtime (network, volume, container), as they arrive here. */
 async function watchRuntime(subject: string) {
@@ -304,8 +304,8 @@ check(
   probe.stderr.toString().trim().slice(0, 80),
 );
 
-// --- 2. Connect -> cancel for both providers ---------------------------------------------------------
-for (const id of ["claude", "codex"]) {
+// --- 2. Connect -> cancel for every provider that signs in ---------------------------------------------
+for (const id of ["claude", "codex", "grok"]) {
   t0 = performance.now();
   const start = await alice.call("POST", `/v1/providers/${id}/connect`, {});
   const c = start.body.connection;
@@ -379,6 +379,30 @@ check(
   (await alice.call("GET", "/v1/providers")).body.providers[0].status ===
     "not_connected",
   "claude: still not connected after the refused key",
+);
+
+// --- 4b. Own OpenRouter API key (bogus): verified by OpenRouter itself, through the egress proxy -----
+t0 = performance.now();
+r = await alice.call("POST", "/v1/providers/openrouter/connect", {
+  method: "api_key",
+  apiKey: `sk-or-v1-${"0".repeat(64)}`,
+});
+check(
+  r.body.connection?.status === "failed" &&
+    r.body.connection.error?.code === "invalid_api_key",
+  "openrouter: a bogus API key is refused and removed",
+  seconds(t0),
+);
+check(
+  (await alice.call("GET", "/v1/providers")).body.providers.find(
+    (p: any) => p.id === "openrouter",
+  ).status === "not_connected" &&
+    inRuntime(alice.subject, 'test -e "$HOME/.agent-runtime/openrouter-api-key" && echo kept') === "",
+  "openrouter: still not connected, and the key is gone from the volume",
+);
+check(
+  (await alice.call("POST", "/v1/providers/openrouter/connect", {})).status === 400,
+  "openrouter: connects only with an API key",
 );
 
 // --- 5. A second person sees nothing of the first ----------------------------------------------------
@@ -483,6 +507,8 @@ if (realSubject) {
   const cheap: Record<string, string[]> = {
     claude: ["claude-code/haiku", "claude-code/sonnet"],
     codex: ["codex-cli/gpt-6-luna"],
+    grok: ["xai/grok-4.5"],
+    openrouter: ["deepseek/deepseek-v4.1-flash-1017"],
   };
   const questions: string[] = [];
   const ask = async (id: string, text: string, extra: Record<string, unknown> = {}) => {
@@ -540,7 +566,7 @@ if (realSubject) {
       continue;
     }
     const model =
-      cheap[p.id]!.find((m) => p.models.some((x: any) => x.id === m)) ??
+      cheap[p.id]?.find((m) => p.models.some((x: any) => x.id === m)) ??
       p.models[0].id;
     console.log(
       `      ${p.id}: ${p.account?.plan ?? "?"} plan, live models: ${p.models.map((m: any) => m.id).join(", ")}`,

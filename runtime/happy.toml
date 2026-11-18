@@ -21,7 +21,8 @@ enabled = false
 [feature.mobile_connector]
 enabled = false
 
-# Only the two vendor accounts the person signs in to through the vendors' own CLIs.
+# Only the person's own vendor accounts: signed in through the vendors' own CLIs, or the person's
+# own API key.
 [providers]
 default_enable = false
 
@@ -35,9 +36,42 @@ executable = "/usr/local/bin/claude"
 [providers.codex]
 enabled = true
 
-# Happy's own agent loop is off: the vendors' unmodified agents run every turn.
+# The person's own `grok login --device-auth`, which Happy reads from ~/.grok/auth.json. No Happy
+# sub-agents on Grok or OpenRouter: both run on Happy's own loop, whose sub-agent routes are chosen
+# per account, so a Grok conversation could otherwise start OpenRouter work and the reverse.
+[providers.grok]
+enabled = true
+include_subagent_models = []
+
+# OpenRouter with the person's own API key. The entrypoint adds the credential: the key the gateway
+# wrote to the person's volume as `api_key`, or without one an `api_key_env` that nothing sets
+# (Happy requires one of the two), so the account has no credential. Only chat models that support
+# tool calling; Happy reads their names, context windows and efforts from OpenRouter's /models.
+[providers.openrouter]
+type = "openai_compatible"
+enabled = true
+base_url = "https://openrouter.ai/api/v1"
+models = [
+  "anthropic/claude-sonnet-5.5",
+  "openai/gpt-6.2-sol",
+  "google/gemini-4-carbon",
+  "x-ai/grok-4.7",
+  "deepseek/deepseek-v4.1-flash-1017",
+  "qwen/qwen4-max",
+  "moonshotai/kimi-k3.1-pro",
+  "z-ai/glm-5.3-prime",
+]
+reasoning_field = "reasoning"
+include_subagent_models = []
+
+[providers.openrouter.request]
+reasoning = { enabled = true }
+
+# Happy's own agent loop runs only Grok and OpenRouter, which have no agent of their own; every
+# other account runs its vendor's unmodified agent. It starts no sub-agents on other harnesses.
 [harnesses.happy]
-enabled = false
+providers = ["grok", "openrouter"]
+subagent_harnesses = []
 
 # What a new agent gets when a message names nothing. The gateway always sends an explicit mode.
 [defaults]

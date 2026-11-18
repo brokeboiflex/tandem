@@ -1,5 +1,6 @@
-// Drives the /connect demo page in headless Chromium through start -> wrong code -> cancel for both
-// providers and saves screenshots to evidence/. Needs DEV_TOKEN_ROUTE=true on the running gateway.
+// Drives the /connect demo page in headless Chromium through start -> wrong code -> cancel for the
+// providers that sign in, opens OpenRouter's key form, and saves screenshots to evidence/. Needs
+// DEV_TOKEN_ROUTE=true on the running gateway.
 //   BROWSER_EXECUTABLE=/path/to/chrome bun scripts/page-check.ts
 import { chromium } from "playwright-core";
 
@@ -12,6 +13,8 @@ const browser = await chromium.launch({
 const page = await browser.newPage({ viewport: { width: 1100, height: 900 } });
 const claude = page.locator("#card-claude");
 const codex = page.locator("#card-codex");
+const grok = page.locator("#card-grok");
+const openrouter = page.locator("#card-openrouter");
 const step = (text: string) => console.log(`PASS  ${text}`);
 
 await page.goto(`${BASE}/connect`);
@@ -21,8 +24,10 @@ await page
 await page.keyboard.press("Enter");
 await claude.getByText("Not connected").waitFor();
 await codex.getByText("Not connected").waitFor();
+await grok.getByText("Not connected").waitFor();
+await openrouter.getByText("Not connected").waitFor();
 await page.screenshot({ path: out("1-not-connected") });
-step("both cards render Not connected");
+step("every card renders Not connected");
 
 const [popup] = await Promise.all([
   page.waitForEvent("popup"),
@@ -80,5 +85,21 @@ await claude
 await claude.getByLabel("Anthropic API key").waitFor();
 await page.screenshot({ path: out("6-claude-api-key") });
 step("Claude also offers its own API key");
+
+await grok.getByRole("button", { name: "Connect Grok" }).click();
+await grok.locator(".code").waitFor();
+const grokCode = await grok.locator(".code").textContent();
+await grok.locator(".code").evaluate((el) => ((el as HTMLElement).style.filter = "blur(9px)"));
+await grok.screenshot({ path: out("7-grok-device-code") });
+step(`Grok shows a ${grokCode?.length}-character device code and its sign-in link`);
+await grok.getByRole("button", { name: "Cancel sign-in" }).click();
+await grok.getByText("Sign-in cancelled.").waitFor();
+
+await openrouter
+  .getByRole("button", { name: "Add your OpenRouter API key" })
+  .click();
+await openrouter.getByLabel("OpenRouter API key").waitFor();
+await openrouter.screenshot({ path: out("8-openrouter-api-key") });
+step("OpenRouter asks only for the person's own API key");
 
 await browser.close();

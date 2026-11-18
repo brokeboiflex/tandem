@@ -3,11 +3,13 @@ import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { devToken } from "../src/auth";
 import type { Config } from "../src/config";
 import { createGateway } from "../src/gateway";
+import { PROVIDER_IDS } from "../src/happy";
 import { runtimeKey } from "../src/runtime";
 import { sseFrames } from "../src/sse";
 import {
   FakeRuntime,
   GOOD_CODE_PREFIX,
+  GOOD_KEY_PREFIX,
   socketProxyPolicy,
 } from "./fake-daemon";
 
@@ -107,7 +109,7 @@ const until = async (ok: () => boolean | Promise<boolean>, ms = 5000) => {
 /** Starts a person's runtime the way an app does, and waits until it is up and the stream closed. */
 async function wake(token: string) {
   const stream = await listen(token);
-  await until(() => stream.updates().length >= 2);
+  await until(() => stream.updates().length >= PROVIDER_IDS.length);
   stream.close();
   await until(() =>
     [...gateway.people.values()].every((p) => p.clients.size === 0),
@@ -133,7 +135,9 @@ describe("façade surface", () => {
       ["GET", "/v1/config"],
       ["GET", "/v1/bots"],
       ["GET", "/v1/connections"],
-      ["POST", "/v1/providers/grok/connect"],
+      ["POST", "/v1/providers/gemini/connect"],
+      ["POST", "/v1/providers/antigravity/connect"],
+      ["DELETE", "/v1/providers/bedrock"],
       ["PATCH", "/v1/providers"],
       ["GET", "/v1/providers/claude"],
       ["PUT", "/v1/conversations"],
@@ -161,7 +165,7 @@ describe("providers and sign-in", () => {
     const key = runtimeKey(cfg.serviceSecret, "alice");
     const { status, body } = await call(alice, "GET", "/v1/providers");
     expect(status).toBe(200);
-    expect(body.providers).toEqual([unknown("claude"), unknown("codex")]);
+    expect(body.providers).toEqual(PROVIDER_IDS.map(unknown));
     for (const path of [
       "/v1/conversations",
       "/v1/conversations/mabc/messages",
@@ -180,7 +184,7 @@ describe("providers and sign-in", () => {
   test("opening the event stream starts the runtime, archives the admin bot and sends the live state", async () => {
     const key = runtimeKey(cfg.serviceSecret, "alice");
     const stream = await listen(alice);
-    await until(() => stream.updates().length >= 2);
+    await until(() => stream.updates().length >= PROVIDER_IDS.length);
     stream.close();
     expect(runtime.calls).toContain(`ensure ${key}`);
     expect(
@@ -191,6 +195,8 @@ describe("providers and sign-in", () => {
     ).toEqual([
       ["claude", "not_connected", 0],
       ["codex", "not_connected", 0],
+      ["grok", "not_connected", 0],
+      ["openrouter", "not_connected", 0],
     ]);
     const { body } = await call(alice, "GET", "/v1/providers");
     expect(
@@ -198,6 +204,8 @@ describe("providers and sign-in", () => {
     ).toEqual([
       ["claude", "not_connected", 0],
       ["codex", "not_connected", 0],
+      ["grok", "not_connected", 0],
+      ["openrouter", "not_connected", 0],
     ]);
     const d = runtime.daemons.get(key)!;
     expect(
@@ -391,6 +399,272 @@ describe("secrets pass through the gateway in memory only", () => {
   });
 });
 
+describe("Grok and OpenRouter", () => {
+  const fixture = (name: string) =>
+    Bun.file(`${import.meta.dir}/fixtures/${name}`).json();
+  const provider = async (token: string, id: string) =>
+    (await call(token, "GET", "/v1/providers")).body.providers.find(
+      (p: any) => p.id === id,
+    );
+
+  test("Grok: one call starts the device flow; the approved code connects Grok, whose conversations run on Happy's grok account", async () => {
+    const gina = await tokenFor("gina");
+    const key = runtimeKey(cfg.serviceSecret, "gina");
+    const start = await call(gina, "POST", "/v1/providers/grok/connect", {});
+    expect(start.body.connection).toEqual({
+      status: "waiting",
+      flow: "device_code",
+      url: "https://accounts.x.ai/oauth2/device?user_code=WXYZ-2345",
+      userCode: "WXYZ-2345",
+      expiresAt: expect.any(String),
+      error: null,
+      account: null,
+    });
+    // Grok has no code to paste and takes no API key.
+    expect(
+      await call(gina, "POST", "/v1/providers/grok/connect/code", {
+        code: "WXYZ-2345",
+      }),
+    ).toMatchObject({ status: 409, body: { error: "not_waiting_for_code" } });
+    expect(
+      await call(gina, "POST", "/v1/providers/grok/connect", {
+        method: "api_key",
+        apiKey: "x".repeat(40),
+      }),
+    ).toMatchObject({
+      status: 400,
+      body: { message: "Only Claude and OpenRouter accept an API key." },
+    });
+    runtime.daemons.get(key)!.approveDevice("grok");
+    await until(async () => (await provider(gina, "grok")).status === "connected");
+    const grok = await provider(gina, "grok");
+    expect(grok).toMatchObject({
+      method: "subscription",
+      account: { email: "user@example.com", plan: null },
+    });
+    expect(grok.models.map((m: any) => m.id)).toContain("xai/grok-4.7");
+    expect(
+      (await call(gina, "GET", "/v1/providers/grok/connect")).body.connection,
+    ).toMatchObject({ status: "connected", flow: "device_code" });
+
+    const created = await call(gina, "POST", "/v1/conversations", {
+      provider: "grok",
+      model: "xai/grok-4.7",
+    });
+    expect(created.status).toBe(201);
+    expect(created.body.conversation).toMatchObject({
+      provider: "grok",
+      model: "xai/grok-4.7",
+      effort: "high",
+    });
+    const id = created.body.conversation.id;
+    const sent = await call(gina, "POST", `/v1/conversations/${id}/messages`, {
+      text: "hi",
+      effort: "low",
+    });
+    expect(sent.body.conversation).toMatchObject({
+      provider: "grok",
+      effort: "low",
+    });
+    const send = runtime.daemons
+      .get(key)!
+      .requests.find((r) => r.path === `/v0/agents/${id}/send`)!;
+    expect(JSON.parse(send.body).mode).toMatchObject({
+      providerId: "grok",
+      modelId: "xai/grok-4.7",
+    });
+    // Models of another account are refused.
+    expect(
+      (
+        await call(gina, "POST", `/v1/conversations/${id}/messages`, {
+          text: "hi",
+          model: "codex-cli/gpt-6-luna",
+        })
+      ).body.error,
+    ).toBe("model_unavailable");
+
+    runtime.calls.length = 0;
+    runtime.execs.length = 0;
+    expect((await call(gina, "DELETE", "/v1/providers/grok")).status).toBe(200);
+    expect(runtime.execs).toEqual([
+      [
+        "sh",
+        "-c",
+        'grok logout >/dev/null 2>&1; rm -f "$HOME/.grok/"auth.json*',
+      ],
+    ]);
+    expect(runtime.calls).toContain(`restart ${key}`);
+  });
+
+  test("OpenRouter connects only with the person's own API key", async () => {
+    const olga = await tokenFor("olga");
+    await wake(olga);
+    for (const body of [{}, { method: "subscription" }])
+      expect(
+        await call(olga, "POST", "/v1/providers/openrouter/connect", body),
+      ).toMatchObject({ status: 400, body: { error: "invalid_request" } });
+    expect(
+      (await call(olga, "GET", "/v1/providers/openrouter/connect")).body,
+    ).toEqual({ connection: null });
+    expect(
+      await call(olga, "POST", "/v1/providers/openrouter/connect/code", {
+        code: "abc",
+      }),
+    ).toMatchObject({ status: 409, body: { error: "not_waiting_for_code" } });
+    expect(
+      await call(olga, "DELETE", "/v1/providers/openrouter/connect"),
+    ).toEqual({ status: 200, body: { connection: null } });
+    expect(
+      await call(olga, "POST", "/v1/providers/openrouter/connect", {
+        method: "api_key",
+        apiKey: "sk-or-short",
+      }),
+    ).toEqual({
+      status: 400,
+      body: {
+        error: "invalid_api_key_format",
+        message: "Paste the whole key. It starts with sk-or-.",
+      },
+    });
+  });
+
+  test("a refused OpenRouter key is removed again; an accepted one connects OpenRouter, and the key stays out of the gateway", async () => {
+    const olga = await tokenFor("olga");
+    const key = runtimeKey(cfg.serviceSecret, "olga");
+    const path = "/home/agent/.agent-runtime/openrouter-api-key";
+    const bad = `sk-or-v1-SECRETOR${"0".repeat(48)}`;
+    const good = `${GOOD_KEY_PREFIX}-SECRETOR${"1".repeat(48)}`;
+    responses.length = 0;
+    logs.length = 0;
+    runtime.execs.length = 0;
+    const refused = await call(olga, "POST", "/v1/providers/openrouter/connect", {
+      method: "api_key",
+      apiKey: bad,
+    });
+    expect(refused.body.connection).toEqual({
+      status: "failed",
+      flow: "api_key",
+      url: null,
+      userCode: null,
+      expiresAt: null,
+      error: {
+        code: "invalid_api_key",
+        message:
+          "OpenRouter didn't accept that API key, or couldn't be reached. Check the key and try again.",
+      },
+      account: null,
+    });
+    expect(runtime.execs).toContainEqual(["rm", "-f", path]);
+    expect(runtime.volume.has(`${key}:${path}`)).toBe(false);
+    expect(
+      (await call(olga, "GET", "/v1/providers/openrouter/connect")).body
+        .connection.error.code,
+    ).toBe("invalid_api_key");
+    // The verdict is OpenRouter's alone.
+    expect(
+      (await call(olga, "GET", "/v1/providers/claude/connect")).body.connection,
+    ).toBeNull();
+
+    const accepted = await call(olga, "POST", "/v1/providers/openrouter/connect", {
+      method: "api_key",
+      apiKey: ` ${good} `,
+    });
+    expect(accepted.body.connection).toMatchObject({
+      status: "connected",
+      flow: "api_key",
+      error: null,
+      account: { email: null, plan: "API key" },
+    });
+    expect(runtime.volume.get(`${key}:${path}`)).toBe(`${good}\n`);
+    const daemon = runtime.daemons.get(key)!;
+    expect(
+      daemon.requests
+        .filter((r) => r.path.endsWith("/verify"))
+        .map((r) => [r.path, r.body]),
+    ).toEqual([
+      ["/v0/providers/openrouter/verify", '{"level":"authentication"}'],
+      ["/v0/providers/openrouter/verify", '{"level":"authentication"}'],
+    ]);
+    const openrouter = await provider(olga, "openrouter");
+    expect(openrouter).toMatchObject({
+      status: "connected",
+      method: "api_key",
+      account: { email: null, plan: "API key" },
+    });
+    expect(openrouter.models).toHaveLength(8);
+    expect(openrouter.models[0]).toMatchObject({
+      id: "anthropic/claude-sonnet-5.5",
+      name: "Anthropic: Claude Sonnet 5.5",
+      default: false,
+    });
+
+    const created = await call(olga, "POST", "/v1/conversations", {
+      provider: "openrouter",
+      model: "deepseek/deepseek-v4.1-flash-1017",
+    });
+    expect(created.body.conversation).toMatchObject({
+      provider: "openrouter",
+      model: "deepseek/deepseek-v4.1-flash-1017",
+    });
+    const draft = daemon.requests.find(
+      (r) =>
+        r.method === "PUT" &&
+        r.path === `/v0/agents/${created.body.conversation.id}/draft`,
+    )!;
+    expect(JSON.parse(draft.body).draft.providerId).toBe("openrouter");
+
+    // The key reached the person's volume only: never a response, a log, the daemon or memory.
+    expect(responses.join("\n")).not.toContain("SECRETOR");
+    expect(logs.join("\n")).not.toContain("SECRETOR");
+    expect(daemon.requests.some((r) => r.body.includes("SECRETOR"))).toBe(false);
+    const state = JSON.stringify([...gateway.people.values()], (_k, v) =>
+      v instanceof Map || v instanceof Set ? [...v] : v,
+    );
+    expect(state).not.toContain("SECRETOR");
+  });
+
+  test("a turn whose key OpenRouter refuses makes it not connected; disconnecting removes the key", async () => {
+    const olga = await tokenFor("olga");
+    const key = runtimeKey(cfg.serviceSecret, "olga");
+    const page = await fixture("messages-invalid-api-key-openrouter.json");
+    const message = page.runs
+      .at(-1)
+      .messages.find((m: any) => m.failure);
+    runtime.daemons.get(key)!.push("message.created", {
+      agentId: "someconversation",
+      runId: "r1",
+      message: { ...message, createdAt: Date.now() },
+    });
+    await until(
+      async () => (await provider(olga, "openrouter")).status === "not_connected",
+    );
+    expect(
+      (await call(olga, "GET", "/v1/providers/openrouter/connect")).body
+        .connection,
+    ).toBeNull();
+
+    runtime.calls.length = 0;
+    runtime.execs.length = 0;
+    const daemon = runtime.daemons.get(key)!;
+    const seen = daemon.requests.length;
+    const r = await call(olga, "DELETE", "/v1/providers/openrouter");
+    expect(r.body.provider).toMatchObject({
+      id: "openrouter",
+      status: "not_connected",
+      method: null,
+      models: [],
+    });
+    expect(runtime.execs).toEqual([
+      ["rm", "-f", "/home/agent/.agent-runtime/openrouter-api-key"],
+    ]);
+    expect(runtime.calls).toContain(`restart ${key}`);
+    // It has no sign-in of its own, and no other provider's was touched.
+    expect(
+      daemon.requests.slice(seen).filter((r) => r.path.startsWith("/v0/provider-clis/") && r.method === "POST"),
+    ).toEqual([]);
+  });
+});
+
 describe("conversations and isolation between people", () => {
   test("Alice's conversation is invisible and unreachable for Bob", async () => {
     const created = await call(alice, "POST", "/v1/conversations", {
@@ -516,7 +790,7 @@ describe("conversations and isolation between people", () => {
       false,
     );
     expect(b.events.filter((e) => e.event === "provider.updated").length).toBe(
-      2,
+      PROVIDER_IDS.length,
     ); // Bob's own snapshot
   });
 
@@ -527,10 +801,9 @@ describe("conversations and isolation between people", () => {
     runtime.kill(key);
     runtime.calls.length = 0;
     const read = await call(carol, "GET", "/v1/providers");
-    expect(read.body.providers.map((p: any) => p.status)).toEqual([
-      "not_connected",
-      "not_connected",
-    ]);
+    expect(read.body.providers.map((p: any) => p.status)).toEqual(
+      PROVIDER_IDS.map(() => "not_connected"),
+    );
     expect(runtime.calls).not.toContain(`ensure ${key}`);
     const t0 = performance.now();
     expect(
@@ -544,14 +817,14 @@ describe("conversations and isolation between people", () => {
   test("while an event stream is open, a runtime that went away is restarted at once", async () => {
     const key = runtimeKey(cfg.serviceSecret, "frank");
     const stream = await listen(await tokenFor("frank"));
-    await until(() => stream.updates().length >= 2);
+    await until(() => stream.updates().length >= PROVIDER_IDS.length);
     runtime.kill(key);
     runtime.calls.length = 0;
     stream.events.length = 0;
     // A restart waits for a runtime that is still shutting down; a plain start would not.
     await until(() => runtime.calls.includes(`restart ${key}`));
     // Its clients get the live state again once it is back.
-    await until(() => stream.updates().length >= 2);
+    await until(() => stream.updates().length >= PROVIDER_IDS.length);
     stream.close();
   });
 
@@ -581,7 +854,7 @@ describe("conversations and isolation between people", () => {
   test("an open event stream keeps the runtime from idling out; the idle period starts when it closes", async () => {
     const key = runtimeKey(cfg.serviceSecret, "heidi");
     const stream = await listen(await tokenFor("heidi"));
-    await until(() => stream.updates().length >= 2);
+    await until(() => stream.updates().length >= PROVIDER_IDS.length);
     const heidi = gateway.people.get(key)!;
     heidi.lastUsed = 0;
     runtime.calls.length = 0;
@@ -604,15 +877,14 @@ describe("conversations and isolation between people", () => {
     runtime.agents.set(key, [agent]);
     runtime.calls.length = 0;
     const stream = await listen(rita);
-    await until(() => stream.updates().length >= 2);
+    await until(() => stream.updates().length >= PROVIDER_IDS.length);
     const statuses = (list: any[]) => list.map((p) => p.status);
-    expect(statuses(stream.updates().map((u) => u.data.provider))).toEqual([
-      "connecting",
-      "connecting",
-    ]);
+    expect(statuses(stream.updates().map((u) => u.data.provider))).toEqual(
+      PROVIDER_IDS.map(() => "connecting"),
+    );
     expect(
       statuses((await call(rita, "GET", "/v1/providers")).body.providers),
-    ).toEqual(["connecting", "connecting"]);
+    ).toEqual(PROVIDER_IDS.map(() => "connecting"));
     const change = await call(rita, "PUT", "/v1/instructions", { text: "x" });
     expect([change.status, change.body.error]).toEqual([
       503,
@@ -639,7 +911,7 @@ describe("conversations and isolation between people", () => {
     expect(calls).toEqual([`ensure ${key}`, `stop ${key}`, `ensure ${key}`]);
     expect(
       statuses((await call(rita, "GET", "/v1/providers")).body.providers),
-    ).toEqual(["not_connected", "not_connected"]);
+    ).toEqual(PROVIDER_IDS.map(() => "not_connected"));
     stream.close();
   });
 
@@ -685,6 +957,8 @@ describe("last-known provider state", () => {
     expect(r.body.providers.map((p: any) => [p.id, p.status])).toEqual([
       ["claude", "connected"],
       ["codex", "not_connected"],
+      ["grok", "not_connected"],
+      ["openrouter", "not_connected"],
     ]);
     expect(r.body.providers[0].models.length).toBeGreaterThan(0);
     expect(Date.parse(r.body.providers[0].checkedAt)).toBeLessThan(asked);
@@ -764,15 +1038,12 @@ describe("last-known provider state", () => {
     );
     expect(performance.now() - t0).toBeLessThan(500);
     expect(res.status).toBe(200);
-    expect((await res.json()).providers).toEqual([
-      unknown("claude"),
-      unknown("codex"),
-    ]);
+    expect((await res.json()).providers).toEqual(PROVIDER_IDS.map(unknown));
     await Bun.sleep(300);
     expect(runtime.calls).toEqual([]);
 
     const stream = await listen(erin, restarted.fetch);
-    await until(() => stream.updates().length >= 2);
+    await until(() => stream.updates().length >= PROVIDER_IDS.length);
     stream.close();
     expect(runtime.calls).toContain(`ensure ${erinKey}`);
     expect(

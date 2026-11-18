@@ -224,9 +224,9 @@
     <main>
       <h1>Connect your AI accounts</h1>
       <p class="lede">
-        Sign in with your own Claude and ChatGPT accounts. Your sign-in stays in
-        your private workspace; passwords are entered only on the vendor's own
-        pages.
+        Sign in with your own Claude, ChatGPT and Grok accounts, or use your own
+        API keys. Your sign-in stays in your private workspace; passwords are
+        entered only on the vendor's own pages.
       </p>
 
       <form class="identity" id="identity" aria-label="Who are you?">
@@ -254,15 +254,48 @@
           id="card-codex"
           aria-labelledby="title-codex"
         ></article>
+        <article
+          class="card"
+          id="card-grok"
+          aria-labelledby="title-grok"
+        ></article>
+        <article
+          class="card"
+          id="card-openrouter"
+          aria-labelledby="title-openrouter"
+        ></article>
       </section>
       <p class="visually-hidden" aria-live="polite" id="announce"></p>
     </main>
     <script nonce="__NONCE__">
       "use strict";
       const DEV_TOKENS = __DEV_TOKENS__;
-      const NAMES = { claude: "Claude", codex: "ChatGPT (Codex)" };
-      const VENDOR = { claude: "Claude", codex: "ChatGPT" };
-      const state = { claude: {}, codex: {} }; // { provider, connection, busy, ui }
+      const NAMES = {
+        claude: "Claude",
+        codex: "ChatGPT (Codex)",
+        grok: "Grok",
+        openrouter: "OpenRouter",
+      };
+      const VENDOR = {
+        claude: "Claude",
+        codex: "ChatGPT",
+        grok: "Grok",
+        openrouter: "OpenRouter",
+      };
+      // Providers that take the person's own API key; OpenRouter takes nothing else.
+      const KEYS = {
+        claude: {
+          label: "Anthropic API key",
+          help: "Create a key at console.anthropic.com. Usage is billed to that key, not to a Claude subscription.",
+        },
+        openrouter: {
+          label: "OpenRouter API key",
+          help: "Create a key at openrouter.ai/keys. Usage is billed to that key.",
+        },
+      };
+      const KEY_ONLY = new Set(["openrouter"]);
+      // { provider, connection, busy, ui }
+      const state = { claude: {}, codex: {}, grok: {}, openrouter: {} };
       let token = null,
         listening = null;
 
@@ -340,6 +373,7 @@
           $("identity-status").textContent = "Loading your accounts…";
           const { providers } = await api("GET", "/v1/providers");
           for (const p of providers) {
+            if (!state[p.id]) continue; // a provider this page does not show
             state[p.id].provider = p;
             render(p.id);
           }
@@ -380,6 +414,7 @@
                 if (event === "provider.updated" && data) {
                   const { provider, connection } = JSON.parse(data);
                   const s = state[provider.id];
+                  if (!s) continue;
                   const was = s.provider?.status;
                   s.provider = provider;
                   s.connection = connection;
@@ -475,12 +510,12 @@
           );
           clearInput(`${id}-key`);
           s.connection = connection;
-          if (connection.status === "connected") {
-            s.ui = null;
+          s.ui = null; // the card shows the outcome: connected, or why the key was refused
+          if (connection.status === "connected")
             s.provider = (await api("GET", "/v1/providers")).providers.find(
               (p) => p.id === id,
             );
-          }
+          else s.focus = "connect";
         });
 
       // Re-renders replace the card, so clear the live field rather than the one that was submitted.
@@ -565,12 +600,12 @@
                   saveKey(id, input);
                 },
               },
-              h("label", { for: `${id}-key` }, "Anthropic API key"),
+              h("label", { for: `${id}-key` }, KEYS[id].label),
               input,
               h(
                 "p",
                 { class: "muted", id: `${id}-key-help` },
-                "Create a key at console.anthropic.com. Usage is billed to that key, not to a Claude subscription.",
+                KEYS[id].help,
               ),
               h(
                 "div",
@@ -615,7 +650,7 @@
                 h(
                   "p",
                   {},
-                  "Sign in on the Claude page we opened in a new tab. ",
+                  `Sign in on the ${VENDOR[id]} page we opened in a new tab. `,
                 ),
                 c.url
                   ? h(
@@ -626,7 +661,7 @@
                         target: "_blank",
                         rel: "noopener noreferrer",
                       },
-                      "Open the Claude sign-in page",
+                      `Open the ${VENDOR[id]} sign-in page`,
                     )
                   : h("p", { class: "muted" }, "Preparing the sign-in page…"),
               ),
@@ -644,7 +679,7 @@
                   h(
                     "label",
                     { for: `${id}-code` },
-                    "After you approve, Claude shows a code. Copy it and paste it here:",
+                    `After you approve, ${VENDOR[id]} shows a code. Copy it and paste it here:`,
                   ),
                   input,
                   c.error &&
@@ -730,7 +765,7 @@
                 h(
                   "p",
                   {},
-                  "Open the sign-in page, sign in with your ChatGPT account and enter the code.",
+                  `Open the sign-in page, sign in with your ${VENDOR[id]} account and enter the code.`,
                 ),
                 c.url &&
                   h(
@@ -776,7 +811,7 @@
           const a = p.account ?? {};
           body.push(
             p.method === "api_key"
-              ? h("p", {}, "Using your own Anthropic API key.")
+              ? h("p", {}, `Using your own ${KEYS[id].label}.`)
               : h(
                   "p",
                   {},
@@ -820,11 +855,18 @@
               cancelled: "Sign-in cancelled.",
               failed: c.error?.message,
             }[c.status];
+          const showKey = () => {
+            s.ui = "api-key";
+            s.focus = "key";
+            render(id);
+          };
           body.push(
             h(
               "p",
               { class: "muted" },
-              `Use your own ${VENDOR[id]} account. You'll sign in on ${VENDOR[id]}'s own page.`,
+              KEY_ONLY.has(id)
+                ? `Use your own ${KEYS[id].label}.`
+                : `Use your own ${VENDOR[id]} account. You'll sign in on ${VENDOR[id]}'s own page.`,
             ),
             result &&
               h(
@@ -844,27 +886,26 @@
                   class: "primary",
                   id: `${id}-connect`,
                   disabled: s.busy,
-                  onclick: () => connect(id),
+                  onclick: () => (KEY_ONLY.has(id) ? showKey() : connect(id)),
                 },
                 s.busy
                   ? "Starting…"
-                  : c && c.status !== "connected"
-                    ? "Try again"
-                    : `Connect ${VENDOR[id]}`,
+                  : KEY_ONLY.has(id)
+                    ? `Add your ${KEYS[id].label}`
+                    : c && c.status !== "connected"
+                      ? "Try again"
+                      : `Connect ${VENDOR[id]}`,
               ),
-              id === "claude" &&
+              KEYS[id] &&
+                !KEY_ONLY.has(id) &&
                 h(
                   "button",
                   {
                     class: "link",
                     disabled: s.busy,
-                    onclick: () => {
-                      s.ui = "api-key";
-                      s.focus = "key";
-                      render(id);
-                    },
+                    onclick: showKey,
                   },
-                  "Use your own Anthropic API key",
+                  `Use your own ${KEYS[id].label}`,
                 ),
             ),
           );
@@ -907,8 +948,7 @@
         for (const el of document.querySelectorAll("[data-countdown]"))
           el.textContent = remaining(el.dataset.countdown);
       }, 1000);
-      render("claude");
-      render("codex");
+      for (const id of Object.keys(state)) render(id);
       if (DEV_TOKENS) $("identity-input").focus();
     </script>
   </body>

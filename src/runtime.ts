@@ -41,7 +41,7 @@ export const LAUNCH_VALUES_COMMAND = [
 export const ACTIVITY_COMMAND = [
   "sh",
   "-c",
-  't=$(cat /home/agent/.happy/agent/token) && for p in projects/chats provider-clis/claude provider-clis/codex; do echo "authorization: Bearer $t" | curl -sf -m 10 -H @- --unix-socket /home/agent/.happy/agent/server.sock "http://runtime/v0/$p" && echo || exit 1; done',
+  't=$(cat /home/agent/.happy/agent/token) && for p in projects/chats provider-clis/claude provider-clis/codex provider-clis/grok; do echo "authorization: Bearer $t" | curl -sf -m 10 -H @- --unix-socket /home/agent/.happy/agent/server.sock "http://runtime/v0/$p" && echo || exit 1; done',
 ];
 
 /**

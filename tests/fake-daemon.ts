@@ -1,6 +1,7 @@
 // A small stateful stand-in for one person's Happy Agent daemon, served over real HTTP, plus a fake
 // Runtime that hands the gateway one such daemon per runtime key. Shapes follow tests/fixtures.
 import { readFileSync } from "node:fs";
+import { apiKeyOf, RUNTIME_DIR, type ProviderId } from "../src/happy";
 import {
   CLAUDE_MODELS_COMMAND,
   StaleRuntime,
@@ -8,16 +9,34 @@ import {
   type RuntimeHandle,
 } from "../src/runtime";
 
-const config = (
-  await Bun.file(`${import.meta.dir}/fixtures/config-signed-out.json`).json()
+const signedOut = (
+  await Bun.file(`${import.meta.dir}/fixtures/config-providers.json`).json()
 ).config;
 const OPENING = [
   "Opening browser to sign in…",
   "If the browser didn't open, visit: https://claude.com/cai/oauth/authorize?<redacted>",
 ];
 export const GOOD_CODE_PREFIX = "goodcode";
+/** An API key the fake vendors accept. */
+export const GOOD_KEY_PREFIX = "goodkey";
+const KEYED: ProviderId[] = ["claude", "openrouter"];
 
-export function fakeDaemon(token: string) {
+/**
+ * `file` reads the person's volume: like the runtime entrypoint, each start (boot) gives an account
+ * whose API key file exists its key's display name.
+ */
+export function fakeDaemon(
+  token: string,
+  file: (path: string) => string | undefined = () => undefined,
+) {
+  let config = signedOut;
+  const boot = () => {
+    config = structuredClone(signedOut);
+    for (const id of KEYED)
+      if (file(`${RUNTIME_DIR}/${apiKeyOf(id)!.file}`))
+        config.providers[id].name = apiKeyOf(id)!.account;
+  };
+  boot();
   const requests: { method: string; path: string; body: string }[] = [];
   const streams = new Set<ReadableStreamDefaultController>();
   const agents = new Map<string, any>();
@@ -47,6 +66,27 @@ export function fakeDaemon(token: string) {
         methods: ["browser", "device"],
       },
       operation: null,
+    },
+    grok: {
+      id: "grok",
+      installation: { status: "installed" },
+      signIn: {
+        status: "signed_out",
+        account: null,
+        methods: ["browser", "device"],
+      },
+      operation: null,
+    },
+  };
+  // The device pages the pinned CLIs print (codes are fake).
+  const DEVICE: Record<string, { url: string; userCode: string }> = {
+    codex: {
+      url: "https://auth.openai.com/codex/device",
+      userCode: "ABCD-12345",
+    },
+    grok: {
+      url: "https://accounts.x.ai/oauth2/device?user_code=WXYZ-2345",
+      userCode: "WXYZ-2345",
     },
   };
   let opSeq = 0;
@@ -86,9 +126,11 @@ export function fakeDaemon(token: string) {
         return project
           ? json({ project: { ...project, agents: [...agents.values()] } })
           : json({ code: "not_found" }, 404);
-      if ((m = path.match(/^\/v0\/provider-clis\/(claude|codex)$/)))
+      if ((m = path.match(/^\/v0\/provider-clis\/(claude|codex|grok)$/)))
         return json({ providerCli: clis[m[1]!] });
-      if ((m = path.match(/^\/v0\/provider-clis\/(claude|codex)\/sign-in$/))) {
+      if (
+        (m = path.match(/^\/v0\/provider-clis\/(claude|codex|grok)\/sign-in$/))
+      ) {
         const id = m[1]!;
         clis[id].operation = {
           id: `op${++opSeq}`,
@@ -108,8 +150,7 @@ export function fakeDaemon(token: string) {
                 }
               : {
                   method: "device",
-                  url: "https://auth.openai.com/codex/device",
-                  userCode: "ABCD-12345",
+                  ...DEVICE[id]!,
                   openedByProgram: false,
                   acceptsCode: false,
                   expiresAt: Date.now() + 600_000,
@@ -118,7 +159,9 @@ export function fakeDaemon(token: string) {
         return json({ providerCli: clis[id] });
       }
       if (
-        (m = path.match(/^\/v0\/provider-clis\/(claude|codex)\/sign-in\/code$/))
+        (m = path.match(
+          /^\/v0\/provider-clis\/(claude|codex|grok)\/sign-in\/code$/,
+        ))
       ) {
         const op = clis[m[1]!].operation;
         if (data.code.startsWith(GOOD_CODE_PREFIX)) {
@@ -149,14 +192,23 @@ export function fakeDaemon(token: string) {
           return json({ code: "internal", error: `bad ${data.code}` }, 500); // a misbehaving daemon
         return json({ providerCli: clis[m[1]!] });
       }
-      if ((m = path.match(/^\/v0\/provider-clis\/(claude|codex)\/cancel$/))) {
+      if (
+        (m = path.match(/^\/v0\/provider-clis\/(claude|codex|grok)\/cancel$/))
+      ) {
         const op = clis[m[1]!].operation;
         if (op && ["running", "waiting"].includes(op.status))
           Object.assign(op, { status: "cancelled", authorization: null });
         return json({ providerCli: clis[m[1]!] });
       }
-      if (path === "/v0/providers/claude/verify")
-        return json({ status: "failed", performedLevel: "inference" });
+      if ((m = path.match(/^\/v0\/providers\/(claude|openrouter)\/verify$/))) {
+        const key = file(
+          `${RUNTIME_DIR}/${apiKeyOf(m[1] as ProviderId)!.file}`,
+        );
+        return json({
+          status: key?.startsWith(GOOD_KEY_PREFIX) ? "passed" : "failed",
+          performedLevel: "inference",
+        });
+      }
       if (path === "/v0/agents" && req.method === "POST") {
         const agent = {
           id: data.id,
@@ -264,6 +316,21 @@ export function fakeDaemon(token: string) {
     requests,
     clis,
     agents,
+    boot,
+    /** The person confirms a device code on the vendor's page: the CLI reports the account. */
+    approveDevice(id: string) {
+      Object.assign(clis[id].operation, {
+        status: "succeeded",
+        finishedAt: Date.now(),
+        authorization: null,
+      });
+      clis[id].signIn = {
+        status: "signed_in",
+        account: { email: "user@example.com", plan: null },
+        methods: ["browser", "device"],
+      };
+      this.push("provider_cli.updated", { providerCli: clis[id] });
+    },
     /** Pushes one journal event to every open event stream. */
     push(type: string, payload: unknown) {
       const frame = `id: ${crypto.randomUUID()}\nevent: ${type}\ndata: ${JSON.stringify({ cursor: "c", type, payload })}\n\n`;
@@ -317,9 +384,17 @@ export class FakeRuntime implements Runtime {
   agents = new Map<string, any[]>();
   private token = "t".repeat(43);
 
+  /** Every start reads the volume again, as the runtime entrypoint does. */
   private handle(key: string): RuntimeHandle {
     let d = this.daemons.get(key);
-    if (!d) this.daemons.set(key, (d = fakeDaemon(this.token)));
+    if (!d)
+      this.daemons.set(
+        key,
+        (d = fakeDaemon(this.token, (path) =>
+          this.volume.get(`${key}:${path}`),
+        )),
+      );
+    d.boot();
     return { key, url: d.url, token: this.token, startedAt: Date.now() };
   }
   async ensure(key: string) {

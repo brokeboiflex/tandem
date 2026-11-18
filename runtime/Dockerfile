@@ -1,7 +1,7 @@
 # Tandem runtime: one container runs one standalone Happy Agent daemon for one person.
 # Build with BuildKit (docker buildx) for linux/arm64 and/or linux/amd64. Every download is pinned
 # per architecture and verified by checksum. Do not publish images built from this file: they
-# contain Claude Code (see THIRD_PARTY.md).
+# contain Claude Code and the Grok CLI (see THIRD_PARTY.md).
 
 # Multi-arch index digest (covers linux/amd64 and linux/arm64).
 ARG BASE=debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
@@ -28,6 +28,12 @@ ARG CODEX_CODE_MODE_HOST_SHA256_AMD64=8a69207d97545ac753b6585974e1e67a4c51ae5dea
 ARG CLAUDE_CODE_VERSION=2.1.321
 ARG CLAUDE_CODE_SHA512_ARM64=137efddf76d743f9171814aba4a8eb5dd91a49b3c431b00ba77238c9c4b47d13190aa9ed907368cfa517c048894a619b3f4b0152a5823024c69959d29c430952
 ARG CLAUDE_CODE_SHA512_AMD64=956f8c8544e19d4da1afa42743dc600fc73a3960096d836988ccc843838968bc5c0724ece77bfbc15ff62331aca416dc3219f1168c75befa25b6e5b29bf87abb
+# Grok CLI, so the daemon's provider-CLI sign-in can run `grok login --device-auth`; Happy's grok
+# provider then reads its sign-in file. xAI publishes no checksum files: these are of the release
+# files as downloaded, which match the MD5 that xAI's storage reports for them.
+ARG GROK_VERSION=1.0.89
+ARG GROK_SHA256_ARM64=20496afea9dcec8ff1a3e3742a2966980888770d4ee845f80e5f0e5db56acb8b
+ARG GROK_SHA256_AMD64=404456474906572060fa36745266caf1e967e9084e656da9572b42d35febf342
 
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
  && rm -rf /var/lib/apt/lists/* && mkdir /out
@@ -37,11 +43,13 @@ RUN set -eu; \
       arm64) happy=linux-arm64; happy_sha=$HAPPY_AGENT_SHA256_ARM64; \
              codex=aarch64-unknown-linux-musl; codex_sha=$CODEX_SHA256_ARM64; \
              host_sha=$CODEX_CODE_MODE_HOST_SHA256_ARM64; \
-             claude=linux-arm64; claude_sha=$CLAUDE_CODE_SHA512_ARM64 ;; \
+             claude=linux-arm64; claude_sha=$CLAUDE_CODE_SHA512_ARM64; \
+             grok=linux-aarch64; grok_sha=$GROK_SHA256_ARM64 ;; \
       amd64) happy=linux-x64; happy_sha=$HAPPY_AGENT_SHA256_AMD64; \
              codex=x86_64-unknown-linux-musl; codex_sha=$CODEX_SHA256_AMD64; \
              host_sha=$CODEX_CODE_MODE_HOST_SHA256_AMD64; \
-             claude=linux-x64; claude_sha=$CLAUDE_CODE_SHA512_AMD64 ;; \
+             claude=linux-x64; claude_sha=$CLAUDE_CODE_SHA512_AMD64; \
+             grok=linux-x86_64; grok_sha=$GROK_SHA256_AMD64 ;; \
       *) echo "unsupported TARGETARCH '$TARGETARCH': build with docker buildx --platform linux/arm64 or linux/amd64" >&2; exit 1 ;; \
     esac; \
     curl -fsSL -o /tmp/codex.tar.gz \
@@ -59,6 +67,11 @@ RUN set -eu; \
     echo "${claude_sha}  /tmp/claude.tgz" | sha512sum -c -; \
     tar -xzf /tmp/claude.tgz -C /tmp package/claude; \
     install -m 0755 /tmp/package/claude /out/claude; \
+    curl -fsSL -o /tmp/grok.gz \
+      "https://x.ai/cli/grok-${GROK_VERSION}-${grok}.gz"; \
+    echo "${grok_sha}  /tmp/grok.gz" | sha256sum -c -; \
+    gunzip -c /tmp/grok.gz > /out/grok; \
+    chmod 0755 /out/grok; \
     curl -fsSL -o /tmp/happy-agent.tar.gz \
       "https://github.com/slopus/happy-agent/releases/download/v${HAPPY_AGENT_VERSION}/happy-agent-${HAPPY_AGENT_VERSION}-${happy}.tar.gz"; \
     echo "${happy_sha}  /tmp/happy-agent.tar.gz" | sha256sum -c -; \
@@ -77,6 +90,7 @@ COPY --from=fetch /out/ /usr/local/bin/
 RUN export HOME=/tmp/version-check DISABLE_AUTOUPDATER=1 \
  && mkdir -p "$HOME" \
  && happy-agent --version && codex --version 2>/dev/null && claude --version \
+ && grok --version \
  && rm -rf "$HOME"
 
 RUN useradd --create-home --home-dir /home/agent --uid 10001 --user-group --shell /bin/bash agent \

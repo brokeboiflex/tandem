@@ -16,6 +16,13 @@ openai.com
 chatgpt.com
 *.chatgpt.com
 
+# xAI: the Grok CLI's device sign-in and token refresh, and Happy's Grok endpoint.
+auth.x.ai
+cli-chat-proxy.grok.com
+
+# OpenRouter: chat completions with the person's own key, and the model details Happy reads.
+openrouter.ai
+
 # GitHub: Codex plugin sync and git.
 github.com
 *.github.com

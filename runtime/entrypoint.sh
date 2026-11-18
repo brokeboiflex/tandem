@@ -9,23 +9,38 @@ mkdir -p "$HOME/happy/config" "$HOME/.codex" "$HOME/projects/chats" "$HOME/.agen
 # its 341 MiB Claude Code binary there (once per volume instead of once per container).
 mkdir -p "${TMPDIR:-/tmp}"
 
-# Install the gateway-owned config. If the person chose their own Anthropic API key (written by
-# the gateway to the private file below), add it to the built-in Claude account as Happy's
-# documented `api_key`, with a display name the gateway reads back from GET /v0/config. Shell
-# builtins only, so the key never appears in any process's argv.
-key_file="$HOME/.agent-runtime/anthropic-api-key"
-api_key=""
-if [ -s "$key_file" ]; then
-  IFS= read -r api_key < "$key_file" || true
-  case $api_key in *[!A-Za-z0-9_-]*) api_key="" ;; esac
-fi
+# Install the gateway-owned config. API keys the person chose (written by the gateway to the
+# private files below) become Happy's documented `api_key` of their account, with a display name
+# the gateway reads back from GET /v0/config: an Anthropic key for the built-in Claude account, an
+# OpenRouter key for the OpenRouter account. Without an OpenRouter key that account names a
+# variable nothing sets, so it has no credential. Shell builtins only, so a key never appears in
+# any process's argv or environment.
+read_key() {
+  key=""
+  if [ -s "$1" ]; then
+    IFS= read -r key < "$1" || true
+    case $key in *[!A-Za-z0-9_-]*) key="" ;; esac
+  fi
+}
+read_key "$HOME/.agent-runtime/anthropic-api-key"
+anthropic_key=$key
+read_key "$HOME/.agent-runtime/openrouter-api-key"
+openrouter_key=$key
+key=""
 while IFS= read -r line; do
   printf '%s\n' "$line"
-  if [ "$line" = "[providers.claude]" ] && [ -n "$api_key" ]; then
-    printf 'name = "Anthropic API key"\napi_key = "%s"\n' "$api_key"
+  if [ "$line" = "[providers.claude]" ] && [ -n "$anthropic_key" ]; then
+    printf 'name = "Anthropic API key"\napi_key = "%s"\n' "$anthropic_key"
+  elif [ "$line" = "[providers.openrouter]" ]; then
+    if [ -n "$openrouter_key" ]; then
+      printf 'name = "OpenRouter API key"\napi_key = "%s"\n' "$openrouter_key"
+    else
+      printf 'name = "OpenRouter"\napi_key_env = "OPENROUTER_API_KEY"\n'
+    fi
   fi
 done < /opt/agent-runtime/happy.toml > "$HOME/happy/config/happy.toml"
-api_key=""
+anthropic_key=""
+openrouter_key=""
 # The daemon writes live overrides (Tailcat, remote connections, defaults) to a generated
 # runtime.toml that wins over happy.toml. Nothing here uses them, so the controller's policy is
 # re-applied on every start.
@@ -44,7 +59,8 @@ else
 fi
 
 # Standing instructions (PUT /v1/instructions): the gateway keeps the canonical copy and the
-# chat workspace gets it as AGENTS.md (Codex) and CLAUDE.md (Claude Code), restored on every start.
+# chat workspace gets it as AGENTS.md (Codex, and Happy's own loop for Grok and OpenRouter) and
+# CLAUDE.md (Claude Code), restored on every start.
 instructions="$HOME/.agent-runtime/instructions.md"
 if [ -f "$instructions" ]; then
   cp "$instructions" "$HOME/projects/chats/AGENTS.md"

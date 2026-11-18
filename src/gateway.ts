@@ -43,7 +43,8 @@ class Person {
   config?: any;
   memos: Partial<Record<H.ProviderId, H.CodeMemo>> = {};
   restartedOps = new Set<string>();
-  apiKeyFailure?: H.Connection;
+  /** The last API key a provider's account refused (until the next attempt): no key, only the verdict. */
+  apiKeyFailures: Partial<Record<H.ProviderId, H.Connection>> = {};
   /**
    * The last settled provider views read from the running runtime, with when: what
    * /v1/providers shows while the runtime is stopped. Views only, never credentials.
@@ -320,10 +321,8 @@ export function createGateway(
   async function isBusy(d: H.Daemon) {
     const { project } = await d.call("GET", `/v0/projects/${H.PROJECT_ID}`);
     const clis = [];
-    for (const id of H.PROVIDER_IDS)
-      clis.push(
-        (await d.call("GET", `/v0/provider-clis/${id}`)).providerCli,
-      );
+    for (const cli of H.CLI_IDS)
+      clis.push((await d.call("GET", `/v0/provider-clis/${cli}`)).providerCli);
     return H.hasWork(project, clis);
   }
 
@@ -444,10 +443,11 @@ export function createGateway(
     ).config);
   }
 
+  /** The provider's sign-in CLI; null for an account that takes only an API key. */
   async function cliOf(p: Person, id: H.ProviderId, start = true) {
-    const { providerCli } = await (
-      await daemonOf(p, start)
-    ).call("GET", `/v0/provider-clis/${id}`);
+    const d = await daemonOf(p, start);
+    if (!H.CLI_IDS.includes(id)) return null;
+    const { providerCli } = await d.call("GET", `/v0/provider-clis/${id}`);
     return sawCli(p, id, providerCli);
   }
 
@@ -467,10 +467,10 @@ export function createGateway(
     const op = cli?.operation?.kind === "sign_in" ? cli.operation : null;
     const signingIn = op && ["running", "waiting"].includes(op.status);
     const signinRequired = id in p.signinRequired;
-    if (id === "claude" && !signingIn) {
-      if (H.usesApiKey(config) && !signinRequired)
+    if (H.apiKeyOf(id) && !signingIn) {
+      if (H.usesApiKey(config, id) && !signinRequired)
         return H.apiKeyConnection("connected");
-      if (p.apiKeyFailure) return p.apiKeyFailure;
+      if (p.apiKeyFailures[id]) return p.apiKeyFailures[id];
     }
     return H.connectionView(id, cli, p.memos[id], {
       restarting: !!p.restarting && p.accountRestart,
@@ -644,13 +644,13 @@ export function createGateway(
   async function startConnect({ p, params, body }: Ctx) {
     const id = params[0] as H.ProviderId;
     if (body.method === "api_key") {
-      if (id !== "claude")
+      if (!H.apiKeyOf(id))
         throw new HttpError(
           400,
           "invalid_request",
-          "Only Claude accepts an API key.",
+          "Only Claude and OpenRouter accept an API key.",
         );
-      return json({ connection: await connectApiKey(p, body.apiKey) });
+      return json({ connection: await connectApiKey(p, id, body.apiKey) });
     }
     if (body.method !== undefined && body.method !== "subscription")
       throw new HttpError(
@@ -658,10 +658,16 @@ export function createGateway(
         "invalid_request",
         "method must be subscription or api_key",
       );
-    const d = await daemonFor(p);
     const method = H.providerMethod(id);
+    if (!method)
+      throw new HttpError(
+        400,
+        "invalid_request",
+        "This provider connects with your own API key: send method api_key.",
+      );
+    const d = await daemonFor(p);
     let cli = await cliOf(p, id);
-    p.apiKeyFailure = undefined;
+    delete p.apiKeyFailures[id];
     delete p.memos[id];
     if (
       cli.installation?.status === "installed" &&
@@ -684,46 +690,39 @@ export function createGateway(
     return json({ connection: H.unavailableConnection(id) });
   }
 
-  async function connectApiKey(p: Person, apiKey: unknown) {
+  async function connectApiKey(p: Person, id: H.ProviderId, apiKey: unknown) {
+    const spec = H.apiKeyOf(id)!;
     const key = typeof apiKey === "string" ? apiKey.trim() : "";
     if (!/^[A-Za-z0-9_-]{20,512}$/.test(key))
       throw new HttpError(
         400,
         "invalid_api_key_format",
-        "Paste the whole key. It starts with sk-ant-.",
+        `Paste the whole key. ${spec.hint}`,
       );
     const d = await daemonFor(p);
     // Choosing a key replaces any subscription sign-in still waiting for this person.
-    await d.call("POST", "/v0/provider-clis/claude/cancel", {});
+    if (H.CLI_IDS.includes(id))
+      await d.call("POST", `/v0/provider-clis/${id}/cancel`, {});
     // The key goes straight into the person's own volume (archive API: no argv, env or logs) and
-    // becomes Happy's documented `api_key` for the Claude account on the next daemon start.
-    await runtime.writePrivateFile(
-      p.key,
-      H.API_KEY_DIR,
-      H.API_KEY_FILE,
-      `${key}\n`,
-    );
+    // becomes Happy's documented `api_key` for the provider's account on the next daemon start.
+    await runtime.writePrivateFile(p.key, H.RUNTIME_DIR, spec.file, `${key}\n`);
     await restartRuntime(p, 2 * 60_000);
     const verdict = await (
       await daemonFor(p)
     )
-      .call("POST", "/v0/providers/claude/verify", { level: "authentication" })
+      .call("POST", `/v0/providers/${id}/verify`, { level: "authentication" })
       .catch(() => null);
     if (verdict?.status === "passed") {
-      p.apiKeyFailure = undefined;
-      delete p.signinRequired.claude;
-      void publish(p, "claude");
+      delete p.apiKeyFailures[id];
+      delete p.signinRequired[id];
+      void publish(p, id);
       return H.apiKeyConnection("connected");
     }
-    await runtime.exec(p.key, [
-      "rm",
-      "-f",
-      `${H.API_KEY_DIR}/${H.API_KEY_FILE}`,
-    ]);
+    await runtime.exec(p.key, ["rm", "-f", `${H.RUNTIME_DIR}/${spec.file}`]);
     await restartRuntime(p, 2 * 60_000);
-    return (p.apiKeyFailure = H.apiKeyConnection("failed", {
+    return (p.apiKeyFailures[id] = H.apiKeyConnection("failed", {
       code: "invalid_api_key",
-      message: H.COPY.invalid_api_key,
+      message: H.invalidApiKey(spec),
     }));
   }
 
@@ -746,7 +745,7 @@ export function createGateway(
       );
     const d = await daemonFor(p);
     let cli = await cliOf(p, id);
-    const op = cli.operation;
+    const op = cli?.operation;
     if (!(
       op?.kind === "sign_in" &&
       op.status === "waiting" &&
@@ -787,8 +786,8 @@ export function createGateway(
         break;
       }
       if (rejected === "restart") {
-        if (cur.status !== "failed") continue; // Claude is still winding this attempt down
-        // Claude ended this attempt. Start a fresh one so the person can simply try again.
+        if (cur.status !== "failed") continue; // the CLI is still winding this attempt down
+        // The CLI ended this attempt. Start a fresh one so the person can simply try again.
         await d.call("POST", `/v0/provider-clis/${id}/sign-in`, {
           method: H.providerMethod(id),
         });
@@ -806,12 +805,18 @@ export function createGateway(
     return json({ connection: connectionFor(p, id, cli, await configOf(p)) });
   }
 
+  /** Cancels a sign-in in progress; an account that takes only an API key has none. */
   async function cancelConnect({ p, params }: Ctx) {
     const id = params[0] as H.ProviderId;
-    const { providerCli } = await (
-      await daemonFor(p)
-    ).call("POST", `/v0/provider-clis/${id}/cancel`, {});
-    sawCli(p, id, providerCli);
+    const d = await daemonFor(p);
+    const providerCli = H.CLI_IDS.includes(id)
+      ? sawCli(
+          p,
+          id,
+          (await d.call("POST", `/v0/provider-clis/${id}/cancel`, {}))
+            .providerCli,
+        )
+      : null;
     delete p.memos[id];
     return json({
       connection: connectionFor(p, id, providerCli, await configOf(p)),
@@ -821,17 +826,16 @@ export function createGateway(
   async function disconnect({ p, params }: Ctx) {
     const id = params[0] as H.ProviderId;
     const d = await daemonFor(p);
-    await d.call("POST", `/v0/provider-clis/${id}/cancel`, {}).catch(() => {});
-    // Happy has no sign-out route: use the vendor CLI's own logout, then make sure no credential
-    // file is left on the volume.
-    const script =
-      id === "claude"
-        ? `claude auth logout >/dev/null 2>&1; rm -f "$HOME/.claude/.credentials.json" "${H.API_KEY_DIR}/${H.API_KEY_FILE}"`
-        : `codex logout >/dev/null 2>&1; rm -f "$HOME/.codex/auth.json"`;
-    await runtime.exec(p.key, ["sh", "-c", script]);
+    if (H.CLI_IDS.includes(id))
+      await d
+        .call("POST", `/v0/provider-clis/${id}/cancel`, {})
+        .catch(() => {});
+    // Happy has no sign-out route: use the vendor CLI's own logout where it has one, then make
+    // sure no credential file is left on the volume.
+    await runtime.exec(p.key, H.SIGN_OUT[id]);
     delete p.memos[id];
     delete p.signinRequired[id];
-    p.apiKeyFailure = undefined;
+    delete p.apiKeyFailures[id];
     await restartRuntime(p, 2 * 60_000); // warm harness processes must drop the old sign-in
     return json({ provider: (await state(p, id)).provider });
   }
@@ -1347,7 +1351,10 @@ export function createGateway(
     });
   }
 
-  /** Standing instructions for every conversation: AGENTS.md (Codex) and CLAUDE.md (Claude Code). */
+  /**
+   * Standing instructions for every conversation: AGENTS.md (Codex, and Happy's own loop for Grok
+   * and OpenRouter) and CLAUDE.md (Claude Code).
+   */
   async function putInstructions({ p, body }: Ctx) {
     const { text } = body;
     if (typeof text !== "string" || text.length > H.MAX_INSTRUCTIONS)
@@ -1376,11 +1383,11 @@ export function createGateway(
 
   const routes: [string, RegExp, (c: Ctx) => Response | Promise<Response>][] = [
     ["GET", /^\/v1\/providers$/, listProviders],
-    ["POST", /^\/v1\/providers\/(claude|codex)\/connect$/, startConnect],
-    ["GET", /^\/v1\/providers\/(claude|codex)\/connect$/, getConnect],
-    ["POST", /^\/v1\/providers\/(claude|codex)\/connect\/code$/, submitCode],
-    ["DELETE", /^\/v1\/providers\/(claude|codex)\/connect$/, cancelConnect],
-    ["DELETE", /^\/v1\/providers\/(claude|codex)$/, disconnect],
+    ["POST", /^\/v1\/providers\/(claude|codex|grok|openrouter)\/connect$/, startConnect],
+    ["GET", /^\/v1\/providers\/(claude|codex|grok|openrouter)\/connect$/, getConnect],
+    ["POST", /^\/v1\/providers\/(claude|codex|grok|openrouter)\/connect\/code$/, submitCode],
+    ["DELETE", /^\/v1\/providers\/(claude|codex|grok|openrouter)\/connect$/, cancelConnect],
+    ["DELETE", /^\/v1\/providers\/(claude|codex|grok|openrouter)$/, disconnect],
     ["GET", /^\/v1\/events$/, events],
     ["POST", /^\/v1\/conversations$/, createConversation],
     ["GET", /^\/v1\/conversations$/, listConversations],

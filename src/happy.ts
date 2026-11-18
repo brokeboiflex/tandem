@@ -2,24 +2,102 @@
 // from Happy objects to the gateway's /v1 façade. Pinned to Happy Agent 2026.11.6-preview.7.
 import type { RuntimeHandle } from "./runtime";
 
-export type ProviderId = "claude" | "codex";
-export const PROVIDER_IDS: ProviderId[] = ["claude", "codex"];
+export type ProviderId = "claude" | "codex" | "grok" | "openrouter";
+export const PROVIDER_IDS: ProviderId[] = ["claude", "codex", "grok", "openrouter"];
 export const PROJECT_ID = "chats";
 export const PROJECT_PATH = "/home/agent/projects/chats";
 /** The gateway's private folder in the person's volume (not the agents' workspace). */
 export const RUNTIME_DIR = "/home/agent/.agent-runtime";
-export const API_KEY_DIR = RUNTIME_DIR;
-export const API_KEY_FILE = "anthropic-api-key";
 export const INSTRUCTIONS_FILE = "instructions.md";
 export const MAX_INSTRUCTIONS = 64_000;
 export const TITLES_FILE = "titles.json";
-/** Display name the runtime entrypoint gives the Claude account when an API key is configured. */
-export const API_KEY_ACCOUNT_NAME = "Anthropic API key";
 
-const PROVIDERS = {
-  claude: { method: "browser", flow: "paste_code", vendor: "Claude" },
-  codex: { method: "device", flow: "device_code", vendor: "ChatGPT" },
-} as const;
+/** The person's own API key for an account: its file in RUNTIME_DIR, read by the runtime entrypoint. */
+type ApiKey = {
+  file: string;
+  /** Display name the runtime entrypoint gives the account when the key is configured. */
+  account: string;
+  /** Who refuses a bad key. */
+  issuer: string;
+  hint: string;
+};
+
+/**
+ * Each façade provider, which is also its account in Happy and the provider CLI that signs it in:
+ * its sign-in method and flow (no method: it takes only the person's own API key), the vendor named
+ * in messages, and the person's own API key when it takes one.
+ */
+const PROVIDERS: Record<
+  ProviderId,
+  {
+    method: "browser" | "device" | null;
+    flow: Connection["flow"];
+    vendor: string;
+    apiKey?: ApiKey;
+  }
+> = {
+  claude: {
+    method: "browser",
+    flow: "paste_code",
+    vendor: "Claude",
+    apiKey: {
+      file: "anthropic-api-key",
+      account: "Anthropic API key",
+      issuer: "Anthropic",
+      hint: "It starts with sk-ant-.",
+    },
+  },
+  codex: {
+    method: "device",
+    flow: "device_code",
+    vendor: "ChatGPT",
+  },
+  grok: {
+    method: "device",
+    flow: "device_code",
+    vendor: "Grok",
+  },
+  openrouter: {
+    method: null,
+    flow: "api_key",
+    vendor: "OpenRouter",
+    apiKey: {
+      file: "openrouter-api-key",
+      account: "OpenRouter API key",
+      issuer: "OpenRouter",
+      hint: "It starts with sk-or-.",
+    },
+  },
+};
+
+/** The providers whose vendor CLI signs them in (GET /v0/provider-clis/:id). */
+export const CLI_IDS = PROVIDER_IDS.filter((id) => PROVIDERS[id].method);
+export const apiKeyOf = (id: ProviderId) => PROVIDERS[id].apiKey;
+
+/**
+ * How disconnecting signs a person out (run inside the runtime; deploy/sockguard.yaml allowlists
+ * each exactly): the vendor CLI's own sign-out where it has one, then no credential file is left
+ * on the volume. Grok can leave a copy of its sign-in file beside it (`auth.json.corrupt.*`); an
+ * OpenRouter key is only the gateway's file.
+ */
+export const SIGN_OUT: Record<ProviderId, string[]> = {
+  claude: [
+    "sh",
+    "-c",
+    `claude auth logout >/dev/null 2>&1; rm -f "$HOME/.claude/.credentials.json" "${RUNTIME_DIR}/anthropic-api-key"`,
+  ],
+  codex: [
+    "sh",
+    "-c",
+    `codex logout >/dev/null 2>&1; rm -f "$HOME/.codex/auth.json"`,
+  ],
+  grok: [
+    "sh",
+    "-c",
+    `grok logout >/dev/null 2>&1; rm -f "$HOME/.grok/"auth.json*`,
+  ],
+  openrouter: ["rm", "-f", `${RUNTIME_DIR}/openrouter-api-key`],
+};
 
 // ---------------------------------------------------------------------------------------------
 // Route allowlist. The daemon token is full owner authority (shutdown, drain, debug, config, bots,
@@ -30,12 +108,12 @@ export const QUESTION_ID = "[a-z0-9]{2,96}";
 const ALLOWED: [string, RegExp][] = [
   ["GET", /^\/v0\/health$/],
   ["GET", /^\/v0\/config$/],
-  ["GET", /^\/v0\/provider-clis\/(claude|codex)$/],
+  ["GET", /^\/v0\/provider-clis\/(claude|codex|grok)$/],
   [
     "POST",
-    /^\/v0\/provider-clis\/(claude|codex)\/(sign-in|sign-in\/code|cancel)$/,
+    /^\/v0\/provider-clis\/(claude|codex|grok)\/(sign-in|sign-in\/code|cancel)$/,
   ],
-  ["POST", /^\/v0\/providers\/claude\/verify$/],
+  ["POST", /^\/v0\/providers\/(claude|openrouter)\/verify$/],
   ["GET", /^\/v0\/bots$/],
   ["POST", new RegExp(`^/v0/bots/${ID}/archive$`)],
   ["POST", /^\/v0\/projects$/],
@@ -162,7 +240,7 @@ export type CodeMemo = {
 
 export const COPY = {
   wrong_code:
-    "That code didn't work. Copy the whole code from the Claude page and paste it again.",
+    "That code didn't work. Copy the whole code from the sign-in page and paste it again.",
   wrong_code_reissued:
     "That code wasn't accepted. Open the sign-in page again to get a new code, then paste it here.",
   expired: "The sign-in timed out. Start again when you're ready.",
@@ -170,9 +248,10 @@ export const COPY = {
   interrupted: "The sign-in was interrupted. Please start again.",
   unavailable:
     "Sign-in isn't available right now. Please try again in a moment.",
-  invalid_api_key:
-    "Anthropic didn't accept that API key, or couldn't be reached. Check the key and try again.",
 };
+
+export const invalidApiKey = (key: ApiKey) =>
+  `${key.issuer} didn't accept that API key, or couldn't be reached. Check the key and try again.`;
 
 /** Model names by Happy model ID, read from the vendor's own agent (claudeModelNames). */
 export type ModelNames = Record<string, string>;
@@ -235,8 +314,10 @@ export function liveModels(config: any, provider: ProviderId, names: ModelNames 
     }));
 }
 
-export function usesApiKey(config: any) {
-  return config?.providers?.claude?.name === API_KEY_ACCOUNT_NAME;
+/** Whether the runtime configured the person's own API key for this provider's account. */
+export function usesApiKey(config: any, id: ProviderId) {
+  const key = PROVIDERS[id].apiKey;
+  return !!key && config?.providers?.[id]?.name === key.account;
 }
 
 /**
@@ -250,7 +331,7 @@ export function providerView(
   opts: { restarting?: boolean; signinRequired?: boolean; names?: ModelNames } = {},
 ) {
   const op = cli?.operation?.kind === "sign_in" ? cli.operation : null;
-  const apiKey = id === "claude" && usesApiKey(config);
+  const apiKey = usesApiKey(config, id);
   const signedIn = cli?.signIn?.status === "signed_in";
   let status: "connected" | "not_connected" | "connecting" = "not_connected";
   if (opts.restarting || (op && ["running", "waiting"].includes(op.status)))
@@ -427,7 +508,7 @@ const MODEL =
  */
 export function classifyFailure(failure: any, providerId?: string): Failure {
   const text = `${failure?.message ?? ""} ${failure?.detail ?? ""}`;
-  const vendor = providerId === "codex" ? "ChatGPT" : "Claude";
+  const vendor = PROVIDERS[providerId as ProviderId]?.vendor ?? "Claude";
   if (failure?.kind === "signin_missing" || SIGNIN.test(text))
     return {
       code: "signin_required",

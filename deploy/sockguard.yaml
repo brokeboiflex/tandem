@@ -49,12 +49,15 @@ request_body:
   exec:
     allow_privileged: false
     allow_root_user: false
-    # The gateway's only commands inside a runtime (src/runtime.ts and src/gateway.ts).
+    # The gateway's only commands inside a runtime (src/runtime.ts, src/gateway.ts and the sign-outs
+    # in src/happy.ts).
     allowed_commands:
       - ["cat", "/home/agent/.happy/agent/token"]
       - ["rm", "-f", "/home/agent/.agent-runtime/anthropic-api-key"]
       - ["sh", "-c", 'claude auth logout >/dev/null 2>&1; rm -f "$HOME/.claude/.credentials.json" "/home/agent/.agent-runtime/anthropic-api-key"']
       - ["sh", "-c", 'codex logout >/dev/null 2>&1; rm -f "$HOME/.codex/auth.json"']
+      - ["sh", "-c", 'grok logout >/dev/null 2>&1; rm -f "$HOME/.grok/"auth.json*']
+      - ["rm", "-f", "/home/agent/.agent-runtime/openrouter-api-key"]
       # MCP registrations, conversation titles and standing instructions (src/gateway.ts).
       - ["cat", "/home/agent/.agent-runtime/mcp-servers.json"]
       - ["cat", "/home/agent/.agent-runtime/titles.json"]
@@ -66,7 +69,7 @@ request_body:
       - ["sh", "-c", 'echo "$HAPPY_BRIDGE_ALLOW" "$MCP_PROXY_URL" "$HTTPS_PROXY"']
       # Claude Code's model names (src/runtime.ts CLAUDE_MODELS_COMMAND): an initialize request, no turn.
       - ["sh", "-c", 'cd /tmp && echo ''{"type":"control_request","request_id":"models","request":{"subtype":"initialize"}}'' | timeout 20 claude -p --input-format stream-json --output-format stream-json --verbose 2>/dev/null | grep -m 1 ''"control_response"''']
-      - ["sh", "-c", 't=$(cat /home/agent/.happy/agent/token) && for p in projects/chats provider-clis/claude provider-clis/codex; do echo "authorization: Bearer $t" | curl -sf -m 10 -H @- --unix-socket /home/agent/.happy/agent/server.sock "http://runtime/v0/$p" && echo || exit 1; done']
+      - ["sh", "-c", 't=$(cat /home/agent/.happy/agent/token) && for p in projects/chats provider-clis/claude provider-clis/codex provider-clis/grok; do echo "authorization: Bearer $t" | curl -sf -m 10 -H @- --unix-socket /home/agent/.happy/agent/server.sock "http://runtime/v0/$p" && echo || exit 1; done']
   container_archive:
     # The gateway's private folder, and AGENTS.md/CLAUDE.md in the chat workspace (instructions).
     allowed_paths: ["/home/agent/.agent-runtime", "/home/agent/projects/chats"]

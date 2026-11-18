@@ -2,10 +2,15 @@
 // Happy Agent 2026.11.6-preview.7 daemon (tests/fixtures).
 import { describe, expect, test } from "bun:test";
 import * as H from "../src/happy";
+import { ACTIVITY_COMMAND } from "../src/runtime";
+import { socketProxyPolicy } from "./fake-daemon";
 
 const fixture = (name: string) =>
   Bun.file(`${import.meta.dir}/fixtures/${name}`).json();
 const config = (await fixture("config-signed-out.json")).config;
+// The pinned daemon with this repository's runtime/happy.toml, signed out: GET /v0/config captured
+// in a throwaway runtime, OpenRouter's model details read from its /models.
+const providers = (await fixture("config-providers.json")).config;
 
 /** The same daemon after a Codex Free sign-in: its live catalog offers only GPT-6-Luna. */
 const codexFreeConfig = {
@@ -144,7 +149,7 @@ describe("live model catalog", () => {
       ...config,
       providers: {
         ...config.providers,
-        claude: { ...config.providers.claude, name: H.API_KEY_ACCOUNT_NAME },
+        claude: { ...config.providers.claude, name: "Anthropic API key" },
       },
     };
     const view = H.providerView("claude", cli("claude"), apiKeyConfig);
@@ -691,7 +696,11 @@ describe("daemon route allowlist", () => {
       ["POST", "/v0/mobile-connector/pairing"],
       ["POST", "/v0/provider-routes/claude/use"],
       ["POST", "/v0/provider-clis/claude/install"],
-      ["POST", "/v0/provider-clis/grok/sign-in"],
+      ["POST", "/v0/provider-clis/grok/install"],
+      ["GET", "/v0/provider-clis/antigravity"],
+      ["POST", "/v0/provider-clis/antigravity/sign-in"],
+      ["POST", "/v0/providers/grok/verify"],
+      ["POST", "/v0/providers/codex/verify"],
       ["POST", "/v0/secrets"],
       ["GET", "/v0/workspaces/chats/terminals"],
       ["GET", "/v0/projects"],
@@ -714,6 +723,16 @@ describe("daemon route allowlist", () => {
     expect(H.isAllowed("POST", "/v0/provider-clis/claude/sign-in/code")).toBe(
       true,
     );
+    // Exactly what the new providers need: Grok's sign-in CLI and OpenRouter's key check.
+    for (const [method, path] of [
+      ["GET", "/v0/provider-clis/grok"],
+      ["POST", "/v0/provider-clis/grok/sign-in"],
+      ["POST", "/v0/provider-clis/grok/cancel"],
+      ["POST", "/v0/providers/openrouter/verify"],
+    ])
+      expect(`${method} ${path} ${H.isAllowed(method!, path!)}`).toBe(
+        `${method} ${path} true`,
+      );
   });
 
   test("a disallowed call never leaves the gateway", async () => {
@@ -764,5 +783,167 @@ describe("work a restart would cut off", () => {
     expect(H.hasWork({ agents: [] }, [op("running")], false)).toBe(true);
     expect(H.hasWork({ agents: [] }, [op("waiting")], false)).toBe(false);
     expect(H.hasWork(undefined, [], false)).toBe(false);
+  });
+});
+
+describe("Grok and OpenRouter", () => {
+  const grokSignedIn = cli("grok", {
+    signIn: {
+      status: "signed_in",
+      account: { email: "user@example.com", plan: null },
+      methods: ["browser", "device"],
+    },
+  });
+  const withName = (id: string, name: string) => ({
+    ...providers,
+    providers: {
+      ...providers.providers,
+      [id]: { ...providers.providers[id], name },
+    },
+  });
+
+  test("Grok signs in through its CLI; OpenRouter takes only an API key", () => {
+    expect(H.PROVIDER_IDS).toEqual(["claude", "codex", "grok", "openrouter"]);
+    expect(H.CLI_IDS).toEqual(["claude", "codex", "grok"]);
+    expect(H.apiKeyOf("openrouter")).toMatchObject({
+      file: "openrouter-api-key",
+      account: "OpenRouter API key",
+    });
+    expect(H.apiKeyOf("grok")).toBeUndefined();
+  });
+
+  test("a signed-in Grok CLI is a connected Grok account with xAI's models", () => {
+    expect(H.providerView("grok", cli("grok"), providers)).toMatchObject({
+      status: "not_connected",
+      models: [],
+    });
+    const view = H.providerView("grok", grokSignedIn, providers);
+    expect(view).toMatchObject({
+      id: "grok",
+      status: "connected",
+      method: "subscription",
+      account: { email: "user@example.com", plan: null },
+    });
+    expect(view.models.map((m) => m.id)).toEqual([
+      "xai/grok-4.7",
+      "xai/grok-4.6",
+      "xai/grok-build",
+      "xai/grok-4.5",
+      "xai/grok-composer-2.5-fast",
+    ]);
+    expect(view.models[0]).toEqual({
+      id: "xai/grok-4.7",
+      name: "Grok 4.7",
+      default: false,
+      efforts: ["low", "medium", "high", "xhigh"],
+      defaultEffort: "high",
+    });
+  });
+
+  test("Grok signs in with a device code", () => {
+    const now = Date.parse("2026-11-16T13:25:00Z");
+    const waiting = cli("grok", {
+      operation: {
+        id: "op3",
+        kind: "sign_in",
+        status: "waiting",
+        output: [],
+        authorization: {
+          method: "device",
+          url: "https://accounts.x.ai/oauth2/device?user_code=WXYZ-2345",
+          userCode: "WXYZ-2345",
+          openedByProgram: false,
+          acceptsCode: false,
+          expiresAt: now + 600_000,
+        },
+      },
+    });
+    expect(H.providerMethod("grok")).toBe("device");
+    expect(H.connectionView("grok", waiting, undefined, { now })).toEqual({
+      status: "waiting",
+      flow: "device_code",
+      url: "https://accounts.x.ai/oauth2/device?user_code=WXYZ-2345",
+      userCode: "WXYZ-2345",
+      expiresAt: "2026-11-16T13:35:00.000Z",
+      error: null,
+      account: null,
+    });
+  });
+
+  test("OpenRouter is connected exactly when the runtime configured the person's key", () => {
+    expect(H.providerMethod("openrouter")).toBeNull();
+    expect(H.usesApiKey(providers, "openrouter")).toBe(false);
+    expect(H.providerView("openrouter", null, providers)).toEqual({
+      id: "openrouter",
+      status: "not_connected",
+      method: null,
+      account: null,
+      models: [],
+    });
+    expect(H.connectionView("openrouter", null, undefined)).toBeNull();
+    const keyed = withName("openrouter", "OpenRouter API key");
+    expect(H.usesApiKey(keyed, "openrouter")).toBe(true);
+    // The same name on another account means nothing.
+    expect(H.usesApiKey(withName("grok", "OpenRouter API key"), "grok")).toBe(false);
+    const view = H.providerView("openrouter", null, keyed);
+    expect(view).toMatchObject({
+      status: "connected",
+      method: "api_key",
+      account: { email: null, plan: "API key" },
+    });
+    // The models runtime/happy.toml lists, named and sized from OpenRouter's /models.
+    expect(view.models).toHaveLength(8);
+    expect(view.models[0]).toEqual({
+      id: "anthropic/claude-sonnet-5.5",
+      name: "Anthropic: Claude Sonnet 5.5",
+      default: false,
+      efforts: ["low", "medium", "high", "xhigh", "max"],
+      defaultEffort: "high",
+    });
+    expect(
+      H.providerView("openrouter", null, keyed, { signinRequired: true }).status,
+    ).toBe("not_connected");
+    expect(
+      H.invalidApiKey(H.apiKeyOf("openrouter")!),
+    ).toContain("OpenRouter didn't accept that API key");
+  });
+
+  test("a key OpenRouter refused (a real turn on the pinned daemon) is signin_required for OpenRouter", async () => {
+    const page = await fixture("messages-invalid-api-key-openrouter.json");
+    const run = page.runs.at(-1);
+    const message = run.messages.find((m: any) => m.failure);
+    expect(message.failure.kind).toBe("signin_missing");
+    expect(H.normalizeMessage(message, run.id)!.failure).toEqual({
+      code: "signin_required",
+      message:
+        "Your OpenRouter account isn't connected or its sign-in expired. Connect it again, then retry.",
+    });
+    expect(
+      H.signinFailure({ type: "message.created", payload: { message } }),
+    ).toEqual({ provider: "openrouter", at: message.createdAt });
+    // A failure on an account the façade does not offer names no provider.
+    const other = {
+      ...message,
+      error: { ...message.error, mode: { providerId: "bedrock" } },
+      failure: { ...message.failure, provider: { id: "bedrock" } },
+    };
+    expect(
+      H.signinFailure({ type: "message.created", payload: { message: other } }),
+    ).toBeNull();
+  });
+
+  test("every sign-out and the activity check are allowlisted for the socket proxy", async () => {
+    const policy = await socketProxyPolicy();
+    for (const id of H.PROVIDER_IDS)
+      expect(policy.commands.has(JSON.stringify(H.SIGN_OUT[id]))).toBe(true);
+    expect(policy.commands.has(JSON.stringify(ACTIVITY_COMMAND))).toBe(true);
+    // It reads every provider CLI the gateway signs in with.
+    for (const id of H.CLI_IDS)
+      expect(ACTIVITY_COMMAND[2]).toMatch(new RegExp(`provider-clis/${id}[ ;]`));
+    expect(H.SIGN_OUT.openrouter).toEqual([
+      "rm",
+      "-f",
+      `${H.RUNTIME_DIR}/openrouter-api-key`,
+    ]);
   });
 });
