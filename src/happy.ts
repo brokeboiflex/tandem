@@ -134,7 +134,10 @@ export function hasWork(project: any, clis: any[], waiting = true) {
 
 export type Model = {
   id: string;
-  name: string;
+  /** Null only for the vendor's default before its model is known. */
+  name: string | null;
+  /** The vendor's default (`claude-code/default`): clients label it in their own language. */
+  default: boolean;
   efforts: string[];
   defaultEffort: string;
 };
@@ -176,7 +179,7 @@ export type ModelNames = Record<string, string>;
 
 /**
  * Claude Code's names for the models a Happy catalog lists by alias: `claude-code/opus` is
- * "Opus 5.5", and `claude-code/default` names the model it currently resolves to. `stdout` is
+ * "Opus 5.5", and `claude-code/default` is the model it currently resolves to ("Sonnet 5.5"). `stdout` is
  * Claude Code's answer to a stream-json `initialize` request (CLAUDE_MODELS_COMMAND).
  */
 export function claudeModelNames(stdout: string): ModelNames {
@@ -198,10 +201,7 @@ export function claudeModelNames(stdout: string): ModelNames {
     named.find((m) => m.value !== "default" && m.resolvedModel === resolved)?.displayName;
   const names: ModelNames = {};
   for (const m of named) {
-    const name =
-      m.value === "default"
-        ? nameOf(m.resolvedModel) && `Default · ${nameOf(m.resolvedModel)}`
-        : m.displayName;
+    const name = m.value === "default" ? nameOf(m.resolvedModel) : m.displayName;
     if (!name) continue;
     names[`claude-code/${m.value}`] ??= name;
     names[`claude-code/${m.resolvedModel}`] ??= name;
@@ -211,10 +211,13 @@ export function claudeModelNames(stdout: string): ModelNames {
   return names;
 }
 
+const isDefault = (id: string) => id.endsWith("/default");
+
 /**
  * Models the signed-in account really offers: the daemon's live catalog (`config.models`). Names
  * come from `names` when the vendor reported them, otherwise Happy's own without its harness
- * prefix ("Codex · GPT-6-Luna" is "GPT-6-Luna"): clients show models under their provider.
+ * prefix ("Codex · GPT-6-Luna" is "GPT-6-Luna"): clients show models under their provider. The
+ * default's name is the model it resolves to; Happy's ("Default (recommended)") is copy, not one.
  */
 export function liveModels(config: any, provider: ProviderId, names: ModelNames = {}): Model[] {
   const catalog = config?.models ?? {};
@@ -223,7 +226,10 @@ export function liveModels(config: any, provider: ProviderId, names: ModelNames 
     .filter((r) => r.enabled && !r.hidden && catalog[r.id])
     .map((r) => ({
       id: r.id,
-      name: names[r.id] ?? String(catalog[r.id].name).replace(/^[^·]*· /, ""),
+      name:
+        names[r.id] ??
+        (isDefault(r.id) ? null : String(catalog[r.id].name).replace(/^[^·]*· /, "")),
+      default: isDefault(r.id),
       efforts: catalog[r.id].efforts,
       defaultEffort: catalog[r.id].defaultEffort,
     }));

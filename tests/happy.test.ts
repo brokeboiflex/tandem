@@ -58,6 +58,7 @@ describe("live model catalog", () => {
     expect(H.liveModels(codexFreeConfig, "codex")[0]).toEqual({
       id: "codex-cli/gpt-6-luna",
       name: "GPT-6-Luna",
+      default: false,
       efforts: ["low", "medium", "high", "xhigh", "max"],
       defaultEffort: "medium",
     });
@@ -69,7 +70,7 @@ describe("live model catalog", () => {
         new URL("./fixtures/claude-initialize.json", import.meta.url),
       ).text(),
     );
-    expect(names["claude-code/default"]).toBe("Default · Sonnet 5.5");
+    expect(names["claude-code/default"]).toBe("Sonnet 5.5");
     expect(names["claude-code/opus"]).toBe("Opus 5.5");
     expect(names["claude-code/claude-fable-5-2[1m]"]).toBe("Fable 5.2");
     expect(names["claude-code/haiku"]).toBe("Haiku 5.5");
@@ -78,10 +79,15 @@ describe("live model catalog", () => {
     expect(
       H.liveModels(config, "claude", names).map((m) => m.name),
     ).toContain("Opus 5.5");
-    // Without names, Happy's own without the harness prefix.
-    expect(H.liveModels(config, "claude").map((m) => m.name)).toContain(
-      "Opus",
-    );
+    expect(H.liveModels(config, "claude", names)[0]).toMatchObject({
+      id: "claude-code/default",
+      name: "Sonnet 5.5",
+      default: true,
+    });
+    // Without names, Happy's own without the harness prefix; the default has none yet.
+    const happyNames = H.liveModels(config, "claude").map((m) => m.name);
+    expect(happyNames).toContain("Opus");
+    expect(happyNames[0]).toBeNull();
   });
 
   test("a signed-out provider offers no models; a connected one offers its live models", () => {
