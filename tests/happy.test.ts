@@ -589,6 +589,89 @@ describe("event mapping", () => {
   });
 });
 
+describe("context and usage", () => {
+  const measured = {
+    approximate: false,
+    contextTokens: 34410,
+    contextWindow: 1000000,
+    providerId: "claude",
+    modelId: "claude-code/default",
+  };
+
+  test("the context counts toward the model's compaction point, which may sit below its window", () => {
+    const config = {
+      models: {
+        "claude-code/default": { contextWindow: 1000000, autoCompactWindow: 800000 },
+      },
+    };
+    expect(H.contextView(measured, config)).toEqual({
+      usedTokens: 34410,
+      limitTokens: 800000,
+      approximate: false,
+    });
+    // Without the definition (older daemon, config not read yet) the measured window applies.
+    expect(H.contextView(measured, undefined)?.limitTokens).toBe(1000000);
+  });
+
+  test("no measurement or no known limit is no context", () => {
+    expect(H.contextView(null, undefined)).toBeNull();
+    expect(
+      H.contextView({ ...measured, contextWindow: null, modelId: "custom/x" }, { models: {} }),
+    ).toBeNull();
+  });
+
+  test("usage is the measured model's totals, never a sum across models", () => {
+    const report = {
+      context: measured,
+      usage: {
+        claude: {
+          "claude-code/default": { input: 33406, output: 1004, cacheRead: 74631, cacheWrite: 20237 },
+          "claude-code/haiku": { input: 5, output: 5, cacheRead: 5, cacheWrite: 5 },
+        },
+      },
+    };
+    expect(H.usageView(report)).toEqual({
+      input: 33406,
+      output: 1004,
+      cacheRead: 74631,
+      cacheWrite: 20237,
+    });
+    expect(H.usageView({ context: null, usage: report.usage })).toBeNull();
+  });
+
+  test("a context measurement reaches the conversation's stream; compaction clears it", () => {
+    const c: H.EventContext = {
+      conversations: new Set(["m1"]),
+      blockTypes: new Map(),
+      runFailures: new Map(),
+      questions: new Map(),
+    };
+    const config = { models: { "claude-code/default": { autoCompactWindow: 1000000 } } };
+    expect(
+      H.mapEvent(
+        { type: "agent.context.updated", payload: { agentId: "m1", context: measured } },
+        c,
+        config,
+      ),
+    ).toEqual([
+      {
+        type: "conversation.context",
+        data: {
+          conversationId: "m1",
+          context: { usedTokens: 34410, limitTokens: 1000000, approximate: false },
+        },
+      },
+    ]);
+    expect(
+      H.mapEvent({ type: "agent.context.updated", payload: { agentId: "m1", context: null } }, c),
+    ).toEqual([{ type: "conversation.context", data: { conversationId: "m1", context: null } }]);
+    // Another person's or a non-chat agent's measurement stays out.
+    expect(
+      H.mapEvent({ type: "agent.context.updated", payload: { agentId: "m2", context: measured } }, c),
+    ).toEqual([]);
+  });
+});
+
 describe("daemon route allowlist", () => {
   test("owner-only and unrelated daemon routes are unreachable", () => {
     const denied: [string, string][] = [
@@ -627,6 +710,7 @@ describe("daemon route allowlist", () => {
         "/v0/agents/abc123/messages?limit=50&omitToolData=true",
       ),
     ).toBe(true);
+    expect(H.isAllowed("GET", "/v0/agents/abc123/usage")).toBe(true);
     expect(H.isAllowed("POST", "/v0/provider-clis/claude/sign-in/code")).toBe(
       true,
     );

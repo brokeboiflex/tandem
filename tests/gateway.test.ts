@@ -416,6 +416,18 @@ describe("conversations and isolation between people", () => {
       ["user", "Reply with one word"],
       ["assistant", "pong"],
     ]);
+    // Haiku's context fills toward its 200k compaction point; usage is that model's totals.
+    expect(page.body.context).toEqual({
+      usedTokens: 1200,
+      limitTokens: 200000,
+      approximate: false,
+    });
+    expect(page.body.usage).toEqual({
+      input: 1100,
+      output: 100,
+      cacheRead: 900,
+      cacheWrite: 50,
+    });
     expect(
       (await call(alice, "GET", "/v1/conversations")).body.conversations.map(
         (c: any) => c.id,

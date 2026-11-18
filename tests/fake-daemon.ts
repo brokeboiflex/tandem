@@ -185,6 +185,8 @@ export function fakeDaemon(token: string) {
           });
         if (sub === "mode") return json({ mode: agent.mode ?? null });
         if (sub === "question") return json({ question: null });
+        if (sub === "usage")
+          return json({ context: agent.context ?? null, usage: agent.usage ?? {} });
         if (sub === "messages")
           return json({ runs: agent.runs ?? [], hasMore: false, cursor: "c" });
         if (sub === "abort") return json({ agent }, 202);
@@ -194,6 +196,20 @@ export function fakeDaemon(token: string) {
         }
         if (sub === "send") {
           agent.mode = data.mode;
+          // The turn's measurement, as Happy records it after an inference.
+          const { providerId, modelId } = data.mode;
+          agent.context = {
+            approximate: false,
+            contextTokens: 1200,
+            contextWindow: config.models[modelId]?.contextWindow ?? null,
+            providerId,
+            modelId,
+          };
+          agent.usage = {
+            [providerId]: {
+              [modelId]: { input: 1100, output: 100, cacheRead: 900, cacheWrite: 50 },
+            },
+          };
           const message = {
             id: data.id,
             role: "user",

@@ -41,7 +41,7 @@ const ALLOWED: [string, RegExp][] = [
   ["POST", /^\/v0\/projects$/],
   ["GET", new RegExp(`^/v0/projects/${PROJECT_ID}$`)],
   ["POST", /^\/v0\/agents$/],
-  ["GET", new RegExp(`^/v0/agents/${ID}(/(mode|draft|question|messages))?$`)],
+  ["GET", new RegExp(`^/v0/agents/${ID}(/(mode|draft|question|messages|usage))?$`)],
   ["PUT", new RegExp(`^/v0/agents/${ID}/draft$`)],
   ["POST", new RegExp(`^/v0/agents/${ID}/(send|abort|archive)$`)],
   ["POST", new RegExp(`^/v0/agents/${ID}/question/${QUESTION_ID}/answer$`)],
@@ -631,6 +631,44 @@ export function conversationView(agent: any, mode: any, title?: string) {
   };
 }
 
+/**
+ * How full the conversation's context is: Happy's latest measurement against the point where it
+ * compacts automatically (the model's `autoCompactWindow`, else its hard `contextWindow`), so the
+ * share reaches 100% when compaction happens. `null` until a turn has been measured, after
+ * compaction until the next one, and for a model whose limit is unknown.
+ */
+export function contextView(context: any, config: any) {
+  if (!context || typeof context.contextTokens !== "number") return null;
+  const model = config?.models?.[context.modelId];
+  const limitTokens: number | null =
+    model?.autoCompactWindow ?? context.contextWindow ?? model?.contextWindow ?? null;
+  if (!limitTokens) return null;
+  return {
+    usedTokens: context.contextTokens as number,
+    limitTokens,
+    approximate: !!context.approximate,
+  };
+}
+
+export type ContextView = ReturnType<typeof contextView>;
+
+/**
+ * The conversation's lifetime tokens on the model its context was last measured with. Happy never
+ * adds up different models' tokens, so neither does this.
+ */
+export function usageView(report: any) {
+  const context = report?.context;
+  const totals = context && report.usage?.[context.providerId]?.[context.modelId];
+  if (!totals) return null;
+  const count = (v: unknown) => (typeof v === "number" ? v : 0);
+  return {
+    input: count(totals.input),
+    output: count(totals.output),
+    cacheRead: count(totals.cacheRead),
+    cacheWrite: count(totals.cacheWrite),
+  };
+}
+
 /** Opaque list cursor: the last item's activity time and id. */
 export const encodeCursor = (at: number, id: string) =>
   Buffer.from(`${at}.${id}`).toString("base64url");
@@ -664,9 +702,11 @@ function remember<K, V>(map: Map<K, V>, key: K, value: V, max = 500) {
   if (map.size > max) map.delete(map.keys().next().value as K);
 }
 
+/** `config` resolves a context's limit; without it the measurement's own window applies. */
 export function mapEvent(
   ev: { type: string; payload: any },
   ctx: EventContext,
+  config?: any,
 ): FacadeEvent[] {
   const p = ev.payload ?? {};
   if (ev.type === "agent.created" && isConversationAgent(p.agent))
@@ -728,6 +768,13 @@ export function mapEvent(
             conversationId,
             run: normalizeRun(p.run, ctx.runFailures.get(p.run.id)),
           },
+        },
+      ];
+    case "agent.context.updated":
+      return [
+        {
+          type: "conversation.context",
+          data: { conversationId, context: contextView(p.context, config) },
         },
       ];
     case "question.created":

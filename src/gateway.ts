@@ -313,7 +313,7 @@ export function createGateway(
         p.signinRequired[signout.provider] = signout.at;
         void publish(p, signout.provider);
       }
-      for (const f of H.mapEvent(ev, p.ctx)) emit(p, f.type, f.data);
+      for (const f of H.mapEvent(ev, p.ctx, p.config)) emit(p, f.type, f.data);
     }
   }
 
@@ -1090,12 +1090,15 @@ export function createGateway(
       return H.normalizeRun(run, failure);
     });
     const { question } = await d.call("GET", `/v0/agents/${agent.id}/question`);
+    const report = await d.call("GET", `/v0/agents/${agent.id}/usage`);
     return json({
       conversation: await view(p, agent, await modeOf(d, agent.id)),
       messages,
       runs,
       hasMore: !!page.hasMore,
       question: question ? H.normalizeQuestion(question) : null,
+      context: H.contextView(report.context, await configOf(p, false)),
+      usage: H.usageView(report),
     });
   }
 
