@@ -498,7 +498,12 @@
             { code: input.value },
           );
           s.connection = connection;
-          if (connection.error?.code === "wrong_code") {
+          // Not accepted: paste it again, or (reissued) the new page's code.
+          if (
+            ["wrong_code", "wrong_code_reissued"].includes(
+              connection.error?.code,
+            )
+          ) {
             s.focus = "code";
             announce(connection.error.message);
           } else clearInput(`${id}-code`);

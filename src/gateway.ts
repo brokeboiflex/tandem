@@ -20,6 +20,8 @@ class HttpError extends Error {
     public status: number,
     public code: string,
     public detail = "",
+    /** Every value `detail` names, for clients that word the error themselves. */
+    public params: H.ErrorParams = {},
   ) {
     super(code);
   }
@@ -80,8 +82,29 @@ const ID = "[a-z][a-z0-9]{1,95}";
 const newId = () => "m" + crypto.randomUUID().replaceAll("-", "").slice(0, 31);
 const json = (data: unknown, status = 200) =>
   Response.json(data, { status, headers: { "cache-control": "no-store" } });
+/** Every /v1 error: clients translate `error` with `params`; `message` is the English fallback. */
+const errorJson = (
+  status: number,
+  error: string,
+  message: string,
+  params: H.ErrorParams = {},
+) => json({ error, message, params }, status);
 const UNAVAILABLE =
   "Your workspace isn't reachable right now. Try again in a moment.";
+const MODEL_UNAVAILABLE =
+  "This model isn't offered by the connected account. Pick another model.";
+/** The longest title, message and search query a person can write. */
+const MAX_TITLE = 200;
+const MAX_TEXT = 100_000;
+const MAX_QUERY = 200;
+/** Text the person wrote is longer than the request takes: they shorten it. */
+const tooLong = (maxLength: number) =>
+  new HttpError(
+    400,
+    "text_too_long",
+    `This text is too long: at most ${maxLength} characters.`,
+    { maxLength },
+  );
 /** How often a runtime waiting to be restarted is asked whether it is still working. */
 const RECOVERY_POLL_MS = 2000;
 
@@ -699,6 +722,7 @@ export function createGateway(
         400,
         "invalid_api_key_format",
         `Paste the whole key. ${spec.hint}`,
+        { provider: id },
       );
     const d = await daemonFor(p);
     // Choosing a key replaces any subscription sign-in still waiting for this person.
@@ -727,10 +751,10 @@ export function createGateway(
     }
     await runtime.exec(p.key, ["rm", "-f", `${H.RUNTIME_DIR}/${spec.file}`]);
     await restartRuntime(p, 2 * 60_000);
-    return (p.apiKeyFailures[id] = H.apiKeyConnection("failed", {
-      code: "invalid_api_key",
-      message: H.invalidApiKey(spec),
-    }));
+    return (p.apiKeyFailures[id] = H.apiKeyConnection(
+      "failed",
+      H.invalidApiKey(id),
+    ));
   }
 
   async function getConnect({ p, params }: Ctx) {
@@ -912,7 +936,8 @@ export function createGateway(
           ? null
           : Promise.reject(e),
       );
-    if (!H.isConversationAgent(agent)) throw new HttpError(404, "not_found");
+    if (!H.isConversationAgent(agent))
+      throw new HttpError(404, "not_found", "Not found.");
     p.ctx.conversations.add(id);
     return agent;
   }
@@ -934,31 +959,26 @@ export function createGateway(
         "invalid_request",
         "provider and model are required",
       );
-    if (
-      title !== undefined &&
-      (typeof title !== "string" || title.length > 200)
-    )
-      throw new HttpError(
-        400,
-        "invalid_request",
-        "title must be at most 200 characters",
-      );
+    if (title !== undefined && typeof title !== "string")
+      throw new HttpError(400, "invalid_request", "title must be a string");
+    if (title?.length > MAX_TITLE) throw tooLong(MAX_TITLE);
     const { provider: view } = await state(p, provider);
     if (view.status !== "connected")
-      throw new HttpError(409, "signin_required", `Connect ${provider} first.`);
-    const m = view.models.find((x) => x.id === model);
-    if (!m)
       throw new HttpError(
-        422,
-        "model_unavailable",
-        "This model isn't offered by the connected account.",
+        409,
+        "signin_required",
+        `Connect your ${H.vendorOf(provider)} account first.`,
+        { provider },
       );
+    const m = view.models.find((x) => x.id === model);
+    if (!m) throw new HttpError(422, "model_unavailable", MODEL_UNAVAILABLE);
     const chosenEffort = effort ?? m.defaultEffort;
     if (!m.efforts.includes(chosenEffort))
       throw new HttpError(
         422,
         "invalid_effort",
         `effort must be one of ${m.efforts.join(", ")}`,
+        { efforts: m.efforts },
       );
     const d = await daemonFor(p);
     const id = newId();
@@ -989,12 +1009,7 @@ export function createGateway(
       Math.max(1, Number(url.searchParams.get("limit")) || 50),
     );
     const query = (url.searchParams.get("query") ?? "").trim().toLowerCase();
-    if (query.length > 200)
-      throw new HttpError(
-        400,
-        "invalid_request",
-        "query must be at most 200 characters",
-      );
+    if (query.length > MAX_QUERY) throw tooLong(MAX_QUERY);
     const rawCursor = url.searchParams.get("cursor");
     const cursor = rawCursor ? H.decodeCursor(rawCursor) : null;
     if (rawCursor && !cursor)
@@ -1040,7 +1055,6 @@ export function createGateway(
       clean !== null &&
       (typeof clean !== "string" ||
         !clean ||
-        clean.length > 200 ||
         /[\u0000-\u001f\u007f]/.test(clean))
     )
       throw new HttpError(
@@ -1048,6 +1062,7 @@ export function createGateway(
         "invalid_request",
         "title must be 1-200 characters, or null to use the generated title",
       );
+    if (clean?.length > MAX_TITLE) throw tooLong(MAX_TITLE);
     const d = await daemonFor(p);
     const agent = await conversationAgent(d, p, params[0]!);
     // Happy has no rename: the gateway keeps the person's own titles in their volume.
@@ -1115,12 +1130,13 @@ export function createGateway(
 
   async function sendMessage({ p, params, body }: Ctx) {
     const { text, model, effort } = body;
-    if (typeof text !== "string" || !text.trim() || text.length > 100_000)
+    if (typeof text !== "string" || !text.trim())
       throw new HttpError(
         400,
         "invalid_request",
         "text must be 1-100000 characters",
       );
+    if (text.length > MAX_TEXT) throw tooLong(MAX_TEXT);
     const auth = parseMcpAuth(body.mcpAuth);
     const context = parseContext(body.context);
     // Before the runtime starts: a cold start's MCP connections then find the credential waiting.
@@ -1129,7 +1145,11 @@ export function createGateway(
     const agent = await conversationAgent(d, p, params[0]!);
     const current = await modeOf(d, agent.id);
     if (!current)
-      throw new HttpError(409, "conflict", "This conversation has no model.");
+      throw new HttpError(
+        409,
+        "conversation_has_no_model",
+        "This conversation has no model. Start a new conversation.",
+      );
     let mode = {
       ...current,
       serviceTier: null,
@@ -1141,12 +1161,7 @@ export function createGateway(
       const m = (
         provider ? H.liveModels(await configOf(p), provider, names) : []
       ).find((x) => x.id === (model ?? current.modelId));
-      if (!m)
-        throw new HttpError(
-          422,
-          "model_unavailable",
-          "This model isn't offered by the connected account.",
-        );
+      if (!m) throw new HttpError(422, "model_unavailable", MODEL_UNAVAILABLE);
       const e =
         effort ??
         (m.efforts.includes(current.effort) ? current.effort : m.defaultEffort);
@@ -1155,6 +1170,7 @@ export function createGateway(
           422,
           "invalid_effort",
           `effort must be one of ${m.efforts.join(", ")}`,
+          { efforts: m.efforts },
         );
       mode = { ...mode, modelId: m.id, effort: e };
     }
@@ -1169,11 +1185,7 @@ export function createGateway(
       .catch((e) => {
         // The daemon checks the mode against the live model catalog.
         if (e instanceof H.DaemonError && e.status === 400)
-          throw new HttpError(
-            422,
-            "model_unavailable",
-            "The selected model isn't available right now.",
-          );
+          throw new HttpError(422, "model_unavailable", MODEL_UNAVAILABLE);
         throw e;
       });
     return json(
@@ -1204,9 +1216,15 @@ export function createGateway(
   async function answer({ p, params, body }: Ctx) {
     const d = await daemonFor(p);
     const agent = await conversationAgent(d, p, params[0]!);
+    // Answered meanwhile (another client, a timeout, a stopped run) or never this conversation's.
+    const notPending = () =>
+      new HttpError(
+        409,
+        "question_not_pending",
+        "This question isn't waiting for an answer any more.",
+      );
     const { question } = await d.call("GET", `/v0/agents/${agent.id}/question`);
-    if (!question || question.id !== params[1])
-      throw new HttpError(404, "not_found");
+    if (!question || question.id !== params[1]) throw notPending();
     const answers = H.questionAnswers(question, body.answer);
     if (!answers)
       throw new HttpError(
@@ -1219,12 +1237,7 @@ export function createGateway(
         answers,
       })
       .catch((e) => {
-        if (e instanceof H.DaemonError && e.status === 409)
-          throw new HttpError(
-            409,
-            "conflict",
-            "This question was already resolved.",
-          );
+        if (e instanceof H.DaemonError && e.status === 409) throw notPending();
         throw e;
       });
     return json({ question: H.normalizeQuestion(r.question) });
@@ -1332,6 +1345,7 @@ export function createGateway(
           409,
           "too_many_servers",
           `At most ${M.MAX_SERVERS} MCP servers can be registered.`,
+          { maxServers: M.MAX_SERVERS },
         );
       return [...servers.filter((s) => s.name !== parsed.name), parsed];
     });
@@ -1342,7 +1356,7 @@ export function createGateway(
     const name = params[0]!;
     await changeServers(p, (servers) => {
       if (!servers.some((s) => s.name === name))
-        throw new HttpError(404, "not_found");
+        throw new HttpError(404, "not_found", "Not found.");
       return servers.filter((s) => s.name !== name);
     });
     proxy.setCredentials(p.key, { [name]: null });
@@ -1365,12 +1379,9 @@ export function createGateway(
    */
   async function putInstructions({ p, body }: Ctx) {
     const { text } = body;
-    if (typeof text !== "string" || text.length > H.MAX_INSTRUCTIONS)
-      throw new HttpError(
-        400,
-        "invalid_request",
-        `text must be at most ${H.MAX_INSTRUCTIONS} characters`,
-      );
+    if (typeof text !== "string")
+      throw new HttpError(400, "invalid_request", "text must be a string");
+    if (text.length > H.MAX_INSTRUCTIONS) throw tooLong(H.MAX_INSTRUCTIONS);
     await daemonFor(p);
     const files: [string, string][] = [
       [H.RUNTIME_DIR, H.INSTRUCTIONS_FILE],
@@ -1422,7 +1433,8 @@ export function createGateway(
 
   async function readJson(req: Request) {
     const text = await req.text();
-    if (text.length > 1_000_000) throw new HttpError(413, "too_large");
+    if (text.length > 1_000_000)
+      throw new HttpError(413, "too_large", "The request is too large.");
     if (!text) return {};
     try {
       const value = JSON.parse(text);
@@ -1494,17 +1506,14 @@ export function createGateway(
       const route = routes.find(
         ([method, re]) => method === req.method && re.test(path),
       );
-      if (!route)
-        return json({ error: "not_found", message: "Not found." }, 404);
+      if (!route) return errorJson(404, "not_found", "Not found.");
       name = `${route[0]} ${route[1].source}`;
       const principal = await verify(req);
       if (!principal)
-        return json(
-          {
-            error: "unauthorized",
-            message: "A valid service token is required.",
-          },
+        return errorJson(
           401,
+          "unauthorized",
+          "A valid service token is required.",
         );
       const p = person(runtimeKey(cfg.serviceSecret, principal.subject));
       const body = ["POST", "PUT", "PATCH"].includes(req.method)
@@ -1523,17 +1532,14 @@ export function createGateway(
       }
     } catch (e) {
       if (e instanceof HttpError)
-        return json({ error: e.code, message: e.detail || e.code }, e.status);
+        return errorJson(e.status, e.code, e.detail || e.code, e.params);
       if (e instanceof H.DaemonError) {
-        if (e.status === 404)
-          return json({ error: "not_found", message: "Not found." }, 404);
+        if (e.status === 404) return errorJson(404, "not_found", "Not found.");
         if (e.status === 409)
-          return json(
-            {
-              error: "conflict",
-              message: "That changed meanwhile. Try again.",
-            },
+          return errorJson(
             409,
+            "conflict",
+            "That changed meanwhile. Try again.",
           );
       }
       // Log the failure class only: never request bodies, daemon bodies or tokens.
@@ -1543,10 +1549,7 @@ export function createGateway(
         (e as Error)?.name ?? "Error",
         String((e as Error)?.message ?? "").slice(0, 160),
       );
-      return json(
-        { error: "runtime_unavailable", message: UNAVAILABLE },
-        503,
-      );
+      return errorJson(503, "runtime_unavailable", UNAVAILABLE);
     }
   }
 

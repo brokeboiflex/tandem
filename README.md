@@ -77,7 +77,8 @@ runs the test MCP server on its own (a `lookup_customer` tool that requires `Bea
 ## API
 
 Every `/v1` request needs `Authorization: Bearer <service JWT>`; `sub` is the person. Anything else is
-`404`. Errors are `{ "error": "<code>", "message": "<readable sentence>" }`.
+`404`. Errors are `{ "error": "<code>", "message": "<English fallback>", "params": { … } }`: clients
+translate by code (see [Error codes](#error-codes)).
 
 **When a runtime runs.** Reads (`GET`) never start a person's runtime, so an app may prefetch with them
 when the person signs in to it. Opening `GET /v1/events` starts it: open the stream when your assistant
@@ -93,7 +94,7 @@ While a stream is open, a runtime that stops on its own (a crash, `docker stop`)
 | `GET /v1/providers` | `{ providers: [{ id: "claude"\|"codex"\|"grok"\|"openrouter"\|"gemini", status: "connected"\|"not_connected"\|"connecting"\|"unknown", method: "subscription"\|"api_key"\|null, account: { email, plan }\|null, models: [{ id, name, default, efforts, defaultEffort }], checkedAt }] }`. Models come from the account's live catalog and are empty until connected. A model's `name` is what the vendor calls it, without a harness prefix ("Opus 5.5", "GPT-6-Luna"); Claude's are read from the person's own Claude Code shortly after it connects and arrive as `provider.updated`, until then Claude's aliases ("Opus"); OpenRouter's are OpenRouter's own ("DeepSeek: DeepSeek V4.1 Flash 1017"); Gemini's are those Google's agent reports for the key ("Gemini 4 Carbon", IDs such as `antigravity/gemini-4-carbon`). `default: true` marks the vendor's default (Claude's `claude-code/default`; the other vendors have none): its `name` is the model it currently resolves to ("Sonnet 5.5"), or `null` until known, and the client labels it as the default in its own language. `checkedAt` (ISO time) is when this was read from the person's runtime. Never starts the runtime. While it is stopped or starting, the answer comes at once from the gateway's memory, with that older `checkedAt`; open `/v1/events` to start it and receive the live state as `provider.updated` once it is up. A provider not read since the gateway started (after a gateway restart, until the person's runtime has run) is `status: "unknown"` with `checkedAt: null`, `method: null`, `account: null` and no models: show it as loading, not as signed out. A provider whose turn failed with `signin_required` reports `not_connected` until the person signs in again. |
 | `POST /v1/providers/:id/connect` | Starts the vendor sign-in, answers `{ connection }` once the vendor page is ready. Claude also accepts `{ "method": "api_key", "apiKey": "sk-ant-…" }`; OpenRouter and Gemini accept only `{ "method": "api_key", "apiKey": "sk-or-…" }` and `{ "method": "api_key", "apiKey": "AIza…" }`. |
 | `GET /v1/providers/:id/connect` | Current `{ connection }` (or `null`). |
-| `POST /v1/providers/:id/connect/code` | `{ code }` from the Claude page. A rejected code answers `status: "waiting"` with `error.code: "wrong_code"`. |
+| `POST /v1/providers/:id/connect/code` | `{ code }` from the Claude page. A rejected code answers `status: "waiting"` with `error.code` `wrong_code` (paste the whole code again) or `wrong_code_reissued` (Claude refused it for good: `url` is a new sign-in page to open again). |
 | `DELETE /v1/providers/:id/connect` | Cancels the sign-in. |
 | `DELETE /v1/providers/:id` | Signs out with the vendor CLI and removes its credentials from the volume (for OpenRouter and Gemini: the key). |
 | `GET /v1/events` | Server-Sent Events for this person only: `provider.updated`, `conversation.run`, `conversation.message`, `conversation.delta`, `conversation.question`, `conversation.context` (`{ conversationId, context }`, the same `context` as above after each measurement, `null` after compaction). Opening it starts the person's runtime, and it keeps the runtime from stopping while it is open. Its first `provider.updated` for each provider is the live state, sent once the runtime is up. The stream closes when the token expires; reconnect with a fresh one. |
@@ -102,7 +103,7 @@ While a stream is open, a runtime that stops on its own (a crash, `docker stop`)
 | `PATCH /v1/conversations/:id` | `{ title }` (1-200 characters, or `null` for the generated title) → `{ conversation }`. |
 | `DELETE /v1/conversations/:id` | Archives the conversation → `204`. It leaves every list and takes no messages; Happy keeps its history. |
 | `GET /v1/conversations/:id/messages` | `{ conversation, messages, runs, hasMore, question, context, usage }`; `?before=<runId>&limit=` pages back. `context` is `{ usedTokens, limitTokens, approximate }`: the latest measured conversation size against the point where the agent compacts it automatically (so 100% is when compaction happens), or `null` before the first measurement and right after compaction. `usage` is the conversation's lifetime `{ input, output, cacheRead, cacheWrite }` tokens on that measured model, or `null`. |
-| `POST /v1/conversations/:id/messages` | `{ text, model?, effort?, mcpAuth?, context? }` → `202 { message, conversation }`. `mcpAuth` is `{ "<server name>": "<Authorization header value>" \| null }` for registered MCP servers: held in gateway memory only, latest wins, `null` forgets it, and all are cleared when the runtime stops or the gateway restarts. `context` (at most 16 000 characters) is a hidden preamble for this message only: the agent receives it, but it is never returned as user text by `GET …/messages` or in events. |
+| `POST /v1/conversations/:id/messages` | `{ text, model?, effort?, mcpAuth?, context? }` → `202 { message, conversation }`. `text` is at most 100 000 characters. `mcpAuth` is `{ "<server name>": "<Authorization header value>" \| null }` for registered MCP servers: held in gateway memory only, latest wins, `null` forgets it, and all are cleared when the runtime stops or the gateway restarts. `context` (at most 16 000 characters) is a hidden preamble for this message only: the agent receives it, but it is never returned as user text by `GET …/messages` or in events. |
 | `POST /v1/conversations/:id/abort` | Stops the current run. |
 | `POST /v1/conversations/:id/questions/:questionId` | `{ answer }`: an option label, a list of labels, or `{ "<promptId>": [...] }`. Used for permission questions, including those an MCP server asks. |
 | `GET /v1/mcp-servers` | `{ servers: [{ name, url, enabledTools, description, hasCredential }] }`. |
@@ -111,14 +112,77 @@ While a stream is open, a runtime that stops on its own (a crash, `docker stop`)
 | `GET /v1/instructions` | `{ text }`: the person's standing instructions (empty when none). |
 | `PUT /v1/instructions` | `{ text }` (at most 64 000 characters; empty clears them) → `{ text }`. Written into the chat workspace as `AGENTS.md` (Codex, Gemini's Antigravity CLI, and Happy's own loop for Grok and OpenRouter) and `CLAUDE.md` (Claude Code), so every agent loads them in new conversations. |
 
-`connection` is `{ status: "waiting"|"connected"|"failed"|"cancelled"|"expired", flow: "paste_code"|"device_code"|"api_key", url, userCode, expiresAt, error: { code: "wrong_code"|"expired"|"sign_in_failed"|"unavailable"|"invalid_api_key", message }|null, account }`.
+`connection` is `{ status: "waiting"|"connected"|"failed"|"cancelled"|"expired", flow: "paste_code"|"device_code"|"api_key", url, userCode, expiresAt, error: { code, message, params }|null, account }`.
 
 Messages are normalized for a chat UI: `{ id, runId, role: "user"|"assistant"|"error", createdAt, text, tools: [{ id, name, status }], failure }`.
-Runs are `{ id, status: "running"|"completed"|"aborted"|"failed", failure }`, and failures are typed:
-`signin_required`, `model_unavailable`, `aborted` or `failed`, each with a readable `message`.
+Runs are `{ id, status: "running"|"completed"|"aborted"|"failed", failure }`. A message with
+`role: "error"` and a failed or aborted run carry a typed `failure: { code, message, params }`.
 
 Other unauthenticated routes: `GET /healthz`, `GET /connect` (demo page), and `POST /dev/token` only when
 `AUTH_MODE=dev` and `DEV_TOKEN_ROUTE=true`.
+
+### Error codes
+
+Clients word errors in their own language by `code`, never by `message`. Everything that goes wrong
+carries a stable snake_case code and a `params` object with each value a sentence about it needs (`{}`
+when there are none). `message` is an English fallback for simple clients such as the demo page: its
+wording is not part of the contract and may change, and for the provider's own failures (`usage_limit`,
+`rate_limited`, `provider_unavailable`, `network`, `context_too_long`) it is the provider's text. A
+code keeps its meaning; new codes may be added, so word a code you do not know like the generic one of
+its kind (`failed`, `sign_in_failed`, or a generic error).
+
+Codes arrive in three places:
+
+- **HTTP error**: the body of every `/v1` error response, for example
+  `{ "error": "signin_required", "message": "Connect your ChatGPT account first.", "params": { "provider": "codex" } }`.
+- **Connection error**: `connection.error`, wherever a `connection` appears (the `/connect` routes and
+  `provider.updated`), for example
+  `{ "code": "invalid_api_key", "message": "Google didn't accept that API key, …", "params": { "provider": "gemini" } }`.
+- **Run failure**: `failure` on a message with `role: "error"` and on a run that `failed` or was
+  `aborted`, in `GET /v1/conversations/:id/messages` and in the `conversation.message` and
+  `conversation.run` events, for example
+  `{ "code": "usage_limit", "message": "<the provider's text>", "params": { "provider": "claude", "resetsAt": "2026-11-20T08:00:00.000Z" } }`.
+
+`provider` is a provider id (`claude`, `codex`, `grok`, `openrouter`, `gemini`); the client names the
+vendor itself. In a run failure it is `null` when the failure names no provider Tandem offers. Times
+are ISO 8601.
+
+| Code | Appears as | Meaning | `params` |
+| --- | --- | --- | --- |
+| `unauthorized` | HTTP 401 | No valid service token. | |
+| `not_found` | HTTP 404 | No such route, conversation or MCP server for this person. | |
+| `invalid_json` | HTTP 400 | The body is not a JSON object. | |
+| `too_large` | HTTP 413 | The request body is over 1 MB. | |
+| `invalid_request` | HTTP 400 | A malformed request, which is a client bug; `message` tells its developers what is wrong. | |
+| `text_too_long` | HTTP 400 | Text the person wrote is over its limit: a message's `text` (100 000 characters), a conversation `title` (200), standing instructions (64 000) or a search `query` (200). The person shortens it. | `maxLength` |
+| `invalid_api_key_format` | HTTP 400 | The pasted API key cannot be one: too short, too long or with other characters. | `provider` |
+| `invalid_code` | HTTP 400 | The pasted sign-in code is empty, too long or contains control characters. | |
+| `invalid_answer` | HTTP 400 | The answer names no option, or leaves a prompt unanswered. | |
+| `runtime_stopped` | HTTP 409 | A read while the person's runtime is stopped; opening `/v1/events` starts it. | |
+| `not_waiting_for_code` | HTTP 409 | A code was sent, but no sign-in of this provider is waiting for one. | |
+| `signin_required` | HTTP 409 | A new conversation on a provider that isn't connected. | `provider` |
+| `question_not_pending` | HTTP 409 | The question isn't waiting for an answer (any more): answered meanwhile, ended with its run, or unknown. | |
+| `conversation_has_no_model` | HTTP 409 | The conversation has no model to continue with; start a new conversation. | |
+| `too_many_servers` | HTTP 409 | The person already has as many MCP servers as allowed. | `maxServers` |
+| `conflict` | HTTP 409 | Something in the workspace changed meanwhile; try again. | |
+| `model_unavailable` | HTTP 422 | The connected account doesn't offer this model (any more); pick another. | |
+| `invalid_effort` | HTTP 422 | The model doesn't offer this effort. | `efforts`: the ones it offers |
+| `runtime_unavailable` | HTTP 503 | The person's workspace didn't answer (restarting, or failing); try again shortly. | |
+| `wrong_code` | connection error, status `waiting` | The pasted code wasn't accepted; the same sign-in still waits for the whole code. | |
+| `wrong_code_reissued` | connection error, status `waiting` | Claude refused the code for good, so Tandem started a new sign-in: the person opens the new `url` and pastes the code it shows. | |
+| `expired` | connection error, status `expired` | The sign-in timed out; start again. | |
+| `sign_in_failed` | connection error, status `failed` | The sign-in ended without signing in (it failed or was interrupted); start again. | |
+| `unavailable` | connection error, status `failed` | Sign-in can't be offered right now; try again later. | |
+| `invalid_api_key` | connection error, status `failed` | The provider refused the API key, or couldn't be reached to check it. | `provider` |
+| `signin_required` | run failure | The account's sign-in is missing or expired, or its API key was refused; connect it again. The provider reports `not_connected` until then. | `provider` |
+| `model_unavailable` | run failure | The account can't use this model; pick another. | |
+| `usage_limit` | run failure | The account's plan or quota is used up. | `provider`; `resetsAt`: when it resets, or `null` when the provider didn't say |
+| `rate_limited` | run failure | The provider is limiting requests; wait a moment, then retry. | `provider` |
+| `provider_unavailable` | run failure | The provider is down or overloaded; retry later. | `provider` |
+| `network` | run failure | The workspace couldn't reach the provider; retry. | `provider` |
+| `context_too_long` | run failure | The conversation no longer fits the model's context; start a new conversation or pick a model with a larger one. | `model`: the model's `id`, or `null` |
+| `aborted` | run failure | The run was stopped on request. | |
+| `failed` | run failure | Any other failure, whose details are kept back; retry. | |
 
 ## The connect flow
 
@@ -130,7 +194,8 @@ Other unauthenticated routes: `GET /healthz`, `GET /connect` (demo page), and `P
 2. **Claude** (`flow: "paste_code"`): open `url` in a new tab. After approving, Claude's page shows a code;
    the person pastes it and you send it to `/connect/code`. A code Claude refuses comes back as
    `wrong_code` with the sign-in still waiting. When Anthropic itself refuses the code, Tandem starts a
-   fresh attempt automatically and returns its new `url` with the same `wrong_code` status.
+   fresh attempt automatically and returns its new `url` with `wrong_code_reissued`: the person opens
+   the sign-in page again and pastes the new code.
 3. **Codex** and **Grok** (`flow: "device_code"`): show `userCode` large, with a copy button and a link to
    `url`, and a countdown to `expiresAt`. The connection turns `connected` on its own; listen for
    `provider.updated`. Grok runs the Grok CLI's own `grok login --device-auth`; the person confirms the

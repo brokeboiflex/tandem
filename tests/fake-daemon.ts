@@ -103,6 +103,8 @@ export function fakeDaemon(
   };
   let opSeq = 0;
   const json = (data: unknown, status = 200) => Response.json(data, { status });
+  /** path -> the status its next request answers with (a change that raced another). */
+  const failures = new Map<string, number>();
 
   const server = Bun.serve({
     port: 0,
@@ -114,6 +116,11 @@ export function fakeDaemon(
       if (req.headers.get("authorization") !== `Bearer ${token}`)
         return json({ code: "unauthorized" }, 401);
       const data = body ? JSON.parse(body) : {};
+      const failure = failures.get(path);
+      if (failure) {
+        failures.delete(path);
+        return json({ code: failure === 409 ? "conflict" : "error" }, failure);
+      }
       let m: RegExpMatchArray | null;
       if (path === "/v0/health") return json({ ready: true });
       if (path === "/v0/config") return json({ config });
@@ -236,6 +243,14 @@ export function fakeDaemon(
         agents.set(agent.id, agent);
         return json({ agent }, 201);
       }
+      if ((m = path.match(/^\/v0\/agents\/(\w+)\/question\/(\w+)\/answer$/))) {
+        const agent = agents.get(m[1]!);
+        if (agent?.question?.id !== m[2])
+          return json({ code: "conflict" }, 409);
+        const question = { ...agent.question, status: "answered" };
+        agent.question = null;
+        return json({ question });
+      }
       if ((m = path.match(/^\/v0\/agents\/(\w+)(?:\/(\w+))?$/))) {
         const agent = agents.get(m[1]!);
         if (!agent) return json({ code: "not_found" }, 404);
@@ -248,7 +263,7 @@ export function fakeDaemon(
             draft: { value: drafts.get(agent.id) ?? null, updatedAt: 1 },
           });
         if (sub === "mode") return json({ mode: agent.mode ?? null });
-        if (sub === "question") return json({ question: null });
+        if (sub === "question") return json({ question: agent.question ?? null });
         if (sub === "usage")
           return json({ context: agent.context ?? null, usage: agent.usage ?? {} });
         if (sub === "messages")
@@ -342,6 +357,10 @@ export function fakeDaemon(
         methods: ["browser", "device"],
       };
       this.push("provider_cli.updated", { providerCli: clis[id] });
+    },
+    /** The next request to `path` answers `status` instead. */
+    fail(path: string, status: number) {
+      failures.set(path, status);
     },
     /** Pushes one journal event to every open event stream. */
     push(type: string, payload: unknown) {

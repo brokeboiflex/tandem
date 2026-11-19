@@ -356,9 +356,9 @@ r = await alice.call("POST", "/v1/providers/claude/connect/code", {
 });
 check(
   r.body.connection?.status === "waiting" &&
-    r.body.connection.error?.code === "wrong_code" &&
+    r.body.connection.error?.code === "wrong_code_reissued" &&
     r.body.connection.url !== start.url,
-  "claude: code refused by Anthropic -> fresh sign-in, waiting + wrong_code",
+  "claude: code refused by Anthropic -> fresh sign-in, waiting + wrong_code_reissued",
   r.body.connection?.error?.message,
 );
 await alice.call("DELETE", "/v1/providers/claude/connect");

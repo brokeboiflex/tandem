@@ -150,7 +150,14 @@ describe("façade surface", () => {
   });
 
   test("every façade route needs a valid service token", async () => {
-    expect((await call(null, "GET", "/v1/providers")).status).toBe(401);
+    expect(await call(null, "GET", "/v1/providers")).toEqual({
+      status: 401,
+      body: {
+        error: "unauthorized",
+        message: "A valid service token is required.",
+        params: {},
+      },
+    });
     expect((await call("not-a-jwt", "GET", "/v1/providers")).status).toBe(401);
     const forged = await devToken(
       "another-secret-that-is-32-characters-long",
@@ -263,7 +270,7 @@ describe("providers and sign-in", () => {
     ).toBe("wrong_code");
   });
 
-  test("Claude: a refused code restarts the sign-in, still waiting with wrong_code and a new page", async () => {
+  test("Claude: a refused code restarts the sign-in, still waiting with wrong_code_reissued and a new page", async () => {
     const before = (await call(alice, "GET", "/v1/providers/claude/connect"))
       .body.connection;
     const r = await call(alice, "POST", "/v1/providers/claude/connect/code", {
@@ -271,7 +278,7 @@ describe("providers and sign-in", () => {
     });
     expect(r.body.connection).toMatchObject({
       status: "waiting",
-      error: { code: "wrong_code" },
+      error: { code: "wrong_code_reissued", params: {} },
     });
     expect(r.body.connection.error.message).toContain(
       "Open the sign-in page again",
@@ -526,6 +533,7 @@ describe("Grok and OpenRouter", () => {
       body: {
         error: "invalid_api_key_format",
         message: "Paste the whole key. It starts with sk-or-.",
+        params: { provider: "openrouter" },
       },
     });
   });
@@ -553,6 +561,7 @@ describe("Grok and OpenRouter", () => {
         code: "invalid_api_key",
         message:
           "OpenRouter didn't accept that API key, or couldn't be reached. Check the key and try again.",
+        params: { provider: "openrouter" },
       },
       account: null,
     });
@@ -691,6 +700,7 @@ describe("Gemini (the person's own Gemini API key, run by Antigravity's agent)",
       body: {
         error: "invalid_api_key_format",
         message: "Paste the whole key. It starts with AIza.",
+        params: { provider: "gemini" },
       },
     });
     responses.length = 0;
@@ -707,6 +717,7 @@ describe("Gemini (the person's own Gemini API key, run by Antigravity's agent)",
         code: "invalid_api_key",
         message:
           "Google didn't accept that API key, or couldn't be reached. Check the key and try again.",
+        params: { provider: "gemini" },
       },
     });
     expect(runtime.execs).toEqual([
@@ -877,13 +888,18 @@ describe("conversations and isolation between people", () => {
       ).body.error,
     ).toBe("model_unavailable");
     expect(
-      (
-        await call(alice, "POST", "/v1/conversations", {
-          provider: "codex",
-          model: "codex-cli/gpt-6-luna",
-        })
-      ).body.error,
-    ).toBe("signin_required");
+      await call(alice, "POST", "/v1/conversations", {
+        provider: "codex",
+        model: "codex-cli/gpt-6-luna",
+      }),
+    ).toEqual({
+      status: 409,
+      body: {
+        error: "signin_required",
+        message: "Connect your ChatGPT account first.",
+        params: { provider: "codex" },
+      },
+    });
   });
 
   test("one person's events reach only that person's stream", async () => {
@@ -1195,6 +1211,280 @@ describe("last-known provider state", () => {
     );
     expect(known).toContain("user@example.com");
     expect(known).not.toMatch(/sk-ant|SECRET|goodcode|token/i);
+  });
+});
+
+describe("error codes a client translates", () => {
+  const ninaKey = runtimeKey(cfg.serviceSecret, "nina");
+  const fake = () => runtime.daemons.get(ninaKey)!;
+  let nina: string;
+  let id: string;
+  const failed = (status: number, error: string, message: string, params = {}) => ({
+    status,
+    body: { error, message, params },
+  });
+
+  test("text the person wrote over its limit is text_too_long with the limit; malformed input stays invalid_request", async () => {
+    nina = await tokenFor("nina");
+    await call(nina, "POST", "/v1/providers/claude/connect", {});
+    await call(nina, "POST", "/v1/providers/claude/connect/code", {
+      code: `${GOOD_CODE_PREFIX}#nina`,
+    });
+    const tooLong = (maxLength: number) =>
+      failed(
+        400,
+        "text_too_long",
+        `This text is too long: at most ${maxLength} characters.`,
+        { maxLength },
+      );
+    const conversation = { provider: "claude", model: "claude-code/haiku" };
+    expect(
+      await call(nina, "POST", "/v1/conversations", {
+        ...conversation,
+        title: "t".repeat(201),
+      }),
+    ).toEqual(tooLong(200));
+    const created = await call(nina, "POST", "/v1/conversations", {
+      ...conversation,
+      title: "t".repeat(200),
+    });
+    expect(created.status).toBe(201);
+    id = created.body.conversation.id;
+    expect(
+      await call(nina, "PATCH", `/v1/conversations/${id}`, {
+        title: "t".repeat(201),
+      }),
+    ).toEqual(tooLong(200));
+    expect(
+      await call(nina, "GET", `/v1/conversations?query=${"q".repeat(201)}`),
+    ).toEqual(tooLong(200));
+    expect(
+      await call(nina, "POST", `/v1/conversations/${id}/messages`, {
+        text: "x".repeat(100_001),
+      }),
+    ).toEqual(tooLong(100_000));
+    expect(
+      (
+        await call(nina, "POST", `/v1/conversations/${id}/messages`, {
+          text: "x".repeat(100_000),
+        })
+      ).status,
+    ).toBe(202);
+    expect(
+      await call(nina, "PUT", "/v1/instructions", { text: "x".repeat(64_001) }),
+    ).toEqual(tooLong(64_000));
+    // A malformed request is a client's bug, worded for its developers.
+    for (const [method, path, body] of [
+      ["POST", `/v1/conversations/${id}/messages`, { text: " " }],
+      ["PATCH", `/v1/conversations/${id}`, { title: "" }],
+      ["PUT", "/v1/instructions", { text: 42 }],
+      ["POST", "/v1/conversations", { ...conversation, title: 42 }],
+    ] as const)
+      expect(await call(nina, method, path, body)).toMatchObject({
+        status: 400,
+        body: { error: "invalid_request", params: {} },
+      });
+  });
+
+  test("an effort the model lacks names the efforts it has; a model the account lacks is model_unavailable", async () => {
+    const haiku = (await call(nina, "GET", "/v1/providers")).body.providers
+      .find((p: any) => p.id === "claude")
+      .models.find((m: any) => m.id === "claude-code/haiku");
+    const invalidEffort = failed(
+      422,
+      "invalid_effort",
+      `effort must be one of ${haiku.efforts.join(", ")}`,
+      { efforts: haiku.efforts },
+    );
+    expect(
+      await call(nina, "POST", "/v1/conversations", {
+        provider: "claude",
+        model: "claude-code/haiku",
+        effort: "turbo",
+      }),
+    ).toEqual(invalidEffort);
+    expect(
+      await call(nina, "POST", `/v1/conversations/${id}/messages`, {
+        text: "hi",
+        effort: "turbo",
+      }),
+    ).toEqual(invalidEffort);
+    expect(
+      await call(nina, "POST", "/v1/conversations", {
+        provider: "claude",
+        model: "claude-code/imaginary",
+      }),
+    ).toEqual(
+      failed(
+        422,
+        "model_unavailable",
+        "This model isn't offered by the connected account. Pick another model.",
+      ),
+    );
+  });
+
+  test("a question no longer waiting is question_not_pending, whether it went before or during the answer", async () => {
+    const notPending = failed(
+      409,
+      "question_not_pending",
+      "This question isn't waiting for an answer any more.",
+    );
+    const answer = (question: string) =>
+      call(nina, "POST", `/v1/conversations/${id}/questions/${question}`, {
+        answer: "Allow once",
+      });
+    expect(await answer("q1")).toEqual(notPending);
+    const agent = fake().agents.get(id);
+    const pending = {
+      id: "q1",
+      agentId: id,
+      status: "pending",
+      questions: [
+        {
+          id: "q1",
+          question: "Allow ls?",
+          options: [{ label: "Allow once" }, { label: "Deny" }],
+        },
+      ],
+    };
+    agent.question = pending;
+    expect(await answer("q2")).toEqual(notPending);
+    expect(await answer("q1")).toMatchObject({
+      status: 200,
+      body: { question: { id: "q1", status: "answered" } },
+    });
+    // Answered elsewhere between the gateway's read and its answer: the daemon refuses it.
+    agent.question = pending;
+    fake().fail(`/v0/agents/${id}/question/q1/answer`, 409);
+    expect(await answer("q1")).toEqual(notPending);
+  });
+
+  test("a conversation without a model is conversation_has_no_model; another change that raced is conflict", async () => {
+    fake().agents.set("mnomodel", {
+      id: "mnomodel",
+      workspaceId: "chats",
+      parentAgentId: null,
+      status: "idle",
+      pendingQuestionId: null,
+      createdAt: 0,
+      archivedAt: null,
+    });
+    expect(
+      await call(nina, "POST", "/v1/conversations/mnomodel/messages", {
+        text: "hi",
+      }),
+    ).toEqual(
+      failed(
+        409,
+        "conversation_has_no_model",
+        "This conversation has no model. Start a new conversation.",
+      ),
+    );
+    fake().fail(`/v0/agents/${id}/abort`, 409);
+    expect(await call(nina, "POST", `/v1/conversations/${id}/abort`)).toEqual(
+      failed(409, "conflict", "That changed meanwhile. Try again."),
+    );
+    expect(await call(nina, "GET", "/v1/conversations/mmissing/messages")).toEqual(
+      failed(404, "not_found", "Not found."),
+    );
+  });
+
+  test("a failed turn's code and data come with its messages and its run", async () => {
+    const agent = fake().agents.get(id);
+    agent.runs = [
+      ...agent.runs,
+      {
+        id: "mfailedrun",
+        status: "failed",
+        reason: "error",
+        messages: [
+          {
+            id: "mfailedrunu",
+            role: "user",
+            createdAt: 1,
+            content: [{ type: "text", text: "hi" }],
+          },
+          {
+            id: "mfailedruns",
+            role: "service",
+            createdAt: 2,
+            content: [{ type: "text", text: "This conversation is too long." }],
+            error: {
+              code: "inference_failed",
+              mode: { providerId: "claude", modelId: "claude-code/haiku" },
+            },
+            failure: {
+              fallbackProviders: [],
+              kind: "context_too_long",
+              message: "This conversation is too long.",
+              modelId: "claude-code/haiku",
+            },
+          },
+        ],
+      },
+    ];
+    const page = (await call(nina, "GET", `/v1/conversations/${id}/messages`))
+      .body;
+    const failure = {
+      code: "context_too_long",
+      message: "This conversation is too long.",
+      params: { model: "claude-code/haiku" },
+    };
+    expect(page.messages.at(-1)).toMatchObject({ role: "error", failure });
+    expect(page.runs.at(-1)).toEqual({
+      id: "mfailedrun",
+      status: "failed",
+      failure,
+    });
+  });
+
+  test("and on the event stream, where a usage limit leaves the account connected", async () => {
+    const stream = await listen(nina);
+    await until(() => stream.updates().length >= PROVIDER_IDS.length);
+    fake().push("message.created", {
+      agentId: id,
+      runId: "mlimit",
+      message: {
+        id: "mlimits",
+        role: "service",
+        createdAt: Date.now(),
+        content: [{ type: "text", text: "Claude usage limit reached." }],
+        error: { code: "inference_failed", mode: { providerId: "claude" } },
+        failure: {
+          fallbackProviders: [],
+          kind: "usage_limit",
+          message: "Claude usage limit reached.",
+          provider: { id: "claude", type: "claude", vendorName: "Claude", label: "claude" },
+          resetsAt: Date.parse("2026-11-20T08:00:00Z"),
+        },
+      },
+    });
+    fake().push("run.finished", {
+      agentId: id,
+      run: { id: "mlimit", status: "failed" },
+    });
+    await until(() =>
+      stream.events.some(
+        (e) => e.event === "conversation.run" && e.data.run.id === "mlimit",
+      ),
+    );
+    stream.close();
+    const failure = {
+      code: "usage_limit",
+      message: "Claude usage limit reached.",
+      params: { provider: "claude", resetsAt: "2026-11-20T08:00:00.000Z" },
+    };
+    const of = (event: string) =>
+      stream.events.filter((e) => e.event === event).map((e) => e.data);
+    expect(of("conversation.message").at(-1).message.failure).toEqual(failure);
+    expect(of("conversation.run").at(-1).run).toEqual({
+      id: "mlimit",
+      status: "failed",
+      failure,
+    });
+    expect(
+      (await call(nina, "GET", "/v1/providers")).body.providers[0].status,
+    ).toBe("connected");
   });
 });
 

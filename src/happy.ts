@@ -29,6 +29,13 @@ type ApiKey = {
 };
 
 /**
+ * Every value a client needs to word an error itself (README: Error codes), so that `message`, the
+ * English fallback, is never the only way to tell two situations apart.
+ */
+export type ErrorParams = Record<string, unknown>;
+type NoParams = Record<string, never>;
+
+/**
  * Each façade provider: its account in Happy when that has another ID (else the same), which with a
  * sign-in method is also the provider CLI that signs it in (no method: it takes only the person's
  * own API key), its flow, the vendor named in messages, and the person's own API key when it takes
@@ -94,6 +101,8 @@ const PROVIDERS: Record<
 /** The providers whose vendor CLI signs them in (GET /v0/provider-clis/:id). */
 export const CLI_IDS = PROVIDER_IDS.filter((id) => PROVIDERS[id].method);
 export const apiKeyOf = (id: ProviderId) => PROVIDERS[id].apiKey;
+/** The vendor as an English sentence names it ("ChatGPT" for Codex). */
+export const vendorOf = (id: ProviderId) => PROVIDERS[id].vendor;
 /** Happy's account for a façade provider. */
 export const happyId = (id: ProviderId) => PROVIDERS[id].happy ?? id;
 /** The façade provider of a Happy account, or null for any other account. */
@@ -246,7 +255,18 @@ export type Model = {
   efforts: string[];
   defaultEffort: string;
 };
-export type ConnectionError = { code: string; message: string };
+export type ConnectionError =
+  | {
+      code:
+        | "wrong_code"
+        | "wrong_code_reissued"
+        | "expired"
+        | "sign_in_failed"
+        | "unavailable";
+      message: string;
+      params: NoParams;
+    }
+  | { code: "invalid_api_key"; message: string; params: { provider: ProviderId } };
 export type Connection = {
   status: "waiting" | "connected" | "failed" | "cancelled" | "expired";
   flow: "paste_code" | "device_code" | "api_key";
@@ -265,6 +285,7 @@ export type CodeMemo = {
   reissued?: boolean;
 };
 
+/** The English fallback of each connection error: one sentence per code. */
 export const COPY = {
   wrong_code:
     "That code didn't work. Copy the whole code from the sign-in page and paste it again.",
@@ -272,13 +293,22 @@ export const COPY = {
     "That code wasn't accepted. Open the sign-in page again to get a new code, then paste it here.",
   expired: "The sign-in timed out. Start again when you're ready.",
   sign_in_failed: "Signing in didn't finish. Please try again.",
-  interrupted: "The sign-in was interrupted. Please start again.",
   unavailable:
     "Sign-in isn't available right now. Please try again in a moment.",
 };
 
-export const invalidApiKey = (key: ApiKey) =>
-  `${key.issuer} didn't accept that API key, or couldn't be reached. Check the key and try again.`;
+const connectionError = (code: keyof typeof COPY): ConnectionError => ({
+  code,
+  message: COPY[code],
+  params: {},
+});
+
+/** The account refused the person's API key, or could not be reached to check it. */
+export const invalidApiKey = (id: ProviderId): ConnectionError => ({
+  code: "invalid_api_key",
+  message: `${PROVIDERS[id].apiKey?.issuer ?? PROVIDERS[id].vendor} didn't accept that API key, or couldn't be reached. Check the key and try again.`,
+  params: { provider: id },
+});
 
 /** Model names by Happy model ID, read from the vendor's own agent (claudeModelNames). */
 export type ModelNames = Record<string, string>;
@@ -428,11 +458,9 @@ export function connectionView(
       ? { ...base, status: "connected", account: account() }
       : null;
   const wrong = memo && memo.opId === op.id && memo.wrong;
+  // A code refused for good also started a new sign-in: a new page, so a code of its own.
   const wrongError = wrong
-    ? {
-        code: "wrong_code",
-        message: memo.reissued ? COPY.wrong_code_reissued : COPY.wrong_code,
-      }
+    ? connectionError(memo.reissued ? "wrong_code_reissued" : "wrong_code")
     : null;
   switch (op.status) {
     case "running":
@@ -440,11 +468,7 @@ export function connectionView(
     case "waiting": {
       const auth = op.authorization ?? {};
       if (auth.expiresAt && now > auth.expiresAt)
-        return {
-          ...base,
-          status: "expired",
-          error: { code: "expired", message: COPY.expired },
-        };
+        return { ...base, status: "expired", error: connectionError("expired") };
       return {
         ...base,
         status: "waiting",
@@ -467,25 +491,18 @@ export function connectionView(
     default: {
       const code = op.error?.code;
       if (code === "expired")
-        return {
-          ...base,
-          status: "expired",
-          error: { code: "expired", message: COPY.expired },
-        };
+        return { ...base, status: "expired", error: connectionError("expired") };
       if (["unavailable", "not_found", "install_failed"].includes(code))
         return {
           ...base,
           status: "failed",
-          error: { code: "unavailable", message: COPY.unavailable },
+          error: connectionError("unavailable"),
         };
+      // Failed or interrupted alike: the person starts again.
       return {
         ...base,
         status: "failed",
-        error: {
-          code: "sign_in_failed",
-          message:
-            code === "interrupted" ? COPY.interrupted : COPY.sign_in_failed,
-        },
+        error: connectionError("sign_in_failed"),
       };
     }
   }
@@ -510,7 +527,7 @@ export const unavailableConnection = (id: ProviderId): Connection => ({
   url: null,
   userCode: null,
   expiresAt: null,
-  error: { code: "unavailable", message: COPY.unavailable },
+  error: connectionError("unavailable"),
   account: null,
 });
 
@@ -519,10 +536,20 @@ export const providerMethod = (id: ProviderId) => PROVIDERS[id].method;
 // ---------------------------------------------------------------------------------------------
 // Conversations, messages, failures.
 
-export type Failure = {
-  code: "signin_required" | "model_unavailable" | "aborted" | "failed";
-  message: string;
-};
+/** Why a run failed (README: Error codes). A `provider` is null when the failure names none. */
+export type Failure =
+  | {
+      code: "signin_required" | "rate_limited" | "provider_unavailable" | "network";
+      message: string;
+      params: { provider: ProviderId | null };
+    }
+  | {
+      code: "usage_limit";
+      message: string;
+      params: { provider: ProviderId | null; resetsAt: string | null };
+    }
+  | { code: "context_too_long"; message: string; params: { model: string | null } }
+  | { code: "model_unavailable" | "aborted" | "failed"; message: string; params: NoParams };
 
 const SIGNIN =
   /not logged in|please run \/login|\b401\b|unauthorized|missing bearer|invalid api key|invalid x-api-key|authentication_error|token (has )?expired|refresh token|invalid_grant|log ?in again|sign ?in again/i;
@@ -530,38 +557,80 @@ const MODEL =
   /issue with the selected model|model.{0,80}(not (found|supported|available)|does not exist|unavailable|no access|not have access)|unknown model|invalid model/i;
 
 /**
+ * The daemon's failure kinds that are written for people, never internal detail. Each is a code of
+ * its own, and its own text is the English fallback; every other kind's text stays out.
+ */
+const SAFE_KINDS = [
+  "usage_limit",
+  "rate_limited",
+  "provider_unavailable",
+  "network",
+  "context_too_long",
+] as const;
+
+/** Tandem's English fallbacks; a safe kind's only when the daemon sent no text of its own. */
+const FAILURE_COPY = {
+  model_unavailable:
+    "This model isn't available on your plan. Pick another model and try again.",
+  usage_limit: "You've reached your plan's usage limit. Try again once it resets.",
+  rate_limited:
+    "The provider is getting too many requests right now. Wait a moment, then try again.",
+  provider_unavailable:
+    "The provider isn't available right now. Please try again in a moment.",
+  network: "The provider couldn't be reached. Please try again in a moment.",
+  context_too_long:
+    "This conversation no longer fits the model's context. Start a new conversation.",
+  failed: "The assistant couldn't finish this reply. Please try again.",
+};
+
+/** The daemon's times are Unix milliseconds; null for anything else. */
+const isoTime = (ms: unknown) =>
+  typeof ms === "number" && Number.isSafeInteger(ms) && ms > 0 && ms <= 8.64e15
+    ? new Date(ms).toISOString()
+    : null;
+
+/** A catalog model ID ("claude-code/opus", "claude-code/x[1m]"), never free text. */
+const modelId = (id: unknown) =>
+  typeof id === "string" && /^[A-Za-z0-9][\w.:\/@[\]-]{0,255}$/.test(id) ? id : null;
+
+/**
  * Happy reports signed-out and expired accounts as kind "internal" with the vendor's raw text
- * (not the documented `signin_missing`), so classify by kind first, then by the vendor's words.
- * `providerId` is Happy's account.
+ * (not the documented `signin_missing`), so a lost sign-in is found by kind or by the vendor's
+ * words. Then the daemon's own kinds decide, and only what they leave is read for a model the
+ * account lacks. `providerId` is Happy's account. Parameters come only from structured fields.
  */
 export function classifyFailure(failure: any, providerId?: string): Failure {
   const text = `${failure?.message ?? ""} ${failure?.detail ?? ""}`;
-  const vendor = PROVIDERS[providerOf(providerId) ?? "claude"].vendor;
+  const provider = providerOf(providerId);
   if (failure?.kind === "signin_missing" || SIGNIN.test(text))
     return {
       code: "signin_required",
-      message: `Your ${vendor} account isn't connected or its sign-in expired. Connect it again, then retry.`,
+      message: `Your ${provider ? `${PROVIDERS[provider].vendor} ` : ""}account isn't connected or its sign-in expired. Connect it again, then retry.`,
+      params: { provider },
     };
+  const kind = SAFE_KINDS.find((k) => k === failure?.kind);
+  if (kind) {
+    const message =
+      typeof failure.message === "string" && failure.message.trim()
+        ? failure.message.slice(0, 300)
+        : FAILURE_COPY[kind];
+    if (kind === "usage_limit")
+      return {
+        code: kind,
+        message,
+        params: { provider, resetsAt: isoTime(failure.resetsAt) },
+      };
+    if (kind === "context_too_long")
+      return { code: kind, message, params: { model: modelId(failure.modelId) } };
+    return { code: kind, message, params: { provider } };
+  }
   if (MODEL.test(text))
     return {
       code: "model_unavailable",
-      message:
-        "This model isn't available on your plan. Pick another model and try again.",
+      message: FAILURE_COPY.model_unavailable,
+      params: {},
     };
-  const safe = [
-    "usage_limit",
-    "rate_limited",
-    "provider_unavailable",
-    "network",
-    "context_too_long",
-  ];
-  return {
-    code: "failed",
-    message:
-      safe.includes(failure?.kind) && failure?.message
-        ? String(failure.message).slice(0, 300)
-        : "The assistant couldn't finish this reply. Please try again.",
-  };
+  return { code: "failed", message: FAILURE_COPY.failed, params: {} };
 }
 
 /**
@@ -662,12 +731,13 @@ export function normalizeRun(run: any, failure?: Failure | null) {
         ? "completed"
         : "aborted"
       : (run.status as "running" | "completed" | "failed");
+  const aborted: Failure = { code: "aborted", message: "Stopped.", params: {} };
   return {
     id: run.id as string,
     status,
     failure:
       status === "aborted"
-        ? { code: "aborted" as const, message: "Stopped." }
+        ? aborted
         : status === "failed"
           ? (failure ?? classifyFailure(null))
           : null,

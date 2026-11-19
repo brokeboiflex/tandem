@@ -226,9 +226,14 @@ describe("connection states", () => {
       H.connectionView("claude", failed("sign_in_failed"), undefined)?.error
         ?.code,
     ).toBe("sign_in_failed");
+    // Interrupted or failed, the person does the same: one code, one sentence.
     expect(
-      H.connectionView("claude", failed("interrupted"), undefined)?.error?.code,
-    ).toBe("sign_in_failed");
+      H.connectionView("claude", failed("interrupted"), undefined)?.error,
+    ).toEqual({
+      code: "sign_in_failed",
+      message: H.COPY.sign_in_failed,
+      params: {},
+    });
     expect(
       H.connectionView("claude", failed("unavailable"), undefined)?.error?.code,
     ).toBe("unavailable");
@@ -291,7 +296,7 @@ describe("wrong-code detection (Claude keeps `waiting`; the rejection is only in
     ).toBeNull();
   });
 
-  test("the gateway's memo turns a rejected code into waiting + wrong_code", () => {
+  test("the gateway's memo turns a rejected code into waiting + wrong_code, or wrong_code_reissued with a new page", () => {
     const memo: H.CodeMemo = { opId: "op1", before: opening, wrong: true };
     const view = H.connectionView(
       "claude",
@@ -301,8 +306,9 @@ describe("wrong-code detection (Claude keeps `waiting`; the rejection is only in
     );
     expect(view).toMatchObject({
       status: "waiting",
-      error: { code: "wrong_code", message: H.COPY.wrong_code },
+      error: { code: "wrong_code", message: H.COPY.wrong_code, params: {} },
     });
+    // Refused for good: the gateway started a new sign-in, which the person must open again.
     const reissued = H.connectionView(
       "claude",
       claudeWaiting(),
@@ -310,8 +316,9 @@ describe("wrong-code detection (Claude keeps `waiting`; the rejection is only in
       { now: 0 },
     );
     expect(reissued?.error).toEqual({
-      code: "wrong_code",
+      code: "wrong_code_reissued",
       message: H.COPY.wrong_code_reissued,
+      params: {},
     });
     // A memo for an older attempt does not leak into a new one.
     expect(
@@ -341,7 +348,7 @@ describe("typed failures from real signed-out turns", () => {
     expect(normalized).toMatchObject({
       role: "error",
       text: "",
-      failure: { code: "signin_required" },
+      failure: { code: "signin_required", params: { provider: "claude" } },
     });
     expect(normalized.failure!.message).toContain("Claude");
     expect(H.normalizeRun(run, normalized.failure)).toEqual({
@@ -356,8 +363,13 @@ describe("typed failures from real signed-out turns", () => {
       "messages-signed-out-codex.json",
     );
     expect(message.failure.kind).toBe("internal");
-    expect(normalized.failure).toMatchObject({ code: "signin_required" });
+    expect(normalized.failure).toMatchObject({
+      code: "signin_required",
+      params: { provider: "codex" },
+    });
     expect(normalized.failure!.message).toContain("ChatGPT");
+    // The vendor's own text (URLs, request IDs) never reaches the client.
+    expect(JSON.stringify(normalized)).not.toContain("api.openai.com");
   });
 
   test("a rejected Anthropic API key is signin_required", async () => {
@@ -385,15 +397,6 @@ describe("typed failures from real signed-out turns", () => {
     expect(
       H.classifyFailure({ kind: "signin_missing", message: "" }).code,
     ).toBe("signin_required");
-    expect(
-      H.classifyFailure({
-        kind: "usage_limit",
-        message: "Claude usage limit reached. It resets in about 2 hours.",
-      }),
-    ).toEqual({
-      code: "failed",
-      message: "Claude usage limit reached. It resets in about 2 hours.",
-    });
     // Unknown internal detail is never shown raw.
     expect(
       H.classifyFailure({
@@ -417,7 +420,16 @@ describe("typed failures from real signed-out turns", () => {
     });
     expect(
       H.normalizeRun({ id: "r", status: "aborted", reason: "abort" }),
-    ).toMatchObject({ status: "aborted", failure: { code: "aborted" } });
+    ).toMatchObject({
+      status: "aborted",
+      failure: { code: "aborted", params: {} },
+    });
+    // A failed run whose failure message was not seen is the generic failure.
+    expect(H.normalizeRun({ id: "r", status: "failed" }).failure).toEqual({
+      code: "failed",
+      message: "The assistant couldn't finish this reply. Please try again.",
+      params: {},
+    });
     expect(
       H.normalizeRun({ id: "r", status: "aborted", reason: "steering" }).status,
     ).toBe("completed");
@@ -441,6 +453,163 @@ describe("typed failures from real signed-out turns", () => {
       role: "assistant",
       text: "pong",
       tools: [{ id: "t1", name: "Bash", status: "completed" }],
+    });
+  });
+});
+
+describe("codes a client words in its own language", () => {
+  const GENERIC = "The assistant couldn't finish this reply. Please try again.";
+  // The pinned daemon's failure shape (tests/fixtures), one kind at a time.
+  const failure = (kind: unknown, fields: any = {}) => ({
+    fallbackProviders: [],
+    kind,
+    message: `Vendor text for ${kind}.`,
+    ...fields,
+  });
+
+  test("each kind the daemon writes for people is a code of its own, with its provider as data", () => {
+    for (const kind of ["rate_limited", "provider_unavailable", "network"] as const)
+      expect(H.classifyFailure(failure(kind), "codex")).toEqual({
+        code: kind,
+        message: `Vendor text for ${kind}.`,
+        params: { provider: "codex" },
+      });
+    // Happy's Antigravity account is Gemini; an account the façade does not offer is none.
+    expect(
+      H.classifyFailure(failure("network"), "antigravity").params,
+    ).toEqual({ provider: "gemini" });
+    expect(H.classifyFailure(failure("network"), "bedrock").params).toEqual({
+      provider: null,
+    });
+  });
+
+  test("a usage limit says when it resets, when the daemon knows", () => {
+    expect(
+      H.classifyFailure(
+        failure("usage_limit", {
+          message: "Claude usage limit reached. It resets in about 2 hours.",
+          resetsAt: Date.parse("2026-11-19T15:00:00Z"),
+        }),
+        "claude",
+      ),
+    ).toEqual({
+      code: "usage_limit",
+      message: "Claude usage limit reached. It resets in about 2 hours.",
+      params: { provider: "claude", resetsAt: "2026-11-19T15:00:00.000Z" },
+    });
+    for (const resetsAt of [null, undefined, "in 2 hours", -1, 1.5, 9e15])
+      expect(
+        H.classifyFailure(failure("usage_limit", { resetsAt }), "claude")
+          .params,
+      ).toEqual({ provider: "claude", resetsAt: null });
+  });
+
+  test("a conversation too long for its model names the model by its ID, never by free text", () => {
+    expect(
+      H.classifyFailure(
+        failure("context_too_long", {
+          modelId: "claude-code/claude-fable-5-2[1m]",
+        }),
+        "claude",
+      ),
+    ).toEqual({
+      code: "context_too_long",
+      message: "Vendor text for context_too_long.",
+      params: { model: "claude-code/claude-fable-5-2[1m]" },
+    });
+    for (const modelId of [undefined, 42, "", "a model id with words", "x".repeat(300)])
+      expect(
+        H.classifyFailure(failure("context_too_long", { modelId }), "claude")
+          .params,
+      ).toEqual({ model: null });
+  });
+
+  test("a kind without text of its own gets Tandem's sentence for its code", () => {
+    const kinds = [
+      "usage_limit",
+      "rate_limited",
+      "provider_unavailable",
+      "network",
+      "context_too_long",
+    ];
+    const messages = kinds.map((kind) => {
+      const f = H.classifyFailure({ kind }, "claude");
+      expect(f.code).toBe(kind as H.Failure["code"]);
+      return f.message;
+    });
+    expect(new Set([...messages, GENERIC]).size).toBe(kinds.length + 1);
+    // Only text is text.
+    expect(
+      H.classifyFailure({ kind: "network", message: { html: "<b>" } }, "claude")
+        .message,
+    ).toBe(messages[3]!);
+  });
+
+  test("a provider outage stays one, even when its text mentions an unavailable model", () => {
+    expect(
+      H.classifyFailure(
+        failure("provider_unavailable", {
+          message: "The model is temporarily unavailable.",
+        }),
+        "claude",
+      ).code,
+    ).toBe("provider_unavailable");
+  });
+
+  test("every other kind, unknown ones included, is the generic failure and carries none of its text or fields", () => {
+    const secret = "stack at /home/agent/x.js:1 req_123";
+    for (const kind of [
+      "internal",
+      "provider_disabled",
+      "no_account_available",
+      "kind_added_later",
+      undefined,
+    ])
+      expect(
+        H.classifyFailure(
+          failure(kind, {
+            message: secret,
+            detail: secret,
+            poolName: secret,
+            resetsAt: Date.now(),
+            modelId: "claude-code/opus",
+          }),
+          "claude",
+        ),
+      ).toEqual({ code: "failed", message: GENERIC, params: {} });
+    expect(H.classifyFailure(null)).toEqual({
+      code: "failed",
+      message: GENERIC,
+      params: {},
+    });
+  });
+
+  test("a sign-in failure on an account the façade does not offer names no provider", () => {
+    expect(
+      H.classifyFailure({ kind: "signin_missing", message: "" }, "bedrock"),
+    ).toEqual({
+      code: "signin_required",
+      message:
+        "Your account isn't connected or its sign-in expired. Connect it again, then retry.",
+      params: { provider: null },
+    });
+  });
+
+  test("every connection error is one code with one sentence", () => {
+    expect(Object.keys(H.COPY).sort()).toEqual([
+      "expired",
+      "sign_in_failed",
+      "unavailable",
+      "wrong_code",
+      "wrong_code_reissued",
+    ]);
+    expect(new Set(Object.values(H.COPY)).size).toBe(
+      Object.keys(H.COPY).length,
+    );
+    expect(H.unavailableConnection("codex").error).toEqual({
+      code: "unavailable",
+      message: H.COPY.unavailable,
+      params: {},
     });
   });
 });
@@ -474,6 +643,74 @@ describe("event mapping", () => {
       conversationId: "probeclaude1",
       run: { status: "failed", failure: { code: "signin_required" } },
     });
+  });
+
+  test("a failure's code and data reach the stream with its message and its run", () => {
+    const c = ctx();
+    c.conversations.add("conv1");
+    const message = {
+      id: "f1",
+      role: "service",
+      createdAt: 0,
+      content: [{ type: "text", text: "You've hit your usage limit." }],
+      error: { code: "inference_failed", mode: { providerId: "codex" } },
+      failure: {
+        fallbackProviders: [],
+        kind: "usage_limit",
+        message: "You've hit your usage limit.",
+        provider: { id: "codex", type: "codex", vendorName: "Codex", label: "codex" },
+        resetsAt: Date.parse("2026-11-20T00:00:00Z"),
+      },
+    };
+    const failure = {
+      code: "usage_limit",
+      message: "You've hit your usage limit.",
+      params: { provider: "codex", resetsAt: "2026-11-20T00:00:00.000Z" },
+    };
+    expect(
+      H.mapEvent(
+        {
+          type: "message.created",
+          payload: { agentId: "conv1", runId: "r1", message },
+        },
+        c,
+      ),
+    ).toEqual([
+      {
+        type: "conversation.message",
+        data: {
+          conversationId: "conv1",
+          message: {
+            id: "f1",
+            runId: "r1",
+            role: "error",
+            createdAt: "1970-01-01T00:00:00.000Z",
+            text: "",
+            tools: [],
+            failure,
+          },
+        },
+      },
+    ]);
+    expect(
+      H.mapEvent(
+        {
+          type: "run.finished",
+          payload: { agentId: "conv1", run: { id: "r1", status: "failed" } },
+        },
+        c,
+      ),
+    ).toEqual([
+      {
+        type: "conversation.run",
+        data: {
+          conversationId: "conv1",
+          run: { id: "r1", status: "failed", failure },
+        },
+      },
+    ]);
+    // A usage limit is no sign-in problem: the provider stays connected.
+    expect(H.signinFailure({ type: "message.created", payload: { message } })).toBeNull();
   });
 
   test("only the failed turn of real signed-out events names the provider to sign in again", async () => {
@@ -909,9 +1146,12 @@ describe("Grok, OpenRouter and Gemini", () => {
     expect(
       H.providerView("openrouter", null, keyed, { signinRequired: true }).status,
     ).toBe("not_connected");
-    expect(
-      H.invalidApiKey(H.apiKeyOf("openrouter")!),
-    ).toContain("OpenRouter didn't accept that API key");
+    expect(H.invalidApiKey("openrouter")).toEqual({
+      code: "invalid_api_key",
+      message:
+        "OpenRouter didn't accept that API key, or couldn't be reached. Check the key and try again.",
+      params: { provider: "openrouter" },
+    });
   });
 
   test("a key OpenRouter refused (a real turn on the pinned daemon) is signin_required for OpenRouter", async () => {
@@ -923,6 +1163,7 @@ describe("Grok, OpenRouter and Gemini", () => {
       code: "signin_required",
       message:
         "Your OpenRouter account isn't connected or its sign-in expired. Connect it again, then retry.",
+      params: { provider: "openrouter" },
     });
     expect(
       H.signinFailure({ type: "message.created", payload: { message } }),
@@ -996,6 +1237,10 @@ describe("Grok, OpenRouter and Gemini", () => {
     expect(
       H.signinFailure({ type: "message.created", payload: { message } }),
     ).toEqual({ provider: "gemini", at: 5 });
+    expect(H.classifyFailure(message.failure, "antigravity")).toMatchObject({
+      code: "signin_required",
+      params: { provider: "gemini" },
+    });
     expect(H.classifyFailure(message.failure, "antigravity").message).toContain(
       "Your Gemini account",
     );

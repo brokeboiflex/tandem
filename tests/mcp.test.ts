@@ -194,6 +194,30 @@ describe("registering MCP servers", () => {
     ).toBe(404);
   });
 
+  test("past the limit, too_many_servers names the limit", async () => {
+    const token = await devToken(cfg.devSecret, "max");
+    for (let i = 0; i < M.MAX_SERVERS; i++)
+      expect(
+        (await call(token, "PUT", `/v1/mcp-servers/s${i}`, { url: stub.url }))
+          .status,
+      ).toBe(201);
+    expect(
+      await call(token, "PUT", "/v1/mcp-servers/onemore", { url: stub.url }),
+    ).toEqual({
+      status: 409,
+      body: {
+        error: "too_many_servers",
+        message: `At most ${M.MAX_SERVERS} MCP servers can be registered.`,
+        params: { maxServers: M.MAX_SERVERS },
+      },
+    });
+    // Replacing a registered one is no new server.
+    expect(
+      (await call(token, "PUT", "/v1/mcp-servers/s0", { url: stub.url }))
+        .status,
+    ).toBe(200);
+  });
+
   test("the runtime gets a sealed registry and a template naming only the proxy, then restarts", async () => {
     const k = key("alice");
     const template = runtime.volume.get(
