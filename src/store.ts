@@ -51,13 +51,6 @@ export type MessageRow = {
   failure: Failure | null;
 };
 
-export type McpRegistration = {
-  name: string;
-  url: string;
-  enabledTools?: string[];
-  description?: string;
-};
-
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS conversations (
   person TEXT NOT NULL, id TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,

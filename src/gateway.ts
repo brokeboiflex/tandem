@@ -258,6 +258,9 @@ export function createGateway(cfg: Config, deps: GatewayDeps) {
         view.method === "api_key" ? "api_key" : (flow ?? "api_key"),
         view.account,
       );
+    // Signed in, its account still being read: connected, account to follow.
+    if (flow && s?.state === "succeeded" && view.status === "unknown")
+      return P.connectedConnection(flow, null);
     if (p.apiKeyFailures[id]) return p.apiKeyFailures[id]!;
     if (flow && s && s.state !== "succeeded")
       return P.signInConnection(flow, s, null);
@@ -751,16 +754,15 @@ export function createGateway(cfg: Config, deps: GatewayDeps) {
         "This sign-in isn't waiting for a code.",
       );
     const next = await signIn.submitCode(p.key, code);
-    if (p.signIns.has(id) && p.signIns.get(id)?.state !== "succeeded")
+    // A device-code-style change may have finished the sign-in meanwhile; never undo that.
+    const before = p.signIns.get(id);
+    if (before?.state !== "succeeded") {
       p.signIns.set(id, next);
-    if (
-      next.state === "succeeded" &&
-      p.signIns.get(id)?.state !== "succeeded"
-    ) {
-      p.signIns.set(id, next);
-      if (P.takesApiKey(id)) store.setApiKey(p.key, id, null);
-      accountChanged(p, id);
-    } else publish(p, id);
+      if (next.state === "succeeded") {
+        if (P.takesApiKey(id)) store.setApiKey(p.key, id, null);
+        accountChanged(p, id);
+      } else publish(p, id);
+    }
     return json({ connection: connection(p, id) });
   }
 

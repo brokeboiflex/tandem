@@ -1,17 +1,37 @@
-// Gateway behavior through its real HTTP handler, with a fake runtime and fake per-person daemons.
-import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
+// The /v1 façade through the gateway's real HTTP handler, with fake agents, sign-ins and runtime.
+import {
+  afterAll,
+  beforeEach,
+  describe,
+  expect,
+  setDefaultTimeout,
+  test,
+} from "bun:test";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { devToken } from "../src/auth";
 import type { Config } from "../src/config";
-import { createGateway } from "../src/gateway";
-import { PROVIDER_IDS } from "../src/happy";
-import { GEMINI_KEY_COMMAND, runtimeKey } from "../src/runtime";
+import { createGateway, type GatewayRuntime } from "../src/gateway";
+import { runtimeKey } from "../src/runtime";
 import { sseFrames } from "../src/sse";
-import {
-  FakeRuntime,
-  GOOD_CODE_PREFIX,
-  GOOD_KEY_PREFIX,
-} from "./fake-daemon";
+import { Store } from "../src/store";
+import type {
+  Agent,
+  KeyVerdict,
+  ProviderId,
+  ProviderLive,
+  SignIn,
+  SignInStatus,
+  TurnEnd,
+  TurnInput,
+  TurnSink,
+} from "../src/agents/types";
+import { CONTEXT_OPEN } from "../src/providers";
+import { fail } from "../src/agents/failures";
 
+setDefaultTimeout(20_000);
+const dir = mkdtempSync(join(tmpdir(), "tandem-gw-"));
 const cfg = {
   port: 0,
   host: "127.0.0.1",
@@ -22,1419 +42,857 @@ const cfg = {
   oidcAudience: "",
   oidcJwksUrl: "",
   serviceSecret: "test-service-secret-at-least-32-characters",
-  dataDir: "/tmp/tandem-test",
-  runtimeRootfs: "/nonexistent/rootfs",
+  dataDir: dir,
+  runtimeRootfs: "/nonexistent",
   runtimePrefix: "test",
-  runtimeMemoryMb: 2048,
-  runtimeCpus: 2,
+  runtimeMemoryMb: 1024,
   runtimePids: 512,
   idleMs: 60_000,
-  permissionMode: "workspace_write",
-  restartAfterSignIn: false,
+  permissionMode: "auto",
   egressMode: "allowlist",
   egressAllowDomains: [],
   egressAllowRanges: [],
-  mcpAllowedOrigins: [] as string[],
-} as Config;
+  mcpAllowedOrigins: ["https://crm.example"],
+} as unknown as Config;
 
-setDefaultTimeout(30_000);
+// --- Fakes ------------------------------------------------------------------------------------
+
+const written: { key: string; dir: string; name: string; content: string }[] =
+  [];
+const execs: string[][] = [];
+const runtime: GatewayRuntime = {
+  spawn: () => Promise.reject(new Error("the gateway itself never spawns")),
+  exec: async (_key, args) => {
+    execs.push(args);
+    return { exitCode: 0, stdout: "", stderr: "" };
+  },
+  homeOf: (key) => join(dir, "homes", key),
+  mcpSocket: (key) => join(dir, "run", key, "mcp.sock"),
+  writePrivateFile: async (key, d, name, content) => {
+    written.push({ key, dir: d, name, content });
+  },
+};
+
+const MODELS = {
+  claude: [
+    {
+      id: "claude-code/default",
+      name: "Sonnet 5.5",
+      default: true,
+      efforts: ["low", "high"],
+      defaultEffort: "high",
+      contextLimit: 200_000,
+    },
+    {
+      id: "claude-code/opus",
+      name: "Opus 5.5",
+      efforts: ["low", "high"],
+      defaultEffort: "high",
+      contextLimit: 200_000,
+    },
+  ],
+  codex: [
+    {
+      id: "codex-cli/gpt-6-luna",
+      name: "GPT-6-Luna",
+      efforts: ["medium"],
+      defaultEffort: "medium",
+      contextLimit: 400_000,
+    },
+  ],
+  grok: [
+    {
+      id: "xai/grok-4.7",
+      name: "Grok 4.7",
+      efforts: [],
+      defaultEffort: null,
+      contextLimit: 256_000,
+    },
+  ],
+  openrouter: [
+    {
+      id: "deepseek/deepseek-v4.1-flash-1017",
+      name: "DeepSeek",
+      efforts: [],
+      defaultEffort: null,
+      contextLimit: 128_000,
+    },
+  ],
+  gemini: [
+    {
+      id: "antigravity/gemini-4-carbon",
+      name: "Gemini 4 Carbon",
+      efforts: ["low", "high"],
+      defaultEffort: "high",
+      contextLimit: 1_000_000,
+    },
+  ],
+};
+
+type Script = (
+  input: TurnInput,
+  sink: TurnSink,
+  signal: AbortSignal,
+) => Promise<TurnEnd>;
+class FakeAgent implements Agent {
+  script: Script = async (_i, sink) => {
+    sink.session("vendor-session-1");
+    sink.delta("a1", "Hel");
+    sink.delta("a1", "lo");
+    sink.text("a1", "Hello");
+    sink.tool("a1", { id: "t1", name: "Bash", status: "running" });
+    sink.tool("a1", { id: "t1", name: "Bash", status: "completed" });
+    sink.context({
+      usedTokens: 1200,
+      limitTokens: 200_000,
+      approximate: false,
+    });
+    sink.usage({ input: 1200, output: 20, cacheRead: 0, cacheWrite: 0 });
+    return { status: "completed" };
+  };
+  inputs: TurnInput[] = [];
+  reads: string[] = [];
+  released: string[] = [];
+  signedIn = true;
+  constructor(readonly providers: ProviderId[]) {}
+  async read(key: string, provider: ProviderId): Promise<ProviderLive> {
+    this.reads.push(`${key}:${provider}`);
+    return {
+      signedIn: this.signedIn,
+      account: { email: "person@example.com", plan: "pro" },
+      models: MODELS[provider],
+    };
+  }
+  turn(_key: string, input: TurnInput, sink: TurnSink, signal: AbortSignal) {
+    this.inputs.push(input);
+    return this.script(input, sink, signal);
+  }
+  busy() {
+    return false;
+  }
+  async release(key: string) {
+    this.released.push(key);
+  }
+  async verifyApiKey(
+    _key: string,
+    _p: ProviderId,
+    apiKey: string,
+  ): Promise<KeyVerdict> {
+    return apiKey.startsWith("good") ? "ok" : "refused";
+  }
+}
+
+class FakeSignIn implements SignIn {
+  signed = new Set<string>();
+  changes = new Map<string, (s: SignInStatus) => void>();
+  signedOut: string[] = [];
+  constructor(
+    readonly provider: ProviderId,
+    readonly flow: "paste_code" | "device_code",
+  ) {}
+  async start(
+    key: string,
+    onChange: (s: SignInStatus) => void,
+  ): Promise<SignInStatus> {
+    this.changes.set(key, onChange);
+    return {
+      state: "waiting",
+      url: `https://${this.provider}.example/signin`,
+      userCode: this.flow === "device_code" ? "ABCD-1234" : null,
+      expiresAt: Date.now() + 600_000,
+      codeError: null,
+    };
+  }
+  async submitCode(key: string, code: string): Promise<SignInStatus> {
+    if (code === "good-code") {
+      this.signed.add(key);
+      return { state: "succeeded" };
+    }
+    return {
+      state: "waiting",
+      url: `https://${this.provider}.example/signin`,
+      userCode: null,
+      expiresAt: Date.now() + 600_000,
+      codeError: code === "dead-code" ? "wrong_code_reissued" : "wrong_code",
+    };
+  }
+  /** What the device-code CLI does when the person confirms on the vendor's page. */
+  confirm(key: string) {
+    this.signed.add(key);
+    this.changes.get(key)?.({ state: "succeeded" });
+  }
+  async cancel() {}
+  signedIn(key: string) {
+    return this.signed.has(key);
+  }
+  async signOut(key: string) {
+    this.signed.delete(key);
+    this.signedOut.push(key);
+  }
+}
+
+const claude = new FakeAgent(["claude"]);
+const codex = new FakeAgent(["codex"]);
+const acp = new FakeAgent(["grok", "openrouter", "gemini"]);
+const claudeSignIn = new FakeSignIn("claude", "paste_code");
+const codexSignIn = new FakeSignIn("codex", "device_code");
+const grokSignIn = new FakeSignIn("grok", "device_code");
+const store = new Store(join(dir, "tandem.db"));
 const logs: string[] = [];
-const runtime = new FakeRuntime();
-const gateway = createGateway(cfg, runtime, {
+const gateway = createGateway(cfg, {
+  runtime,
+  agents: [claude, codex, acp],
+  signIns: [claudeSignIn, codexSignIn, grokSignIn],
+  store,
   log: (...a) => logs.push(a.map(String).join(" ")),
 });
 const server = Bun.serve({ port: 0, fetch: gateway.fetch, idleTimeout: 60 });
 const base = `http://127.0.0.1:${server.port}`;
-afterAll(() => {
+afterAll(async () => {
+  await gateway.shutdown();
   server.stop(true);
-  runtime.stopAll();
 });
 
-const tokenFor = (subject: string) => devToken(cfg.devSecret, subject);
-const alice = await tokenFor("alice");
-const bob = await tokenFor("bob");
-const responses: string[] = [];
+const keyOf = (subject: string) => runtimeKey(cfg.serviceSecret, subject);
+const tokens = new Map<string, string>();
+async function token(subject: string) {
+  if (!tokens.has(subject))
+    tokens.set(subject, await devToken(cfg.devSecret, subject));
+  return tokens.get(subject)!;
+}
 async function call(
-  token: string | null,
+  subject: string | null,
   method: string,
   path: string,
   body?: unknown,
-  raw?: string,
 ) {
   const res = await fetch(base + path, {
     method,
     headers: {
-      ...(token ? { authorization: `Bearer ${token}` } : {}),
-      ...(body || raw ? { "content-type": "application/json" } : {}),
+      ...(subject ? { authorization: `Bearer ${await token(subject)}` } : {}),
+      ...(body ? { "content-type": "application/json" } : {}),
     },
-    body: raw ?? (body ? JSON.stringify(body) : undefined),
+    body: body ? JSON.stringify(body) : undefined,
   });
   const text = await res.text();
-  responses.push(text);
   return { status: res.status, body: text ? JSON.parse(text) : null };
 }
 
-/** Opens a person's event stream, as an app does when its UI opens; this starts their runtime. */
-async function listen(
-  token: string,
-  send: (req: Request) => Promise<Response> = (req) => fetch(req),
-) {
-  const ac = new AbortController();
-  const res = await send(
-    new Request(`${base}/v1/events`, {
-      headers: { authorization: `Bearer ${token}` },
-      signal: ac.signal,
-    }),
-  );
+/** Opens the person's event stream and collects its events. */
+async function listen(subject: string) {
+  const ctrl = new AbortController();
+  const res = await fetch(`${base}/v1/events`, {
+    headers: { authorization: `Bearer ${await token(subject)}` },
+    signal: ctrl.signal,
+  });
   const events: { event: string; data: any }[] = [];
+  const waiters: (() => void)[] = [];
   void (async () => {
     try {
-      for await (const f of sseFrames(res.body!))
+      for await (const f of sseFrames(res.body!)) {
         events.push({ event: f.event, data: JSON.parse(f.data) });
+        waiters.splice(0).forEach((w) => w());
+      }
     } catch {}
   })();
-  const updates = () => events.filter((e) => e.event === "provider.updated");
-  return { events, updates, close: () => ac.abort() };
+  async function until(
+    pred: (e: { event: string; data: any }) => boolean,
+    ms = 5000,
+  ) {
+    const end = Date.now() + ms;
+    for (;;) {
+      const hit = events.find(pred);
+      if (hit) return hit;
+      if (Date.now() > end)
+        throw new Error(
+          `no matching event; got ${events.map((e) => e.event).join(",")}`,
+        );
+      await new Promise<void>((r) => {
+        waiters.push(r);
+        setTimeout(r, 50);
+      });
+    }
+  }
+  return { events, until, close: () => ctrl.abort() };
 }
 
-const until = async (ok: () => boolean | Promise<boolean>, ms = 5000) => {
-  for (const end = Date.now() + ms; !(await ok()); await Bun.sleep(25))
-    if (Date.now() > end) throw new Error("timed out");
-};
-
-/** Starts a person's runtime the way an app does, and waits until it is up and the stream closed. */
-async function wake(token: string) {
-  const stream = await listen(token);
-  await until(() => stream.updates().length >= PROVIDER_IDS.length);
-  stream.close();
-  await until(() =>
-    [...gateway.people.values()].every((p) => p.clients.size === 0),
+const providerOf = async (subject: string, id: string) =>
+  (await call(subject, "GET", "/v1/providers")).body.providers.find(
+    (p: any) => p.id === id,
   );
+
+async function connectClaude(subject: string) {
+  await call(subject, "POST", "/v1/providers/claude/connect", {});
+  const r = await call(subject, "POST", "/v1/providers/claude/connect/code", {
+    code: "good-code",
+  });
+  expect(r.body.connection.status).toBe("connected");
+  // The account is read once after sign-in; wait for it.
+  for (
+    let i = 0;
+    i < 50 && (await providerOf(subject, "claude")).status !== "connected";
+    i++
+  )
+    await Bun.sleep(20);
 }
 
-const unknown = (id: string) => ({
-  id,
-  status: "unknown",
-  method: null,
-  account: null,
-  models: [],
-  checkedAt: null,
+async function newConversation(subject: string, model = "claude-code/default") {
+  const r = await call(subject, "POST", "/v1/conversations", {
+    provider: "claude",
+    model,
+  });
+  expect(r.status).toBe(201);
+  return r.body.conversation;
+}
+
+async function settled(subject: string, id: string) {
+  for (let i = 0; i < 200; i++) {
+    const r = await call(subject, "GET", `/v1/conversations/${id}/messages`);
+    if (
+      r.body.conversation.status === "idle" &&
+      r.body.runs.every((x: any) => x.status !== "running")
+    )
+      return r.body;
+    await Bun.sleep(20);
+  }
+  throw new Error("turn did not settle");
+}
+
+beforeEach(() => {
+  claude.script = new FakeAgent([]).script;
+  claude.signedIn = true;
 });
 
-describe("façade surface", () => {
-  test("anything outside the /v1 contract is 404, authenticated or not", async () => {
-    for (const [method, path] of [
-      ["GET", "/v0/health"],
-      ["POST", "/v0/shutdown"],
-      ["POST", "/v1/shutdown"],
-      ["POST", "/v1/drain"],
-      ["GET", "/v1/config"],
-      ["GET", "/v1/bots"],
-      ["GET", "/v1/connections"],
-      ["POST", "/v1/providers/antigravity/connect"],
-      ["POST", "/v1/providers/bedrock/connect"],
-      ["DELETE", "/v1/providers/bedrock"],
-      ["PATCH", "/v1/providers"],
-      ["GET", "/v1/providers/claude"],
-      ["PUT", "/v1/conversations"],
-      ["GET", "/v1/conversations/BAD-ID/messages"],
-      ["GET", "/"],
-    ])
-      expect(
-        `${method} ${path} ${(await call(alice, method, path)).status}`,
-      ).toBe(`${method} ${path} 404`);
-  });
+// --- Tests ------------------------------------------------------------------------------------
 
-  test("every façade route needs a valid service token", async () => {
-    expect(await call(null, "GET", "/v1/providers")).toEqual({
-      status: 401,
-      body: {
-        error: "unauthorized",
-        message: "A valid service token is required.",
-        params: {},
-      },
-    });
-    expect((await call("not-a-jwt", "GET", "/v1/providers")).status).toBe(401);
-    const forged = await devToken(
-      "another-secret-that-is-32-characters-long",
-      "alice",
+describe("auth and routing", () => {
+  test("every /v1 route needs a service token; unknown routes are 404", async () => {
+    expect((await call(null, "GET", "/v1/providers")).status).toBe(401);
+    expect((await call("alice", "GET", "/v1/nope")).body.error).toBe(
+      "not_found",
     );
-    expect((await call(forged, "GET", "/v1/providers")).status).toBe(401);
+    expect((await call(null, "GET", "/healthz")).body.ok).toBe(true);
   });
 });
 
 describe("providers and sign-in", () => {
-  test("reads never start a runtime: providers are unknown, everything else is runtime_stopped", async () => {
-    const key = runtimeKey(cfg.serviceSecret, "alice");
-    const { status, body } = await call(alice, "GET", "/v1/providers");
-    expect(status).toBe(200);
-    expect(body.providers).toEqual(PROVIDER_IDS.map(unknown));
-    for (const path of [
-      "/v1/conversations",
-      "/v1/conversations/mabc/messages",
-      "/v1/providers/claude/connect",
-      "/v1/mcp-servers",
-      "/v1/instructions",
-    ])
-      expect(await call(alice, "GET", path)).toMatchObject({
-        status: 409,
-        body: { error: "runtime_stopped" },
-      });
-    expect(runtime.calls.filter((c) => c.includes(key))).toEqual([]);
-    expect(runtime.daemons.has(key)).toBe(false);
-  });
-
-  test("opening the event stream starts the runtime, archives the admin bot and sends the live state", async () => {
-    const key = runtimeKey(cfg.serviceSecret, "alice");
-    const stream = await listen(alice);
-    await until(() => stream.updates().length >= PROVIDER_IDS.length);
-    stream.close();
-    expect(runtime.calls).toContain(`ensure ${key}`);
-    expect(
-      stream
-        .updates()
-        .map(({ data: { provider: p } }) => [p.id, p.status, p.models.length])
-        .sort(),
-    ).toEqual([
-      ["claude", "not_connected", 0],
-      ["codex", "not_connected", 0],
-      ["gemini", "not_connected", 0],
-      ["grok", "not_connected", 0],
-      ["openrouter", "not_connected", 0],
-    ]);
-    const { body } = await call(alice, "GET", "/v1/providers");
-    expect(
-      body.providers.map((p: any) => [p.id, p.status, p.models.length]),
-    ).toEqual([
-      ["claude", "not_connected", 0],
-      ["codex", "not_connected", 0],
-      ["grok", "not_connected", 0],
-      ["openrouter", "not_connected", 0],
-      ["gemini", "not_connected", 0],
-    ]);
-    const d = runtime.daemons.get(key)!;
-    expect(
-      d.requests.some(
-        (r) =>
-          r.method === "POST" && r.path === "/v0/bots/chiefofstaff/archive",
-      ),
-    ).toBe(true);
-  });
-
-  test("Codex: one call starts the device flow; cancel ends it", async () => {
-    const { body } = await call(
-      alice,
-      "POST",
-      "/v1/providers/codex/connect",
-      {},
-    );
-    expect(body.connection).toMatchObject({
-      status: "waiting",
-      flow: "device_code",
-      userCode: "ABCD-12345",
-      url: "https://auth.openai.com/codex/device",
-      error: null,
-    });
-    expect(
-      (await call(alice, "GET", "/v1/providers/codex/connect")).body.connection
-        .status,
-    ).toBe("waiting");
-    expect(
-      (await call(alice, "DELETE", "/v1/providers/codex/connect")).body
-        .connection.status,
-    ).toBe("cancelled");
-  });
-
-  test("Claude: a malformed code is wrong_code and the sign-in keeps waiting", async () => {
-    const start = await call(alice, "POST", "/v1/providers/claude/connect", {});
-    expect(start.body.connection).toMatchObject({
-      status: "waiting",
-      flow: "paste_code",
-      error: null,
-    });
-    const r = await call(alice, "POST", "/v1/providers/claude/connect/code", {
-      code: "notarealcode",
-    });
-    expect(r.body.connection).toMatchObject({
-      status: "waiting",
-      url: start.body.connection.url,
-      error: { code: "wrong_code" },
-    });
-    expect(
-      (await call(alice, "GET", "/v1/providers/claude/connect")).body.connection
-        .error.code,
-    ).toBe("wrong_code");
-  });
-
-  test("Claude: a refused code restarts the sign-in, still waiting with wrong_code_reissued and a new page", async () => {
-    const before = (await call(alice, "GET", "/v1/providers/claude/connect"))
-      .body.connection;
-    const r = await call(alice, "POST", "/v1/providers/claude/connect/code", {
-      code: "refused#state",
-    });
-    expect(r.body.connection).toMatchObject({
-      status: "waiting",
-      error: { code: "wrong_code_reissued", params: {} },
-    });
-    expect(r.body.connection.error.message).toContain(
-      "Open the sign-in page again",
-    );
-    expect(r.body.connection.url).not.toBe(before.url);
-  });
-
-  test("Claude: the right code connects", async () => {
-    const r = await call(alice, "POST", "/v1/providers/claude/connect/code", {
-      code: `${GOOD_CODE_PREFIX}#state`,
-    });
-    expect(r.body.connection).toMatchObject({
-      status: "connected",
-      account: { email: "user@example.com", plan: "Max" },
-    });
-    const providers = (await call(alice, "GET", "/v1/providers")).body
-      .providers;
-    expect(providers[0]).toMatchObject({
-      id: "claude",
-      status: "connected",
-      method: "subscription",
-    });
-    expect(providers[0].models.length).toBeGreaterThan(0);
-    // Claude Code's own names arrive once read from the person's runtime.
-    let names: string[] = [];
-    await until(async () => {
-      names = (await call(alice, "GET", "/v1/providers")).body.providers[0]
-        .models.map((m: any) => m.name);
-      return names.includes("Opus 5.5");
-    });
-    expect(names).not.toContain("Claude Code · Opus");
-  });
-
-  test("disconnect signs out with the vendor CLI and restarts the runtime", async () => {
-    runtime.calls.length = 0;
-    const r = await call(alice, "DELETE", "/v1/providers/codex");
-    expect(r.status).toBe(200);
-    const key = runtimeKey(cfg.serviceSecret, "alice");
-    // The restarted runtime's Claude Code model names are read again, in the background.
-    expect(runtime.calls.filter((c) => !c.endsWith("claude-models"))).toEqual(
-      [`exec ${key} sh`, `restart ${key}`],
-    );
-  });
-});
-
-describe("secrets pass through the gateway in memory only", () => {
-  test("a pasted login code is never logged, stored or echoed", async () => {
-    const secret = "SECRETCODE7f3a9";
-    await call(bob, "POST", "/v1/providers/claude/connect", {});
-    responses.length = 0;
-    logs.length = 0;
-    await call(bob, "POST", "/v1/providers/claude/connect/code", {
-      code: `${secret}x`,
-    }); // wrong code path
-    await call(bob, "POST", "/v1/providers/claude/connect/code", {
-      code: `${secret}#state`,
-    }); // refused path
-    await call(bob, "POST", "/v1/providers/claude/connect/code", {
-      code: `${secret}echo`,
-    }); // daemon echoes it in a 500
-    await call(
-      bob,
-      "POST",
-      "/v1/providers/claude/connect/code",
-      undefined,
-      `{"code":"${secret}`,
-    ); // malformed JSON
-    await call(bob, "POST", "/v1/providers/claude/connect/code", {
-      code: `${secret}\u0001`,
-    }); // invalid characters
-    await call(bob, "POST", "/v1/providers/codex/connect/code", {
-      code: secret,
-    }); // nothing waiting for a code
-    const bobDaemon = runtime.daemons.get(
-      runtimeKey(cfg.serviceSecret, "bob"),
-    )!;
-    expect(
-      bobDaemon.requests.filter((r) => r.body.includes(secret)).length,
-    ).toBe(3); // delivered to the vendor CLI only
-    expect(responses.join("\n")).not.toContain(secret);
-    expect(logs.join("\n")).not.toContain(secret);
-    expect(logs.some((l) => l.startsWith("request_failed"))).toBe(true); // the failure itself is logged
-    const state = JSON.stringify([...gateway.people.values()], (_k, v) =>
-      v instanceof Map || v instanceof Set ? [...v] : v,
-    );
-    expect(state).not.toContain(secret);
-  });
-
-  test("an Anthropic API key goes only to the person's own runtime volume", async () => {
-    const key = "sk-ant-api03-SECRETKEY" + "x".repeat(40);
-    responses.length = 0;
-    logs.length = 0;
-    const r = await call(bob, "POST", "/v1/providers/claude/connect", {
-      method: "api_key",
-      apiKey: key,
-    });
-    expect(r.body.connection).toMatchObject({
-      status: "failed",
-      flow: "api_key",
-      error: { code: "invalid_api_key" },
-    });
-    const bad = await call(bob, "POST", "/v1/providers/claude/connect", {
-      method: "api_key",
-      apiKey: `${key} with spaces`,
-    });
-    expect(bad.status).toBe(400);
-    expect(runtime.files).toEqual([
-      {
-        key: runtimeKey(cfg.serviceSecret, "bob"),
-        dir: "/home/agent/.agent-runtime",
-        name: "anthropic-api-key",
-        content: `${key}\n`,
-      },
-    ]);
-    expect(responses.join("\n")).not.toContain("SECRETKEY");
-    expect(logs.join("\n")).not.toContain("SECRETKEY");
-    const bobDaemon = runtime.daemons.get(
-      runtimeKey(cfg.serviceSecret, "bob"),
-    )!;
-    expect(bobDaemon.requests.some((r) => r.body.includes("SECRETKEY"))).toBe(
-      false,
-    );
-    const state = JSON.stringify([...gateway.people.values()], (_k, v) =>
-      v instanceof Map || v instanceof Set ? [...v] : v,
-    );
-    expect(state).not.toContain("SECRETKEY");
-  });
-});
-
-describe("Grok and OpenRouter", () => {
-  const fixture = (name: string) =>
-    Bun.file(`${import.meta.dir}/fixtures/${name}`).json();
-  const provider = async (token: string, id: string) =>
-    (await call(token, "GET", "/v1/providers")).body.providers.find(
-      (p: any) => p.id === id,
-    );
-
-  test("Grok: one call starts the device flow; the approved code connects Grok, whose conversations run on Happy's grok account", async () => {
-    const gina = await tokenFor("gina");
-    const key = runtimeKey(cfg.serviceSecret, "gina");
-    const start = await call(gina, "POST", "/v1/providers/grok/connect", {});
-    expect(start.body.connection).toEqual({
-      status: "waiting",
-      flow: "device_code",
-      url: "https://accounts.x.ai/oauth2/device?user_code=WXYZ-2345",
-      userCode: "WXYZ-2345",
-      expiresAt: expect.any(String),
-      error: null,
-      account: null,
-    });
-    // Grok has no code to paste and takes no API key.
-    expect(
-      await call(gina, "POST", "/v1/providers/grok/connect/code", {
-        code: "WXYZ-2345",
-      }),
-    ).toMatchObject({ status: 409, body: { error: "not_waiting_for_code" } });
-    expect(
-      await call(gina, "POST", "/v1/providers/grok/connect", {
-        method: "api_key",
-        apiKey: "x".repeat(40),
-      }),
-    ).toMatchObject({
-      status: 400,
-      body: { message: "Only Claude, OpenRouter and Gemini accept an API key." },
-    });
-    runtime.daemons.get(key)!.approveDevice("grok");
-    await until(async () => (await provider(gina, "grok")).status === "connected");
-    const grok = await provider(gina, "grok");
-    expect(grok).toMatchObject({
-      method: "subscription",
-      account: { email: "user@example.com", plan: null },
-    });
-    expect(grok.models.map((m: any) => m.id)).toContain("xai/grok-4.7");
-    expect(
-      (await call(gina, "GET", "/v1/providers/grok/connect")).body.connection,
-    ).toMatchObject({ status: "connected", flow: "device_code" });
-
-    const created = await call(gina, "POST", "/v1/conversations", {
-      provider: "grok",
-      model: "xai/grok-4.7",
-    });
-    expect(created.status).toBe(201);
-    expect(created.body.conversation).toMatchObject({
-      provider: "grok",
-      model: "xai/grok-4.7",
-      effort: "high",
-    });
-    const id = created.body.conversation.id;
-    const sent = await call(gina, "POST", `/v1/conversations/${id}/messages`, {
-      text: "hi",
-      effort: "low",
-    });
-    expect(sent.body.conversation).toMatchObject({
-      provider: "grok",
-      effort: "low",
-    });
-    const send = runtime.daemons
-      .get(key)!
-      .requests.find((r) => r.path === `/v0/agents/${id}/send`)!;
-    expect(JSON.parse(send.body).mode).toMatchObject({
-      providerId: "grok",
-      modelId: "xai/grok-4.7",
-    });
-    // Models of another account are refused.
-    expect(
-      (
-        await call(gina, "POST", `/v1/conversations/${id}/messages`, {
-          text: "hi",
-          model: "codex-cli/gpt-6-luna",
-        })
-      ).body.error,
-    ).toBe("model_unavailable");
-
-    runtime.calls.length = 0;
-    runtime.execs.length = 0;
-    expect((await call(gina, "DELETE", "/v1/providers/grok")).status).toBe(200);
-    expect(runtime.execs).toEqual([
-      [
-        "sh",
-        "-c",
-        'grok logout >/dev/null 2>&1; rm -f "$HOME/.grok/"auth.json*',
-      ],
-    ]);
-    expect(runtime.calls).toContain(`restart ${key}`);
-  });
-
-  test("OpenRouter connects only with the person's own API key", async () => {
-    const olga = await tokenFor("olga");
-    await wake(olga);
-    for (const body of [{}, { method: "subscription" }])
-      expect(
-        await call(olga, "POST", "/v1/providers/openrouter/connect", body),
-      ).toMatchObject({ status: 400, body: { error: "invalid_request" } });
-    expect(
-      (await call(olga, "GET", "/v1/providers/openrouter/connect")).body,
-    ).toEqual({ connection: null });
-    expect(
-      await call(olga, "POST", "/v1/providers/openrouter/connect/code", {
-        code: "abc",
-      }),
-    ).toMatchObject({ status: 409, body: { error: "not_waiting_for_code" } });
-    expect(
-      await call(olga, "DELETE", "/v1/providers/openrouter/connect"),
-    ).toEqual({ status: 200, body: { connection: null } });
-    expect(
-      await call(olga, "POST", "/v1/providers/openrouter/connect", {
-        method: "api_key",
-        apiKey: "sk-or-short",
-      }),
-    ).toEqual({
-      status: 400,
-      body: {
-        error: "invalid_api_key_format",
-        message: "Paste the whole key. It starts with sk-or-.",
-        params: { provider: "openrouter" },
-      },
-    });
-  });
-
-  test("a refused OpenRouter key is removed again; an accepted one connects OpenRouter, and the key stays out of the gateway", async () => {
-    const olga = await tokenFor("olga");
-    const key = runtimeKey(cfg.serviceSecret, "olga");
-    const path = "/home/agent/.agent-runtime/openrouter-api-key";
-    const bad = `sk-or-v1-SECRETOR${"0".repeat(48)}`;
-    const good = `${GOOD_KEY_PREFIX}-SECRETOR${"1".repeat(48)}`;
-    responses.length = 0;
-    logs.length = 0;
-    runtime.execs.length = 0;
-    const refused = await call(olga, "POST", "/v1/providers/openrouter/connect", {
-      method: "api_key",
-      apiKey: bad,
-    });
-    expect(refused.body.connection).toEqual({
-      status: "failed",
-      flow: "api_key",
-      url: null,
-      userCode: null,
-      expiresAt: null,
-      error: {
-        code: "invalid_api_key",
-        message:
-          "OpenRouter didn't accept that API key, or couldn't be reached. Check the key and try again.",
-        params: { provider: "openrouter" },
-      },
-      account: null,
-    });
-    expect(runtime.execs).toContainEqual(["rm", "-f", path]);
-    expect(runtime.volume.has(`${key}:${path}`)).toBe(false);
-    expect(
-      (await call(olga, "GET", "/v1/providers/openrouter/connect")).body
-        .connection.error.code,
-    ).toBe("invalid_api_key");
-    // The verdict is OpenRouter's alone.
-    expect(
-      (await call(olga, "GET", "/v1/providers/claude/connect")).body.connection,
-    ).toBeNull();
-
-    const accepted = await call(olga, "POST", "/v1/providers/openrouter/connect", {
-      method: "api_key",
-      apiKey: ` ${good} `,
-    });
-    expect(accepted.body.connection).toMatchObject({
-      status: "connected",
-      flow: "api_key",
-      error: null,
-      account: { email: null, plan: "API key" },
-    });
-    expect(runtime.volume.get(`${key}:${path}`)).toBe(`${good}\n`);
-    const daemon = runtime.daemons.get(key)!;
-    expect(
-      daemon.requests
-        .filter((r) => r.path.endsWith("/verify"))
-        .map((r) => [r.path, r.body]),
-    ).toEqual([
-      ["/v0/providers/openrouter/verify", '{"level":"authentication"}'],
-      ["/v0/providers/openrouter/verify", '{"level":"authentication"}'],
-    ]);
-    const openrouter = await provider(olga, "openrouter");
-    expect(openrouter).toMatchObject({
-      status: "connected",
-      method: "api_key",
-      account: { email: null, plan: "API key" },
-    });
-    expect(openrouter.models).toHaveLength(6);
-    expect(openrouter.models[0]).toMatchObject({
-      id: "deepseek/deepseek-v4.1-flash-1017",
-      name: "DeepSeek: DeepSeek V4.1 Flash 1017",
-      default: false,
-    });
-
-    const created = await call(olga, "POST", "/v1/conversations", {
-      provider: "openrouter",
-      model: "deepseek/deepseek-v4.1-flash-1017",
-    });
-    expect(created.body.conversation).toMatchObject({
-      provider: "openrouter",
-      model: "deepseek/deepseek-v4.1-flash-1017",
-    });
-    const draft = daemon.requests.find(
-      (r) =>
-        r.method === "PUT" &&
-        r.path === `/v0/agents/${created.body.conversation.id}/draft`,
-    )!;
-    expect(JSON.parse(draft.body).draft.providerId).toBe("openrouter");
-
-    // The key reached the person's volume only: never a response, a log, the daemon or memory.
-    expect(responses.join("\n")).not.toContain("SECRETOR");
-    expect(logs.join("\n")).not.toContain("SECRETOR");
-    expect(daemon.requests.some((r) => r.body.includes("SECRETOR"))).toBe(false);
-    const state = JSON.stringify([...gateway.people.values()], (_k, v) =>
-      v instanceof Map || v instanceof Set ? [...v] : v,
-    );
-    expect(state).not.toContain("SECRETOR");
-  });
-
-  test("a turn whose key OpenRouter refuses makes it not connected; disconnecting removes the key", async () => {
-    const olga = await tokenFor("olga");
-    const key = runtimeKey(cfg.serviceSecret, "olga");
-    const page = await fixture("messages-invalid-api-key-openrouter.json");
-    const message = page.runs
-      .at(-1)
-      .messages.find((m: any) => m.failure);
-    runtime.daemons.get(key)!.push("message.created", {
-      agentId: "someconversation",
-      runId: "r1",
-      message: { ...message, createdAt: Date.now() },
-    });
-    await until(
-      async () => (await provider(olga, "openrouter")).status === "not_connected",
-    );
-    expect(
-      (await call(olga, "GET", "/v1/providers/openrouter/connect")).body
-        .connection,
-    ).toBeNull();
-
-    runtime.calls.length = 0;
-    runtime.execs.length = 0;
-    const daemon = runtime.daemons.get(key)!;
-    const seen = daemon.requests.length;
-    const r = await call(olga, "DELETE", "/v1/providers/openrouter");
-    expect(r.body.provider).toMatchObject({
-      id: "openrouter",
-      status: "not_connected",
-      method: null,
-      models: [],
-    });
-    expect(runtime.execs).toEqual([
-      ["rm", "-f", "/home/agent/.agent-runtime/openrouter-api-key"],
-    ]);
-    expect(runtime.calls).toContain(`restart ${key}`);
-    // It has no sign-in of its own, and no other provider's was touched.
-    expect(
-      daemon.requests.slice(seen).filter((r) => r.path.startsWith("/v0/provider-clis/") && r.method === "POST"),
-    ).toEqual([]);
-  });
-});
-
-describe("Gemini (the person's own Gemini API key, run by Antigravity's agent)", () => {
-  const provider = async (token: string) =>
-    (await call(token, "GET", "/v1/providers")).body.providers.find(
-      (p: any) => p.id === "gemini",
-    );
-  const path = "/home/agent/.agent-runtime/gemini-api-key";
-
-  test("connects only with an API key, which Google checks from inside the runtime; a refused one is removed", async () => {
-    const gwen = await tokenFor("gwen");
-    const key = runtimeKey(cfg.serviceSecret, "gwen");
-    await wake(gwen);
-    expect(
-      await call(gwen, "POST", "/v1/providers/gemini/connect", {}),
-    ).toMatchObject({ status: 400, body: { error: "invalid_request" } });
-    expect(
-      await call(gwen, "POST", "/v1/providers/gemini/connect", {
-        method: "api_key",
-        apiKey: "AIza-short",
-      }),
-    ).toEqual({
-      status: 400,
-      body: {
-        error: "invalid_api_key_format",
-        message: "Paste the whole key. It starts with AIza.",
-        params: { provider: "gemini" },
-      },
-    });
-    responses.length = 0;
-    logs.length = 0;
-    runtime.execs.length = 0;
-    const refused = await call(gwen, "POST", "/v1/providers/gemini/connect", {
-      method: "api_key",
-      apiKey: `AIzaSECRETGEM${"0".repeat(26)}`,
-    });
-    expect(refused.body.connection).toMatchObject({
-      status: "failed",
-      flow: "api_key",
-      error: {
-        code: "invalid_api_key",
-        message:
-          "Google didn't accept that API key, or couldn't be reached. Check the key and try again.",
-        params: { provider: "gemini" },
-      },
-    });
-    expect(runtime.execs).toEqual([
-      GEMINI_KEY_COMMAND,
-      ["rm", "-f", path],
-    ]);
-    expect(runtime.volume.has(`${key}:${path}`)).toBe(false);
-    // Happy's own provider check is never asked about this account.
-    expect(
-      runtime.daemons
-        .get(key)!
-        .requests.some((r) => r.path.endsWith("/verify")),
-    ).toBe(false);
-    expect((await provider(gwen)).status).toBe("not_connected");
-  });
-
-  test("an accepted key connects Gemini with the models agy reports, and its conversations run on the Antigravity account", async () => {
-    const gwen = await tokenFor("gwen");
-    const key = runtimeKey(cfg.serviceSecret, "gwen");
-    const accepted = await call(gwen, "POST", "/v1/providers/gemini/connect", {
-      method: "api_key",
-      apiKey: `${GOOD_KEY_PREFIX}SECRETGEM${"1".repeat(26)}`,
-    });
-    expect(accepted.body.connection).toEqual({
-      status: "connected",
-      flow: "api_key",
-      url: null,
-      userCode: null,
-      expiresAt: null,
-      error: null,
-      account: { email: null, plan: "API key" },
-    });
-    const gemini = await provider(gwen);
-    expect(gemini).toMatchObject({
-      status: "connected",
-      method: "api_key",
-      account: { email: null, plan: "API key" },
-    });
-    expect(gemini.models[0]).toMatchObject({
-      id: "antigravity/gemini-4-carbon",
-      name: "Gemini 4 Carbon",
-      default: false,
-    });
-    const created = await call(gwen, "POST", "/v1/conversations", {
-      provider: "gemini",
-      model: "antigravity/gemini-3.8-flash",
-    });
-    expect(created.status).toBe(201);
-    expect(created.body.conversation).toMatchObject({
-      provider: "gemini",
-      model: "antigravity/gemini-3.8-flash",
-      effort: "high",
-    });
-    const id = created.body.conversation.id;
-    const daemon = runtime.daemons.get(key)!;
-    const draft = daemon.requests.find(
-      (r) => r.method === "PUT" && r.path === `/v0/agents/${id}/draft`,
-    )!;
-    expect(JSON.parse(draft.body).draft.providerId).toBe("antigravity");
-    const sent = await call(gwen, "POST", `/v1/conversations/${id}/messages`, {
-      text: "hi",
-      effort: "low",
-    });
-    expect(sent.body.conversation).toMatchObject({
-      provider: "gemini",
-      effort: "low",
-    });
-    expect(
-      (await call(gwen, "GET", "/v1/conversations")).body.conversations[0]
-        .provider,
-    ).toBe("gemini");
-    // The key reached the person's volume only.
-    expect(responses.join("\n")).not.toContain("SECRETGEM");
-    expect(logs.join("\n")).not.toContain("SECRETGEM");
-    expect(daemon.requests.some((r) => r.body.includes("SECRETGEM"))).toBe(false);
-    const state = JSON.stringify([...gateway.people.values()], (_k, v) =>
-      v instanceof Map || v instanceof Set ? [...v] : v,
-    );
-    expect(state).not.toContain("SECRETGEM");
-  });
-
-  test("disconnecting removes the key and turns the account off again", async () => {
-    const gwen = await tokenFor("gwen");
-    runtime.execs.length = 0;
-    const r = await call(gwen, "DELETE", "/v1/providers/gemini");
-    expect(r.body.provider).toMatchObject({
-      id: "gemini",
-      status: "not_connected",
-      models: [],
-    });
-    expect(runtime.execs).toEqual([["rm", "-f", path]]);
-  });
-});
-
-describe("conversations and isolation between people", () => {
-  test("Alice's conversation is invisible and unreachable for Bob", async () => {
-    const created = await call(alice, "POST", "/v1/conversations", {
-      provider: "claude",
-      model: "claude-code/haiku",
-      title: "hello",
-    });
-    expect(created.status).toBe(201);
-    expect(created.body.conversation).toMatchObject({
-      provider: "claude",
-      model: "claude-code/haiku",
-      effort: "medium",
-      status: "idle",
-      title: "hello",
-    });
-    const id = created.body.conversation.id;
-    const sent = await call(alice, "POST", `/v1/conversations/${id}/messages`, {
-      text: "Reply with one word",
-    });
-    expect(sent.status).toBe(202);
-    const page = await call(alice, "GET", `/v1/conversations/${id}/messages`);
-    expect(page.body.messages.map((m: any) => [m.role, m.text])).toEqual([
-      ["user", "Reply with one word"],
-      ["assistant", "pong"],
-    ]);
-    // Haiku's context fills toward its 200k compaction point; usage is that model's totals.
-    expect(page.body.context).toEqual({
-      usedTokens: 1200,
-      limitTokens: 200000,
-      approximate: false,
-    });
-    expect(page.body.usage).toEqual({
-      input: 1100,
-      output: 100,
-      cacheRead: 900,
-      cacheWrite: 50,
-    });
-    expect(
-      (await call(alice, "GET", "/v1/conversations")).body.conversations.map(
-        (c: any) => c.id,
-      ),
-    ).toEqual([id]);
-
-    const aliceDaemon = runtime.daemons.get(
-      runtimeKey(cfg.serviceSecret, "alice"),
-    )!;
-    const seen = aliceDaemon.requests.length;
-    expect(
-      (await call(bob, "GET", "/v1/conversations")).body.conversations,
-    ).toEqual([]);
-    expect(
-      (await call(bob, "GET", `/v1/conversations/${id}/messages`)).status,
-    ).toBe(404);
-    expect(
-      (
-        await call(bob, "POST", `/v1/conversations/${id}/messages`, {
-          text: "hi",
-        })
-      ).status,
-    ).toBe(404);
-    expect(
-      (await call(bob, "POST", `/v1/conversations/${id}/abort`)).status,
-    ).toBe(404);
-    expect(aliceDaemon.requests.length).toBe(seen); // Bob's requests never reached Alice's runtime
-  });
-
-  test("a model outside the live catalog is refused; signed-out providers need a sign-in first", async () => {
-    expect(
-      (
-        await call(alice, "POST", "/v1/conversations", {
-          provider: "claude",
-          model: "claude-code/imaginary",
-        })
-      ).body.error,
-    ).toBe("model_unavailable");
-    expect(
-      await call(alice, "POST", "/v1/conversations", {
-        provider: "codex",
-        model: "codex-cli/gpt-6-luna",
-      }),
-    ).toEqual({
-      status: 409,
-      body: {
-        error: "signin_required",
-        message: "Connect your ChatGPT account first.",
-        params: { provider: "codex" },
-      },
-    });
-  });
-
-  test("one person's events reach only that person's stream", async () => {
-    const open = async (token: string) => {
-      const ac = new AbortController();
-      const res = await fetch(`${base}/v1/events`, {
-        headers: { authorization: `Bearer ${token}` },
-        signal: ac.signal,
-      });
-      const events: { event: string; data: any }[] = [];
-      void (async () => {
-        try {
-          for await (const f of sseFrames(res.body!))
-            events.push({ event: f.event, data: JSON.parse(f.data) });
-        } catch {}
-      })();
-      return { events, close: () => ac.abort() };
-    };
-    const a = await open(alice);
-    const b = await open(bob);
-    await Bun.sleep(300);
-    const convo = (await call(alice, "GET", "/v1/conversations")).body
-      .conversations[0].id;
-    runtime.daemons
-      .get(runtimeKey(cfg.serviceSecret, "alice"))!
-      .push("run.started", {
-        agentId: convo,
-        run: { id: "r9", status: "running" },
-      });
-    await Bun.sleep(300);
-    a.close();
-    b.close();
-    expect(
-      a.events.some(
-        (e) =>
-          e.event === "conversation.run" && e.data.conversationId === convo,
-      ),
-    ).toBe(true);
-    expect(b.events.some((e) => e.event.startsWith("conversation."))).toBe(
-      false,
-    );
-    expect(b.events.filter((e) => e.event === "provider.updated").length).toBe(
-      PROVIDER_IDS.length,
-    ); // Bob's own snapshot
-  });
-
-  test("a runtime stopped outside the gateway: a read answers without starting it, the next change starts it", async () => {
-    const key = runtimeKey(cfg.serviceSecret, "carol");
-    const carol = await tokenFor("carol");
-    await wake(carol);
-    runtime.kill(key);
-    runtime.calls.length = 0;
-    const read = await call(carol, "GET", "/v1/providers");
-    expect(read.body.providers.map((p: any) => p.status)).toEqual(
-      PROVIDER_IDS.map(() => "not_connected"),
-    );
-    expect(runtime.calls).not.toContain(`ensure ${key}`);
-    const t0 = performance.now();
-    expect(
-      (await call(carol, "POST", "/v1/providers/codex/connect", {})).status,
-    ).toBe(200);
-    expect(performance.now() - t0).toBeLessThan(5000);
-    expect(runtime.calls).toContain(`ensure ${key}`);
-    await call(carol, "DELETE", "/v1/providers/codex/connect");
-  });
-
-  test("while an event stream is open, a runtime that went away is restarted at once", async () => {
-    const key = runtimeKey(cfg.serviceSecret, "frank");
-    const stream = await listen(await tokenFor("frank"));
-    await until(() => stream.updates().length >= PROVIDER_IDS.length);
-    runtime.kill(key);
-    runtime.calls.length = 0;
-    stream.events.length = 0;
-    // A restart waits for a runtime that is still shutting down; a plain start would not.
-    await until(() => runtime.calls.includes(`restart ${key}`));
-    // Its clients get the live state again once it is back.
-    await until(() => stream.updates().length >= PROVIDER_IDS.length);
-    stream.close();
-  });
-
-  test("idle runtimes stop, but never while a run is in progress", async () => {
-    const key = runtimeKey(cfg.serviceSecret, "dave");
-    await wake(await tokenFor("dave"));
-    const fake = runtime.daemons.get(key)!;
-    fake.agents.set("busyconvo", {
-      id: "busyconvo",
-      workspaceId: "chats",
-      parentAgentId: null,
-      status: "working",
-      pendingQuestionId: null,
-      createdAt: 0,
-      archivedAt: null,
-    });
-    for (const p of gateway.people.values()) p.lastUsed = 0;
-    runtime.calls.length = 0;
-    await gateway.idleSweep();
-    expect(runtime.calls).not.toContain(`stop ${key}`);
-    fake.agents.get("busyconvo").status = "idle";
-    gateway.people.get(key)!.lastUsed = 0;
-    await gateway.idleSweep();
-    expect(runtime.calls).toContain(`stop ${key}`);
-  });
-
-  test("an open event stream keeps the runtime from idling out; the idle period starts when it closes", async () => {
-    const key = runtimeKey(cfg.serviceSecret, "heidi");
-    const stream = await listen(await tokenFor("heidi"));
-    await until(() => stream.updates().length >= PROVIDER_IDS.length);
-    const heidi = gateway.people.get(key)!;
-    heidi.lastUsed = 0;
-    runtime.calls.length = 0;
-    await gateway.idleSweep();
-    expect(runtime.calls).not.toContain(`stop ${key}`);
-    stream.close();
-    await until(() => heidi.clients.size === 0);
-    await gateway.idleSweep();
-    expect(runtime.calls).not.toContain(`stop ${key}`);
-    heidi.lastUsed = 0;
-    await gateway.idleSweep();
-    expect(runtime.calls).toContain(`stop ${key}`);
-  });
-
-  test("runtime names come from HMAC(secret, subject)", () => {
-    const a = runtimeKey(cfg.serviceSecret, "alice");
-    expect(a).toMatch(/^[0-9a-f]{24}$/);
-    expect(a).toBe(runtimeKey(cfg.serviceSecret, "alice"));
-    expect(a).not.toBe(runtimeKey(cfg.serviceSecret, "bob"));
-    expect(a).not.toBe(
-      runtimeKey("another-service-secret-of-32-characters", "alice"),
-    );
-  });
-});
-
-describe("last-known provider state", () => {
-  const idleStop = async (key: string) => {
-    const person = gateway.people.get(key)!;
-    await until(() => person.clients.size === 0);
-    person.lastUsed = 0;
-    await gateway.idleSweep();
-    expect(person.daemon).toBeUndefined();
-  };
-  const erinKey = runtimeKey(cfg.serviceSecret, "erin");
-  let erin: string;
-
-  test("a stopped runtime answers at once with what it last reported and starts nothing; the event stream starts it", async () => {
-    erin = await tokenFor("erin");
-    await call(erin, "POST", "/v1/providers/claude/connect", {});
-    await call(erin, "POST", "/v1/providers/claude/connect/code", {
-      code: `${GOOD_CODE_PREFIX}#state`,
-    });
-    const live = (await call(erin, "GET", "/v1/providers")).body.providers;
-    expect(live[0]).toMatchObject({ id: "claude", status: "connected" });
-    await wake(erin);
-    await idleStop(erinKey);
-
-    runtime.startDelayMs = 1500; // a real runtime takes a second or more to start
-    runtime.calls.length = 0;
-    const asked = Date.now();
-    const t0 = performance.now();
-    const r = await call(erin, "GET", "/v1/providers");
-    expect(performance.now() - t0).toBeLessThan(500);
+  test("a new person: nothing connected, answered at once without starting anything", async () => {
+    const r = await call("fresh", "GET", "/v1/providers");
     expect(r.body.providers.map((p: any) => [p.id, p.status])).toEqual([
-      ["claude", "connected"],
+      ["claude", "not_connected"],
       ["codex", "not_connected"],
       ["grok", "not_connected"],
       ["openrouter", "not_connected"],
       ["gemini", "not_connected"],
     ]);
-    expect(r.body.providers[0].models.length).toBeGreaterThan(0);
-    expect(Date.parse(r.body.providers[0].checkedAt)).toBeLessThan(asked);
-    await Bun.sleep(300);
-    expect(runtime.calls).toEqual([]);
-
-    // Opening the event stream starts it; reads meanwhile still answer at once from memory.
-    const stream = await listen(erin);
-    await until(() => runtime.calls.includes(`ensure ${erinKey}`));
-    const t1 = performance.now();
-    const during = await call(erin, "GET", "/v1/providers");
-    expect(performance.now() - t1).toBeLessThan(500);
-    expect(during.body.providers[0]).toMatchObject({ status: "connected" });
-    // Once it is up, the live state arrives on the stream.
-    await until(() =>
-      stream
-        .updates()
-        .some((e) => Date.parse(e.data.provider.checkedAt) >= asked),
+    expect(claude.reads.filter((r) => r.startsWith(keyOf("fresh")))).toEqual(
+      [],
     );
-    stream.close();
-    runtime.startDelayMs = 0;
-    expect(runtime.calls.filter((c) => c === `ensure ${erinKey}`)).toHaveLength(
-      1,
+  });
+
+  test("Claude paste code: a wrong code waits, a refused one reissues, a good one connects", async () => {
+    const start = await call("pc", "POST", "/v1/providers/claude/connect", {});
+    expect(start.body.connection).toMatchObject({
+      status: "waiting",
+      flow: "paste_code",
+      url: "https://claude.example/signin",
+    });
+    expect((await providerOf("pc", "claude")).status).toBe("connecting");
+    const wrong = await call(
+      "pc",
+      "POST",
+      "/v1/providers/claude/connect/code",
+      { code: "nope" },
     );
-    expect(gateway.people.get(erinKey)!.daemon).toBeDefined();
-  });
-
-  test("a turn that finds the sign-in expired makes it not connected, also while stopped, until a new sign-in", async () => {
-    const fake = runtime.daemons.get(erinKey)!;
-    fake.push("message.created", {
-      agentId: "someconversation",
-      runId: "r1",
-      message: {
-        id: "failed1",
-        role: "service",
-        createdAt: Date.now(),
-        content: [{ type: "text", text: "Not logged in · Please run /login" }],
-        error: { code: "inference_failed", mode: { providerId: "claude" } },
-        failure: {
-          kind: "internal",
-          message: "Not logged in · Please run /login",
-        },
-      },
+    expect(wrong.body.connection).toMatchObject({
+      status: "waiting",
+      error: { code: "wrong_code" },
     });
-    const claude = async () =>
-      (await call(erin, "GET", "/v1/providers")).body.providers[0];
-    await until(async () => (await claude()).status === "not_connected");
-    expect(await claude()).toMatchObject({
-      method: null,
-      account: null,
-      models: [],
+    const dead = await call("pc", "POST", "/v1/providers/claude/connect/code", {
+      code: "dead-code",
     });
-    expect(
-      (await call(erin, "GET", "/v1/providers/claude/connect")).body.connection,
-    ).toBeNull();
-
-    await idleStop(erinKey);
-    expect(await claude()).toMatchObject({ status: "not_connected" });
-
-    await call(erin, "POST", "/v1/providers/claude/connect", {});
-    const r = await call(erin, "POST", "/v1/providers/claude/connect/code", {
-      code: `${GOOD_CODE_PREFIX}#again`,
-    });
-    expect(r.body.connection.status).toBe("connected");
-    expect(await claude()).toMatchObject({ status: "connected" });
-  });
-
-  test("after a gateway restart nothing is remembered: unknown at once, nothing started until the event stream opens", async () => {
-    await idleStop(erinKey);
-    const restarted = createGateway(cfg, runtime, { log: () => {} });
-    runtime.calls.length = 0;
-    const t0 = performance.now();
-    const res = await restarted.fetch(
-      new Request(`${base}/v1/providers`, {
-        headers: { authorization: `Bearer ${erin}` },
-      }),
-    );
-    expect(performance.now() - t0).toBeLessThan(500);
-    expect(res.status).toBe(200);
-    expect((await res.json()).providers).toEqual(PROVIDER_IDS.map(unknown));
-    await Bun.sleep(300);
-    expect(runtime.calls).toEqual([]);
-
-    const stream = await listen(erin, restarted.fetch);
-    await until(() => stream.updates().length >= PROVIDER_IDS.length);
-    stream.close();
-    expect(runtime.calls).toContain(`ensure ${erinKey}`);
-    expect(
-      stream.updates().find((e) => e.data.provider.id === "claude")!.data
-        .provider,
-    ).toMatchObject({ status: "connected" });
-  });
-
-  test("what is remembered holds no credentials", () => {
-    const known = JSON.stringify(
-      [...gateway.people.values()].map((p) => p.known),
-    );
-    expect(known).toContain("user@example.com");
-    expect(known).not.toMatch(/sk-ant|SECRET|goodcode|token/i);
-  });
-});
-
-describe("error codes a client translates", () => {
-  const ninaKey = runtimeKey(cfg.serviceSecret, "nina");
-  const fake = () => runtime.daemons.get(ninaKey)!;
-  let nina: string;
-  let id: string;
-  const failed = (status: number, error: string, message: string, params = {}) => ({
-    status,
-    body: { error, message, params },
-  });
-
-  test("text the person wrote over its limit is text_too_long with the limit; malformed input stays invalid_request", async () => {
-    nina = await tokenFor("nina");
-    await call(nina, "POST", "/v1/providers/claude/connect", {});
-    await call(nina, "POST", "/v1/providers/claude/connect/code", {
-      code: `${GOOD_CODE_PREFIX}#nina`,
-    });
-    const tooLong = (maxLength: number) =>
-      failed(
-        400,
-        "text_too_long",
-        `This text is too long: at most ${maxLength} characters.`,
-        { maxLength },
-      );
-    const conversation = { provider: "claude", model: "claude-code/haiku" };
-    expect(
-      await call(nina, "POST", "/v1/conversations", {
-        ...conversation,
-        title: "t".repeat(201),
-      }),
-    ).toEqual(tooLong(200));
-    const created = await call(nina, "POST", "/v1/conversations", {
-      ...conversation,
-      title: "t".repeat(200),
-    });
-    expect(created.status).toBe(201);
-    id = created.body.conversation.id;
-    expect(
-      await call(nina, "PATCH", `/v1/conversations/${id}`, {
-        title: "t".repeat(201),
-      }),
-    ).toEqual(tooLong(200));
-    expect(
-      await call(nina, "GET", `/v1/conversations?query=${"q".repeat(201)}`),
-    ).toEqual(tooLong(200));
-    expect(
-      await call(nina, "POST", `/v1/conversations/${id}/messages`, {
-        text: "x".repeat(100_001),
-      }),
-    ).toEqual(tooLong(100_000));
+    expect(dead.body.connection.error.code).toBe("wrong_code_reissued");
     expect(
       (
-        await call(nina, "POST", `/v1/conversations/${id}/messages`, {
-          text: "x".repeat(100_000),
+        await call("pc", "POST", "/v1/providers/claude/connect/code", {
+          code: "a\nb",
+        })
+      ).body.error,
+    ).toBe("invalid_code");
+    const ok = await call("pc", "POST", "/v1/providers/claude/connect/code", {
+      code: "good-code",
+    });
+    expect(ok.body.connection.status).toBe("connected");
+    for (
+      let i = 0;
+      i < 50 && (await providerOf("pc", "claude")).status !== "connected";
+      i++
+    )
+      await Bun.sleep(20);
+    const view = await providerOf("pc", "claude");
+    expect(view).toMatchObject({
+      status: "connected",
+      method: "subscription",
+      account: { email: "person@example.com" },
+    });
+    expect(view.models.map((m: any) => m.id)).toEqual([
+      "claude-code/default",
+      "claude-code/opus",
+    ]);
+    expect(view.models[0]).toEqual({
+      id: "claude-code/default",
+      name: "Sonnet 5.5",
+      default: true,
+      efforts: ["low", "high"],
+      defaultEffort: "high",
+    });
+    expect(
+      (
+        await call("pc", "POST", "/v1/providers/codex/connect/code", {
+          code: "x",
+        })
+      ).body.error,
+    ).toBe("not_waiting_for_code");
+  });
+
+  test("Codex device code connects when the person confirms, announced as provider.updated", async () => {
+    const s = await listen("dc");
+    const start = await call("dc", "POST", "/v1/providers/codex/connect", {});
+    expect(start.body.connection).toMatchObject({
+      status: "waiting",
+      flow: "device_code",
+      userCode: "ABCD-1234",
+    });
+    codexSignIn.confirm(keyOf("dc"));
+    await s.until(
+      (e) =>
+        e.event === "provider.updated" &&
+        e.data.provider.id === "codex" &&
+        e.data.provider.status === "connected",
+    );
+    s.close();
+  });
+
+  test("API keys: format checked, a refused key is not kept, a good one is kept outside the home", async () => {
+    expect(
+      (
+        await call("ak", "POST", "/v1/providers/openrouter/connect", {
+          method: "api_key",
+          apiKey: "short",
+        })
+      ).body.error,
+    ).toBe("invalid_api_key_format");
+    const bad = await call("ak", "POST", "/v1/providers/openrouter/connect", {
+      method: "api_key",
+      apiKey: "bad-0123456789abcdefghij",
+    });
+    expect(bad.body.connection).toMatchObject({
+      status: "failed",
+      error: { code: "invalid_api_key", params: { provider: "openrouter" } },
+    });
+    expect(store.apiKey(keyOf("ak"), "openrouter")).toBeNull();
+    const good = await call("ak", "POST", "/v1/providers/openrouter/connect", {
+      method: "api_key",
+      apiKey: "good-0123456789abcdefghij",
+    });
+    expect(good.body.connection.status).toBe("connected");
+    expect(store.apiKey(keyOf("ak"), "openrouter")).toBe(
+      "good-0123456789abcdefghij",
+    );
+    expect(written.some((w) => w.content.includes("good-0123456789"))).toBe(
+      false,
+    );
+    for (
+      let i = 0;
+      i < 50 && (await providerOf("ak", "openrouter")).status !== "connected";
+      i++
+    )
+      await Bun.sleep(20);
+    expect(await providerOf("ak", "openrouter")).toMatchObject({
+      status: "connected",
+      method: "api_key",
+      account: { plan: "API key" },
+    });
+    expect(
+      (
+        await call("ak", "POST", "/v1/providers/codex/connect", {
+          method: "api_key",
+          apiKey: "good-0123456789abcdefghij",
         })
       ).status,
-    ).toBe(202);
-    expect(
-      await call(nina, "PUT", "/v1/instructions", { text: "x".repeat(64_001) }),
-    ).toEqual(tooLong(64_000));
-    // A malformed request is a client's bug, worded for its developers.
-    for (const [method, path, body] of [
-      ["POST", `/v1/conversations/${id}/messages`, { text: " " }],
-      ["PATCH", `/v1/conversations/${id}`, { title: "" }],
-      ["PUT", "/v1/instructions", { text: 42 }],
-      ["POST", "/v1/conversations", { ...conversation, title: 42 }],
-    ] as const)
-      expect(await call(nina, method, path, body)).toMatchObject({
-        status: 400,
-        body: { error: "invalid_request", params: {} },
-      });
+    ).toBe(400);
   });
 
-  test("an effort the model lacks names the efforts it has; a model the account lacks is model_unavailable", async () => {
-    const haiku = (await call(nina, "GET", "/v1/providers")).body.providers
-      .find((p: any) => p.id === "claude")
-      .models.find((m: any) => m.id === "claude-code/haiku");
-    const invalidEffort = failed(
-      422,
-      "invalid_effort",
-      `effort must be one of ${haiku.efforts.join(", ")}`,
-      { efforts: haiku.efforts },
-    );
-    expect(
-      await call(nina, "POST", "/v1/conversations", {
-        provider: "claude",
-        model: "claude-code/haiku",
-        effort: "turbo",
-      }),
-    ).toEqual(invalidEffort);
-    expect(
-      await call(nina, "POST", `/v1/conversations/${id}/messages`, {
-        text: "hi",
-        effort: "turbo",
-      }),
-    ).toEqual(invalidEffort);
-    expect(
-      await call(nina, "POST", "/v1/conversations", {
-        provider: "claude",
-        model: "claude-code/imaginary",
-      }),
-    ).toEqual(
-      failed(
-        422,
-        "model_unavailable",
-        "This model isn't offered by the connected account. Pick another model.",
-      ),
-    );
-  });
-
-  test("a question no longer waiting is question_not_pending, whether it went before or during the answer", async () => {
-    const notPending = failed(
-      409,
-      "question_not_pending",
-      "This question isn't waiting for an answer any more.",
-    );
-    const answer = (question: string) =>
-      call(nina, "POST", `/v1/conversations/${id}/questions/${question}`, {
-        answer: "Allow once",
-      });
-    expect(await answer("q1")).toEqual(notPending);
-    const agent = fake().agents.get(id);
-    const pending = {
-      id: "q1",
-      agentId: id,
-      status: "pending",
-      questions: [
-        {
-          id: "q1",
-          question: "Allow ls?",
-          options: [{ label: "Allow once" }, { label: "Deny" }],
-        },
-      ],
-    };
-    agent.question = pending;
-    expect(await answer("q2")).toEqual(notPending);
-    expect(await answer("q1")).toMatchObject({
-      status: 200,
-      body: { question: { id: "q1", status: "answered" } },
-    });
-    // Answered elsewhere between the gateway's read and its answer: the daemon refuses it.
-    agent.question = pending;
-    fake().fail(`/v0/agents/${id}/question/q1/answer`, 409);
-    expect(await answer("q1")).toEqual(notPending);
-  });
-
-  test("a conversation without a model is conversation_has_no_model; another change that raced is conflict", async () => {
-    fake().agents.set("mnomodel", {
-      id: "mnomodel",
-      workspaceId: "chats",
-      parentAgentId: null,
-      status: "idle",
-      pendingQuestionId: null,
-      createdAt: 0,
-      archivedAt: null,
-    });
-    expect(
-      await call(nina, "POST", "/v1/conversations/mnomodel/messages", {
-        text: "hi",
-      }),
-    ).toEqual(
-      failed(
-        409,
-        "conversation_has_no_model",
-        "This conversation has no model. Start a new conversation.",
-      ),
-    );
-    fake().fail(`/v0/agents/${id}/abort`, 409);
-    expect(await call(nina, "POST", `/v1/conversations/${id}/abort`)).toEqual(
-      failed(409, "conflict", "That changed meanwhile. Try again."),
-    );
-    expect(await call(nina, "GET", "/v1/conversations/mmissing/messages")).toEqual(
-      failed(404, "not_found", "Not found."),
-    );
-  });
-
-  test("a failed turn's code and data come with its messages and its run", async () => {
-    const agent = fake().agents.get(id);
-    agent.runs = [
-      ...agent.runs,
-      {
-        id: "mfailedrun",
-        status: "failed",
-        reason: "error",
-        messages: [
-          {
-            id: "mfailedrunu",
-            role: "user",
-            createdAt: 1,
-            content: [{ type: "text", text: "hi" }],
-          },
-          {
-            id: "mfailedruns",
-            role: "service",
-            createdAt: 2,
-            content: [{ type: "text", text: "This conversation is too long." }],
-            error: {
-              code: "inference_failed",
-              mode: { providerId: "claude", modelId: "claude-code/haiku" },
-            },
-            failure: {
-              fallbackProviders: [],
-              kind: "context_too_long",
-              message: "This conversation is too long.",
-              modelId: "claude-code/haiku",
-            },
-          },
-        ],
-      },
-    ];
-    const page = (await call(nina, "GET", `/v1/conversations/${id}/messages`))
-      .body;
-    const failure = {
-      code: "context_too_long",
-      message: "This conversation is too long.",
-      params: { model: "claude-code/haiku" },
-    };
-    expect(page.messages.at(-1)).toMatchObject({ role: "error", failure });
-    expect(page.runs.at(-1)).toEqual({
-      id: "mfailedrun",
-      status: "failed",
-      failure,
-    });
-  });
-
-  test("and on the event stream, where a usage limit leaves the account connected", async () => {
-    const stream = await listen(nina);
-    await until(() => stream.updates().length >= PROVIDER_IDS.length);
-    fake().push("message.created", {
-      agentId: id,
-      runId: "mlimit",
-      message: {
-        id: "mlimits",
-        role: "service",
-        createdAt: Date.now(),
-        content: [{ type: "text", text: "Claude usage limit reached." }],
-        error: { code: "inference_failed", mode: { providerId: "claude" } },
-        failure: {
-          fallbackProviders: [],
-          kind: "usage_limit",
-          message: "Claude usage limit reached.",
-          provider: { id: "claude", type: "claude", vendorName: "Claude", label: "claude" },
-          resetsAt: Date.parse("2026-11-20T08:00:00Z"),
-        },
-      },
-    });
-    fake().push("run.finished", {
-      agentId: id,
-      run: { id: "mlimit", status: "failed" },
-    });
-    await until(() =>
-      stream.events.some(
-        (e) => e.event === "conversation.run" && e.data.run.id === "mlimit",
-      ),
-    );
-    stream.close();
-    const failure = {
-      code: "usage_limit",
-      message: "Claude usage limit reached.",
-      params: { provider: "claude", resetsAt: "2026-11-20T08:00:00.000Z" },
-    };
-    const of = (event: string) =>
-      stream.events.filter((e) => e.event === event).map((e) => e.data);
-    expect(of("conversation.message").at(-1).message.failure).toEqual(failure);
-    expect(of("conversation.run").at(-1).run).toEqual({
-      id: "mlimit",
-      status: "failed",
-      failure,
-    });
-    expect(
-      (await call(nina, "GET", "/v1/providers")).body.providers[0].status,
-    ).toBe("connected");
+  test("disconnect signs out, drops the key and restarts the agent", async () => {
+    await connectClaude("dis");
+    const r = await call("dis", "DELETE", "/v1/providers/claude");
+    expect(r.body.provider.status).toBe("not_connected");
+    expect(claudeSignIn.signedOut).toContain(keyOf("dis"));
+    expect(claude.released).toContain(keyOf("dis"));
   });
 });
 
+describe("conversations and turns", () => {
+  test("creating needs a connected account, an offered model and a valid effort", async () => {
+    expect(
+      (
+        await call("cc", "POST", "/v1/conversations", {
+          provider: "claude",
+          model: "claude-code/opus",
+        })
+      ).body.error,
+    ).toBe("signin_required");
+    await connectClaude("cc");
+    expect(
+      (
+        await call("cc", "POST", "/v1/conversations", {
+          provider: "claude",
+          model: "claude-code/imaginary",
+        })
+      ).body.error,
+    ).toBe("model_unavailable");
+    const e = await call("cc", "POST", "/v1/conversations", {
+      provider: "claude",
+      model: "claude-code/opus",
+      effort: "max",
+    });
+    expect(e.body).toMatchObject({
+      error: "invalid_effort",
+      params: { efforts: ["low", "high"] },
+    });
+    const c = await newConversation("cc", "claude-code/opus");
+    expect(c).toMatchObject({
+      provider: "claude",
+      model: "claude-code/opus",
+      effort: "high",
+      status: "idle",
+      title: null,
+    });
+  });
+
+  test("a turn: events in order, history from the store, hidden context never shown", async () => {
+    await connectClaude("turn");
+    const c = await newConversation("turn");
+    const s = await listen("turn");
+    const sent = await call(
+      "turn",
+      "POST",
+      `/v1/conversations/${c.id}/messages`,
+      { text: "Hi there\nsecond line", context: "Customer #42 is open" },
+    );
+    expect(sent.status).toBe(202);
+    expect(sent.body.message).toMatchObject({
+      role: "user",
+      text: "Hi there\nsecond line",
+    });
+    await s.until(
+      (e) =>
+        e.event === "conversation.run" && e.data.run.status === "completed",
+    );
+    const kinds = s.events
+      .filter((e) => e.event.startsWith("conversation."))
+      .map((e) => e.event);
+    expect(kinds.slice(0, 4)).toEqual([
+      "conversation.message",
+      "conversation.run",
+      "conversation.message",
+      "conversation.delta",
+    ]);
+    expect(claude.inputs.at(-1)!.text.startsWith(CONTEXT_OPEN)).toBe(true);
+    expect(claude.inputs.at(-1)!.session).toBeNull();
+    const m = await settled("turn", c.id);
+    expect(m.messages.map((x: any) => [x.role, x.text])).toEqual([
+      ["user", "Hi there\nsecond line"],
+      ["assistant", "Hello"],
+    ]);
+    expect(m.messages[1].tools).toEqual([
+      { id: "t1", name: "Bash", status: "completed" },
+    ]);
+    expect(m.runs).toEqual([
+      { id: sent.body.message.runId, status: "completed", failure: null },
+    ]);
+    expect(m.context).toEqual({
+      usedTokens: 1200,
+      limitTokens: 200_000,
+      approximate: false,
+    });
+    expect(m.usage).toEqual({
+      input: 1200,
+      output: 20,
+      cacheRead: 0,
+      cacheWrite: 0,
+    });
+    expect(m.conversation.title).toBe("Hi there");
+    // The next turn resumes the vendor's own session.
+    await call("turn", "POST", `/v1/conversations/${c.id}/messages`, {
+      text: "again",
+    });
+    await settled("turn", c.id);
+    expect(claude.inputs.at(-1)!.session).toBe("vendor-session-1");
+    s.close();
+  });
+
+  test("questions: announced, answered once, validated", async () => {
+    await connectClaude("ask");
+    const c = await newConversation("ask");
+    let answers: any;
+    claude.script = async (_i, sink) => {
+      answers = await sink.ask({
+        kind: "permission",
+        askedBy: "Claude Code",
+        context: null,
+        prompts: [
+          {
+            id: "p",
+            header: "Bash",
+            question: "Allow ls?",
+            multiSelect: false,
+            options: [
+              { label: "Allow once", description: null },
+              { label: "Deny", description: null },
+            ],
+          },
+        ],
+      });
+      return { status: "completed" };
+    };
+    const s = await listen("ask");
+    await call("ask", "POST", `/v1/conversations/${c.id}/messages`, {
+      text: "list",
+    });
+    const q = (await s.until((e) => e.event === "conversation.question")).data
+      .question;
+    const m = await call("ask", "GET", `/v1/conversations/${c.id}/messages`);
+    expect(m.body.conversation).toMatchObject({
+      status: "waiting_for_answer",
+      pendingQuestionId: q.id,
+    });
+    expect(m.body.question).toMatchObject({
+      id: q.id,
+      kind: "permission",
+      askedBy: "Claude Code",
+    });
+    expect(
+      (
+        await call(
+          "ask",
+          "POST",
+          `/v1/conversations/${c.id}/questions/${q.id}`,
+          { answer: "Maybe" },
+        )
+      ).body.error,
+    ).toBe("invalid_answer");
+    const ok = await call(
+      "ask",
+      "POST",
+      `/v1/conversations/${c.id}/questions/${q.id}`,
+      { answer: "Allow once" },
+    );
+    expect(ok.body.question.status).toBe("answered");
+    expect(
+      (
+        await call(
+          "ask",
+          "POST",
+          `/v1/conversations/${c.id}/questions/${q.id}`,
+          { answer: "Deny" },
+        )
+      ).body.error,
+    ).toBe("question_not_pending");
+    await settled("ask", c.id);
+    expect(answers).toEqual({ p: ["Allow once"] });
+    s.close();
+  });
+
+  test("abort ends the run as aborted; an unanswered question is cancelled", async () => {
+    await connectClaude("ab");
+    const c = await newConversation("ab");
+    claude.script = (_i, sink, signal) =>
+      new Promise((resolve) => {
+        void sink.ask({
+          kind: "question",
+          askedBy: null,
+          context: null,
+          prompts: [
+            {
+              id: "p",
+              header: null,
+              question: "Which?",
+              multiSelect: false,
+              options: [],
+            },
+          ],
+        });
+        signal.addEventListener("abort", () => resolve({ status: "aborted" }));
+      });
+    const s = await listen("ab");
+    await call("ab", "POST", `/v1/conversations/${c.id}/messages`, {
+      text: "go",
+    });
+    await s.until((e) => e.event === "conversation.question");
+    await call("ab", "POST", `/v1/conversations/${c.id}/abort`);
+    await s.until(
+      (e) =>
+        e.event === "conversation.question" &&
+        e.data.question.status === "cancelled",
+    );
+    const m = await settled("ab", c.id);
+    expect(m.runs.at(-1)).toMatchObject({
+      status: "aborted",
+      failure: { code: "aborted" },
+    });
+    s.close();
+  });
+
+  test("a lost sign-in fails the run and marks the provider not connected", async () => {
+    await connectClaude("lost");
+    const c = await newConversation("lost");
+    claude.script = async () => ({
+      status: "failed",
+      failure: fail.signinRequired("claude"),
+    });
+    await call("lost", "POST", `/v1/conversations/${c.id}/messages`, {
+      text: "hi",
+    });
+    const m = await settled("lost", c.id);
+    expect(m.messages.at(-1)).toMatchObject({
+      role: "error",
+      failure: { code: "signin_required", params: { provider: "claude" } },
+    });
+    expect(m.runs.at(-1).status).toBe("failed");
+    expect((await providerOf("lost", "claude")).status).toBe("not_connected");
+  });
+
+  test("a message sent during a turn runs after it", async () => {
+    await connectClaude("q");
+    const c = await newConversation("q");
+    const order: string[] = [];
+    claude.script = async (input) => {
+      order.push(`start ${input.text}`);
+      await Bun.sleep(100);
+      order.push(`end ${input.text}`);
+      return { status: "completed" };
+    };
+    await call("q", "POST", `/v1/conversations/${c.id}/messages`, {
+      text: "one",
+    });
+    await call("q", "POST", `/v1/conversations/${c.id}/messages`, {
+      text: "two",
+    });
+    await Bun.sleep(50);
+    await settled("q", c.id);
+    for (let i = 0; i < 50 && order.length < 4; i++) await Bun.sleep(20);
+    expect(order).toEqual(["start one", "end one", "start two", "end two"]);
+  });
+
+  test("list, search, page, rename, archive; one person never sees another's", async () => {
+    await connectClaude("lst");
+    const ids: string[] = [];
+    for (const t of ["alpha report", "beta plan", "gamma notes"]) {
+      const c = await newConversation("lst");
+      await call("lst", "PATCH", `/v1/conversations/${c.id}`, { title: t });
+      ids.push(c.id);
+      await Bun.sleep(5);
+    }
+    const page1 = await call("lst", "GET", "/v1/conversations?limit=2");
+    expect(page1.body.conversations).toHaveLength(2);
+    const page2 = await call(
+      "lst",
+      "GET",
+      `/v1/conversations?limit=2&cursor=${page1.body.nextCursor}`,
+    );
+    expect(page2.body.nextCursor).toBeNull();
+    const all = [...page1.body.conversations, ...page2.body.conversations].map(
+      (c: any) => c.id,
+    );
+    expect(new Set(all)).toEqual(new Set(ids));
+    expect(
+      (
+        await call("lst", "GET", "/v1/conversations?query=BETA")
+      ).body.conversations.map((c: any) => c.title),
+    ).toEqual(["beta plan"]);
+    expect(
+      (await call("other", "GET", `/v1/conversations/${ids[0]}/messages`))
+        .status,
+    ).toBe(404);
+    expect(
+      (await call("lst", "PATCH", `/v1/conversations/${ids[0]}`, { title: "" }))
+        .body.error,
+    ).toBe("invalid_request");
+    expect(
+      (await call("lst", "DELETE", `/v1/conversations/${ids[0]}`)).status,
+    ).toBe(204);
+    expect(
+      (await call("lst", "GET", `/v1/conversations/${ids[0]}/messages`)).status,
+    ).toBe(404);
+    expect(
+      (
+        await call("lst", "POST", `/v1/conversations/${ids[0]}/messages`, {
+          text: "x",
+        })
+      ).status,
+    ).toBe(404);
+  });
+});
+
+describe("MCP servers and instructions", () => {
+  test("registered servers reach the agent through the proxy, without the app's credential", async () => {
+    await connectClaude("mcp");
+    const put = await call("mcp", "PUT", "/v1/mcp-servers/crm", {
+      url: "https://crm.example/api/v1/mcp",
+      enabledTools: ["search"],
+    });
+    expect(put.status).toBe(201);
+    expect(
+      (
+        await call("mcp", "PUT", "/v1/mcp-servers/evil", {
+          url: "https://evil.example/mcp",
+        })
+      ).status,
+    ).toBe(400);
+    const c = await newConversation("mcp");
+    await call("mcp", "POST", `/v1/conversations/${c.id}/messages`, {
+      text: "hi",
+      mcpAuth: { crm: "Bearer app-secret" },
+    });
+    await settled("mcp", c.id);
+    const servers = claude.inputs.at(-1)!.mcpServers;
+    expect(servers).toHaveLength(1);
+    expect(servers[0]!.url).toBe(
+      `http://127.0.0.1:8790/mcp/${keyOf("mcp")}/crm`,
+    );
+    expect(servers[0]!.enabledTools).toEqual(["search"]);
+    expect(JSON.stringify(servers)).not.toContain("app-secret");
+    expect(
+      (await call("mcp", "GET", "/v1/mcp-servers")).body.servers[0],
+    ).toMatchObject({ name: "crm", hasCredential: true });
+    expect((await call("mcp", "DELETE", "/v1/mcp-servers/crm")).status).toBe(
+      204,
+    );
+    expect((await call("mcp", "GET", "/v1/mcp-servers")).body.servers).toEqual(
+      [],
+    );
+  });
+
+  test("instructions are kept by the gateway and written into the workspace", async () => {
+    expect((await call("ins", "GET", "/v1/instructions")).body.text).toBe("");
+    await call("ins", "PUT", "/v1/instructions", { text: "Answer in Polish." });
+    expect((await call("ins", "GET", "/v1/instructions")).body.text).toBe(
+      "Answer in Polish.",
+    );
+    const files = written
+      .filter((w) => w.key === keyOf("ins"))
+      .map((w) => `${w.dir}/${w.name}`);
+    expect(files).toEqual([
+      "/home/agent/projects/chats/AGENTS.md",
+      "/home/agent/projects/chats/CLAUDE.md",
+    ]);
+    await call("ins", "PUT", "/v1/instructions", { text: "" });
+    expect(execs.at(-1)).toEqual([
+      "rm",
+      "-f",
+      "/home/agent/projects/chats/AGENTS.md",
+      "/home/agent/projects/chats/CLAUDE.md",
+    ]);
+  });
+});
