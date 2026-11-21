@@ -26,7 +26,14 @@ import {
   type VerifiesApiKeys,
 } from "./agents/types";
 import type { ConversationRow, MessageRow, Store } from "./store";
-import { runtimeKey } from "./runtime";
+import { runtimeKey, SandboxRuntime } from "./runtime";
+import { loadConfig } from "./config";
+import { startEgress } from "./egress";
+import { ClaudeAgent } from "./agents/claude";
+import { CodexAgent } from "./agents/codex";
+import { ClaudeSignIn } from "./signin/claude";
+import { CodexSignIn } from "./signin/codex";
+import { Store as GatewayStore } from "./store";
 import { sseComment, sseEncode } from "./sse";
 
 /** What the gateway needs from the sandbox runtime beyond spawning processes. */
@@ -879,7 +886,10 @@ export function createGateway(cfg: Config, deps: GatewayDeps) {
     // A title given at creation is the conversation's generated title: renaming it to null
     // brings it back, and the first message does not replace it.
     if (clean) store.updateConversation(p.key, c.id, { autoTitle: clean });
-    return json({ conversation: conversationView(p, conversationOf(p, c.id)) }, 201);
+    return json(
+      { conversation: conversationView(p, conversationOf(p, c.id)) },
+      201,
+    );
   }
 
   function listConversations({ p, url }: Ctx) {
@@ -1362,3 +1372,79 @@ export function createGateway(cfg: Config, deps: GatewayDeps) {
 }
 
 export { HOME };
+
+/** Every agent and sign-in of a full Tandem, on one runtime and store. */
+export function standardAgents(
+  cfg: Config,
+  runtime: SandboxRuntime,
+  store: GatewayStore,
+) {
+  const apiKeys = {
+    get: (key: string, provider: any) => store.apiKey(key, provider),
+  };
+  const log = (...a: unknown[]) => console.log(...a);
+  return {
+    agents: [
+      new ClaudeAgent({ sandboxes: runtime, apiKeys, idleMs: cfg.idleMs }),
+      new CodexAgent(runtime, {
+        idleMs: cfg.idleMs,
+        log: (l: string) => log(l),
+      }),
+    ] as Agent[],
+    signIns: [
+      new ClaudeSignIn({ sandboxes: runtime }),
+      new CodexSignIn(runtime),
+    ] as SignIn[],
+  };
+}
+
+if (import.meta.main) {
+  const cfg = loadConfig();
+  const runtime = new SandboxRuntime(cfg);
+  // The egress proxy, then a test sandbox: a container without the rights to create sandboxes
+  // stops the gateway here, naming what is missing.
+  const posture = await startEgress(cfg, runtime.egressSocket())
+    .then(() => runtime.posture())
+    .catch((e) => {
+      console.error(`startup failed: ${(e as Error).message}`);
+      process.exit(1);
+    });
+  console.log(
+    `security: sandbox=${posture.sandbox} egress=${posture.egress} ` +
+      `limits=${posture.limits ? `${cfg.runtimeMemoryMb}MiB/${cfg.runtimePids}pids per person` : "none"} ` +
+      `data=${cfg.dataDir}`,
+  );
+  for (const w of posture.warnings) console.warn(`WARNING: ${w}`);
+  const store = new GatewayStore(join(cfg.dataDir, "tandem.db"));
+  const interrupted = store.failInterruptedRuns(fail.failed(), Date.now());
+  if (interrupted)
+    console.log(
+      `${interrupted} run(s) ended with the previous gateway process`,
+    );
+  const gateway = createGateway(cfg, {
+    runtime,
+    store,
+    ...standardAgents(cfg, runtime, store),
+  });
+  Bun.serve({
+    hostname: cfg.host,
+    port: cfg.port,
+    fetch: gateway.fetch,
+    idleTimeout: 255,
+  });
+  console.log(
+    `tandem gateway on ${cfg.host}:${cfg.port} (auth ${cfg.authMode}, idle ${cfg.idleMs / 60_000} min, permission mode ${cfg.permissionMode})`,
+  );
+  setInterval(() => gateway.idleSweep(), 30_000);
+  // The sandboxes live in this container: end them cleanly before it stops.
+  let stopping = false;
+  for (const signal of ["SIGTERM", "SIGINT"] as const)
+    process.on(signal, async () => {
+      if (stopping) return;
+      stopping = true;
+      await gateway.shutdown().catch(() => {});
+      await runtime.stopEverything().catch(() => {});
+      store.close();
+      process.exit(0);
+    });
+}
