@@ -30,6 +30,12 @@ afterAll(() => rmSync(work, { recursive: true, force: true }));
 
 function configWith(vars: Record<string, string>): Config {
   const saved = { ...process.env };
+  // Never the developer's own settings (Bun loads a local .env into process.env).
+  for (const k of Object.keys(process.env))
+    if (
+      /^(RUNTIME_|EGRESS_|DATA_DIR|MCP_|IDLE_|PERMISSION_|AUTH_|OIDC_)/.test(k)
+    )
+      delete process.env[k];
   Object.assign(process.env, {
     AUTH_MODE: "dev",
     DEV_AUTH_SECRET: "d".repeat(32),
@@ -68,7 +74,8 @@ function setup(
   const crun = join(dir, "crun.sh");
   writeFileSync(
     crun,
-    `#!/bin/sh\nFAKE_CRUN_STATE='${state}' exec '${process.execPath}' '${new URL("./fixtures/fake-crun.ts", import.meta.url).pathname}' "$@"\n`,
+    // From its own directory: Bun would load a developer's .env from the repository into it.
+    `#!/bin/sh\ncd '${dir}' || exit 1\nFAKE_CRUN_STATE='${state}' exec '${process.execPath}' '${new URL("./fixtures/fake-crun.ts", import.meta.url).pathname}' "$@"\n`,
     { mode: 0o755 },
   );
   const cgroupRoot = join(dir, "cgroup");
@@ -132,8 +139,13 @@ async function specSoon(t: ReturnType<typeof setup>, label: string) {
   for (const until = Date.now() + 5_000; ; await Bun.sleep(20)) {
     const call = t
       .calls()
-      .find((c) => c.args[0] === "run" && c.args.at(-1)!.includes(`-${label}-`));
-    if (call && existsSync(join(t.state, "configs", `${call.args.at(-1)}.json`)))
+      .find(
+        (c) => c.args[0] === "run" && c.args.at(-1)!.includes(`-${label}-`),
+      );
+    if (
+      call &&
+      existsSync(join(t.state, "configs", `${call.args.at(-1)}.json`))
+    )
       return t.configOf(call.args.at(-1)!);
     if (Date.now() > until) throw new Error(`no sandbox ${label}`);
   }
@@ -220,7 +232,7 @@ describe("a sandbox per process", () => {
       for (const c of t.calls())
         expect(
           c.env.filter(
-            (k) => !["FAKE_CRUN_STATE", "PWD", "SHLVL", "_"].includes(k),
+            (k) => !["FAKE_CRUN_STATE", "PWD", "OLDPWD", "SHLVL", "_"].includes(k),
           ),
         ).toEqual(["PATH"]);
     } finally {
