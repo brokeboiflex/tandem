@@ -38,9 +38,11 @@ The `/v1` API stays as README documents it, so applications (the CRM) do not cha
   stdio piped. (`crun exec` into a running sandbox is refused without `CAP_SYS_PTRACE`, which the
   gateway should not have.) `exec()` is the existing one-shot command.
 - **The person's cgroup** `/sandboxes/<prefix>-<key>` holds the person's limits (memory.max =
-  `RUNTIME_MEMORY_MB`, memory.high ≈ 80 % of it, pids.max = `RUNTIME_PIDS`, cpu.weight 100); each
-  process is a child cgroup `/sandboxes/<prefix>-<key>/<label>-<n>` with `memory.oom.group=1`. The
-  gateway's own leaf gets a higher cpu.weight and a memory.min.
+  `RUNTIME_MEMORY_MB`, pids.max = `RUNTIME_PIDS`, cpu.weight 100); each process is a child cgroup
+  `/sandboxes/<prefix>-<key>/<label>-<n>` with `memory.oom.group=1`. The gateway's own leaf gets a
+  higher cpu.weight and a memory.min. No memory.high: measured without swap, a runaway above it is
+  throttled for minutes instead of OOM-killed, and the person's other processes stall with it
+  (`evidence/sandbox-check.txt`).
 - **Relays.** Every sandbox starts under `tini` with `agent-run` (replaces `with-egress` and the
   Happy entrypoint): socat 127.0.0.1:4750 → `/run/tandem/egress.sock` (HTTPS_PROXY) and, when the
   person has MCP servers, 127.0.0.1:8790 → `/run/tandem/mcp.sock`; then `exec "$@"`. Base env:

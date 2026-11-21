@@ -111,12 +111,14 @@ RUN useradd --create-home --home-dir /home/agent --uid 10001 --user-group --shel
  && chmod 0700 /home/agent \
  && install -d -m 0755 /var/tmp/agent
 
-# The first program of every sandbox (src/runtime.ts).
-COPY --chmod=0755 runtime/agent-run /usr/local/bin/agent-run
-# Vendor settings every person's programs read from the system (docs/agent-layer.md): Claude Code's
-# managed settings and Codex's system config and requirements.
-COPY --chmod=0644 runtime/etc/claude-code/managed-settings.json /etc/claude-code/managed-settings.json
-COPY --chmod=0644 runtime/etc/codex/config.toml runtime/etc/codex/requirements.toml /etc/codex/
+# The first program of every sandbox (src/runtime.ts), and the vendor settings every person's
+# programs read from the system (docs/agent-layer.md): Claude Code's managed settings and Codex's
+# system config and requirements. (COPY --chmod would give the new directories the files' mode.)
+COPY runtime/agent-run /usr/local/bin/agent-run
+COPY runtime/etc/claude-code/managed-settings.json /etc/claude-code/
+COPY runtime/etc/codex/config.toml runtime/etc/codex/requirements.toml /etc/codex/
+RUN chmod 0755 /usr/local/bin/agent-run /etc/claude-code /etc/codex \
+ && chmod 0644 /etc/claude-code/managed-settings.json /etc/codex/config.toml /etc/codex/requirements.toml
 
 
 # Stripe's Smokescreen, the runtimes' egress proxy (src/egress.ts). Release binary pinned per

@@ -337,8 +337,9 @@ database of its own.
 - **Start-up:** a person's live state arrives about 1.2-1.7 seconds after their event stream opens,
   the first time included (2 vCPUs, no KVM).
 - **Limits:** each person's cgroup caps the memory and processes of all of their sandboxes
-  together; above 80 % of `RUNTIME_MEMORY_MB` the kernel reclaims their caches and slows them down,
-  and at the limit it ends one process tree (the one using the most), not the person's others. CPU is
+  together; at `RUNTIME_MEMORY_MB` the kernel first reclaims their caches, then ends one process tree
+  (the one using the most), not the person's others. There is deliberately no `memory.high`: without
+  swap it throttles a runaway instead of ending it, and the person's other processes with it. CPU is
   shared by weight (no per-person quota, which would only leave CPUs idle): the gateway's own cgroup
   weighs four times all sandboxes together and keeps 128 MiB protected from reclaim. The gateway sets
   this up inside its own container at startup (cgroup v2 hosts, which current Ubuntu and Debian are);

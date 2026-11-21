@@ -227,16 +227,17 @@ describe("the sandbox spec", () => {
 });
 
 describe("cgroup limits", () => {
-  test("the person's cgroup: their memory (80 % soft), processes and an equal CPU weight", () => {
+  test("the person's cgroup: their memory, processes and an equal CPU weight", () => {
     expect(personCgroupLimits(1024, 512)).toEqual({
       "memory.max": String(1024 * 2 ** 20),
-      "memory.high": String(819 * 2 ** 20),
       "memory.swap.max": "0",
       "pids.max": "512",
       "cpu.weight": "100",
     });
-    // No CPU quota: it would only leave CPUs idle.
+    // No CPU quota: it would only leave CPUs idle. No memory.high: without swap it throttles a
+    // runaway (and the person's other processes) instead of ending it.
     expect(personCgroupLimits(1024, 512)).not.toHaveProperty("cpu.max");
+    expect(personCgroupLimits(1024, 512)).not.toHaveProperty("memory.high");
   });
 
   test("the gateway's leaf weighs more than all sandboxes together and keeps a memory reserve", () => {

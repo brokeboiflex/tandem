@@ -1,0 +1,85 @@
+# scripts/sandbox-check.ts on the hetzner-like VM (2 vCPU, 4 GiB, arm64, no KVM, Ubuntu 24.04,
+# kernel 6.8.0-134, Docker 28), 2026-11-21, image built from this commit's Dockerfile:
+#   docker build -t tandem-sandbox:check .
+#   docker compose -p tandem-sandbox -f compose.yaml -f scripts/sandbox-check.compose.yaml \
+#     run --rm -T tandem
+# (its own Compose project and volume, compose.yaml's privileges: cap_add SYS_ADMIN, NET_ADMIN,
+# apparmor=unconfined, init; .env with AUTH_MODE=dev, random secrets and a fake SECRET).
+# The JSON lines are Smokescreen's own log of its decisions.
+
+sandbox check: kernel 6.8.0-134-generic, 2 CPUs, RUNTIME_MEMORY_MB=1024, RUNTIME_PIDS=512, key 1ed27c9a4a2247f17aef4b38
+PASS  the gateway's environment holds SECRET (a fake value)
+{"level":"info","msg":"Loading egress ACL from /var/lib/tandem/egress/acl.yaml","time":"2026-11-21T14:19:42.903425327Z"}
+{"level":"info","msg":"starting","time":"2026-11-21T14:19:42Z"}
+{"level":"info","listening_ip":"127.0.0.1","listening_port":4750,"local_ips":["127.0.0.1","::1","172.19.0.2"],"msg":"Self-connection detection initialized","time":"2026-11-21T14:19:42Z"}
+PASS  a killed gateway leaves its sandbox running (the situation setup must clean up)
+        crun: tandem-1ed27c9a4a2247f17aef4b38-left-20-2; cgroups: left-20-2
+PASS  setup deleted the leftover sandbox, its cgroups, bundles and temporary files
+        crun list: []; log: removed 1 sandbox(es) left from an earlier run
+PASS  per-person limits are on (cgroups delegated)
+PASS  the gateway runs in its own leaf with cpu.weight 400 and memory.min 128 MiB
+        cgroup 0::/gateway, cpu.weight 400, memory.min 134217728
+PASS  two processes of one person run at once, each a sandbox of its own and a child of the person's cgroup
+        sandboxes: tandem-1ed27c9a4a2247f17aef4b38-a-6-2, tandem-1ed27c9a4a2247f17aef4b38-b-6-3; /sys/fs/cgroup/sandboxes/tandem-1ed27c9a4a2247f17aef4b38: b-6-3, a-6-2
+PASS  the person's cgroup holds their limits; each sandbox has memory.oom.group 1
+        memory.max 1073741824, memory.high max, pids.max 512, cpu.weight 100, leaves oom.group 1,1, leaves cpu.max max 100000,max 100000
+PASS  process a: the person's uid 100000, no capabilities, NoNewPrivs 1, seccomp filter, oom_score_adj 500, PID 1 is tini
+        uid=100000 pid=2 | CapInh:	0000000000000000 | CapPrm:	0000000000000000 | CapEff:	0000000000000000 | CapBnd:	0000000000000000 | CapAmb:	0000000000000000 | NoNewPrivs:	1 | Seccomp:	2 | 0::/ | init=tini | 500
+PASS  process b: the person's uid 100000, no capabilities, NoNewPrivs 1, seccomp filter, oom_score_adj 500, PID 1 is tini
+        uid=100000 pid=2 | CapInh:	0000000000000000 | CapPrm:	0000000000000000 | CapEff:	0000000000000000 | CapBnd:	0000000000000000 | CapAmb:	0000000000000000 | NoNewPrivs:	1 | Seccomp:	2 | 0::/ | init=tini | 500
+PASS  agent-run made the working directory as the person
+PASS  a sandbox's environment is the base set plus what the agent passes; the gateway's SECRET is absent
+        variables: ANTHROPIC_API_KEY HOME HTTPS_PROXY HTTP_PROXY NO_PROXY OLDPWD PATH PWD TMPDIR http_proxy https_proxy no_proxy
+{"allow":true,"decision_reason":"host matched allowed domain in rule","dns_lookup_time_ms":9,"enforce_would_deny":false,"id":"dc0qh0f53k2s70bujg60","inbound_remote_addr":"127.0.0.1:44480","level":"info","msg":"CANONICAL-PROXY-DECISION","project":"tandem","proxy_type":"connect","requested_host":"api.anthropic.com:443","role":"","start_time":"2026-11-21T14:19:45.216907161Z","time":"2026-11-21T14:19:45Z","trace_id":""}
+{"bytes_in":4993,"bytes_out":1896,"conn_establish_time_ms":10,"duration":0.164766755,"end_time":"2026-11-21T14:19:45.402110362Z","error":"","id":"dc0qh0f53k2s70bujg60","inbound_remote_addr":"127.0.0.1:44480","last_activity":"2026-11-21T14:19:45.400428642Z","level":"info","msg":"CANONICAL-PROXY-CN-CLOSE","outbound_local_addr":"172.19.0.2:46802","outbound_remote_addr":"160.79.104.10:443","project":"tandem","proxy_type":"connect","requested_host":"api.anthropic.com:443","role":"","start_time":"2026-11-21T14:19:45.216907161Z","time":"2026-11-21T14:19:45Z","trace_id":""}
+PASS  an allowlisted host (api.anthropic.com) answers through the egress proxy
+        HTTP 401 
+{"allow":false,"content_length":79,"decision_reason":"default rule policy used","dns_lookup_time_ms":0,"enforce_would_deny":true,"id":"dc0qh0f53k2s70bujg6g","inbound_remote_addr":"127.0.0.1:44496","level":"warning","msg":"CANONICAL-PROXY-DECISION","project":"tandem","proxy_type":"connect","requested_host":"example.com:443","role":"","start_time":"2026-11-21T14:19:45.450072661Z","status_code":407,"time":"2026-11-21T14:19:45Z","trace_id":""}
+PASS  a host outside the allowlist (example.com) is refused by the proxy
+        exit 56, curl: (56) CONNECT tunnel failed, response 407
+PASS  without the proxy there is no network at all
+        exit 6, curl: (6) Could not resolve host: api.anthropic.com
+PASS  a spawned process reaches the MCP socket at 127.0.0.1:8790 (not through the egress proxy)
+        mcp-ok /mcp/1ed27c9a4a2247f17aef4b38/stub 
+PASS  the MCP socket belongs to the person, mode 600
+        100000 600
+PASS  a one-shot command does not get the MCP socket
+        exit 7 curl: (7) Failed to connect to 127.0.0.1 port 8790 after 0 ms: Could not connect to server
+PASS  a process tree allocating beyond RUNTIME_MEMORY_MB (1024 MiB) is OOM-killed with its whole group
+        exit 137 after 322 ms; person memory.peak 1073741824; memory.events: low 0, high 0, max 20, oom 1, oom_kill 7, oom_group_kill 1
+PASS  the person's other process and the gateway survive
+        keep running: true
+PASS  kill() ends a program that honours TERM at once
+        exit 143 3 ms after kill()
+PASS  kill() kills a program that ignores TERM after the grace period (5000 ms)
+        exit 137 after 5014 ms
+PASS  Claude Code's managed settings are in place (env, sandbox off)
+PASS  Codex: plugins and apps stay off although the person's own config enables plugins
+        apps                                     stable             false | plugins                                  stable             false
+PASS  goose and Claude Code run in a sandbox
+         1.60.2 | 2.1.321 (Claude Code) | 
+PASS  src/cli.ts exec runs as the person and does not end or sweep the gateway's sandboxes
+        cli exit 0 out 100000 ; live still running: true
+PASS  stopAll ends every sandbox of the person and leaves no sandbox, cgroup or temporary directory
+        exits 143, 137; left: []; cgroup exists: false
+PASS  stopEverything leaves no sandbox and no person cgroup of this instance
+
+all checks passed
+CHECK EXIT 0
+
+# ------------------------------------------------------------------------------------------------
+# The same check one revision earlier, with memory.high at 80 % of memory.max on the person's
+# cgroup (as first designed). The allocation was not OOM-killed within 60 s: it sat throttled at
+# 933 MiB, between memory.high (819 MiB) and memory.max (1024 MiB), memory.events counting `high`
+# events and no `oom`; meanwhile the person's next sandboxes stalled while starting (the kill check
+# below found its sandbox not yet created after 5 s), and the run had to be stopped. memory.high is
+# therefore not set (src/security.ts, personCgroupLimits). Excerpt:
+
+FAIL  a process tree allocating beyond RUNTIME_MEMORY_MB (1024 MiB) is OOM-killed with its whole group
+        exit undefined after undefined ms; person memory.events: low 0, high 3586, max 0, oom 0, oom_kill 0, oom_group_kill 0
+PASS  the person's other process and the gateway survive
+        keep running: true
+FAIL  kill() ends a program that honours TERM at once
+        exit null after 5513 ms
+# Seen in the stalled container afterwards: the hog still running, memory.current 933617664,
+# memory.events high 6408, oom 0, oom_kill 0.

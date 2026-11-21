@@ -362,12 +362,12 @@ describe("the person's cgroup and temporary directory", () => {
     const b = await t.rt.spawn(KEY, ["sleep", "30"], { label: "b" });
     const person = join(t.cgroupRoot, "sandboxes", `tandem-${KEY}`);
     const read = (f: string) => readFileSync(join(person, f), "utf8");
-    expect([
-      read("memory.max"),
-      read("memory.high"),
-      read("pids.max"),
-      read("cpu.weight"),
-    ]).toEqual([String(768 * 2 ** 20), String(614 * 2 ** 20), "300", "100"]);
+    expect([read("memory.max"), read("pids.max"), read("cpu.weight")]).toEqual([
+      String(768 * 2 ** 20),
+      "300",
+      "100",
+    ]);
+    expect(existsSync(join(person, "memory.high"))).toBe(false);
     expect(read("cgroup.subtree_control")).toBe("+memory +pids +cpu");
     for (const label of ["a", "b"]) {
       const c = await specSoon(t, label);

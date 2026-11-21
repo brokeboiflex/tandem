@@ -254,16 +254,18 @@ const MIB = 1024 * 1024;
 
 /**
  * The person's cgroup (`/sandboxes/<prefix>-<key>`): every sandbox of theirs is a child, so these
- * limits hold for all of their processes together. memory.high (80 %) makes the kernel reclaim
- * their caches and slow them down before memory.max ends a process tree; equal cpu.weight shares
- * the CPUs fairly between people under contention without capping an idle server (a cpu.max quota
- * of N CPUs caps nothing on a host with N or fewer). memory.swap.max, where the host has swap
- * accounting, keeps the memory limit from spilling into swap.
+ * limits hold for all of their processes together. At memory.max the kernel first reclaims the
+ * person's caches, then ends the process tree using the most (memory.oom.group). No memory.high:
+ * without swap, a runaway above it is throttled instead of ended, and the person's other processes
+ * with it (measured: a 1.2 GiB allocation under a 1 GiB limit with memory.high at 80 % sat at
+ * 933 MiB for minutes, never OOM-killed, and the person's new sandboxes stalled while starting).
+ * Equal cpu.weight shares the CPUs fairly between people under contention without capping an idle
+ * server (a cpu.max quota of N CPUs caps nothing on a host with N or fewer). memory.swap.max, where
+ * the host has swap accounting, keeps the limit from spilling into swap.
  */
 export function personCgroupLimits(memoryMb: number, pids: number) {
   return {
     "memory.max": String(memoryMb * MIB),
-    "memory.high": String(Math.floor(memoryMb * 0.8) * MIB),
     "memory.swap.max": "0",
     "pids.max": String(pids),
     "cpu.weight": "100",
