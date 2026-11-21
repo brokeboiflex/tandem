@@ -11,7 +11,8 @@ repository does not contain or redistribute any of them.
 | Codex CLI | 0.160.1, x86_64 musl | Apache-2.0 | `https://github.com/openai/codex/releases/download/rust-v0.160.1/codex-x86_64-unknown-linux-musl.tar.gz` | sha256 `9226581be592d18f7e7f740a352fdb63aa61e45e39f7eb9b09d3888c84bba33f` |
 | Codex code-mode host | 0.160.1, aarch64 musl | Apache-2.0 | `https://github.com/openai/codex/releases/download/rust-v0.160.1/codex-code-mode-host-aarch64-unknown-linux-musl.tar.gz` | sha256 `e5e027e6689efda2e3570aa600179f0ebb18632803350e152ed6c9b97dcf9741` |
 | Codex code-mode host | 0.160.1, x86_64 musl | Apache-2.0 | `https://github.com/openai/codex/releases/download/rust-v0.160.1/codex-code-mode-host-x86_64-unknown-linux-musl.tar.gz` | sha256 `8a69207d97545ac753b6585974e1e67a4c51ae5deacf06517db512bb25e0e3c2` |
-| Claude Code | 2.1.321, linux-arm64 and linux-x64 | Anthropic's proprietary terms (not open source) | Anthropic's official npm packages `@anthropic-ai/claude-code-linux-arm64@2.1.321` and `@anthropic-ai/claude-code-linux-x64@2.1.321` | sha512 `137efddf…c430952` and `956f8c85…87abb` (full values in `Dockerfile`) |
+| Claude Code | 2.1.330, linux-arm64 and linux-x64 | Anthropic's proprietary terms (not open source) | Anthropic's official npm packages `@anthropic-ai/claude-code-linux-arm64@2.1.330` and `@anthropic-ai/claude-code-linux-x64@2.1.330` | sha512 `578c9a9c…113dcb0` and `f469fe57…ec19ecd` (full values in `Dockerfile`) |
+| Claude Agent SDK | 0.3.330 (gateway dependency, without its optional packages) | Anthropic's proprietary terms (not open source) | npm `@anthropic-ai/claude-agent-sdk@0.3.330` | locked in `bun.lock` |
 | Grok CLI (Grok Build) | 1.0.89, linux-aarch64 | Source Apache-2.0 (`github.com/xai-org/grok-build`); xAI's release build, used under xAI's terms | `https://x.ai/cli/grok-1.0.89-linux-aarch64.gz` | sha256 `20496afea9dcec8ff1a3e3742a2966980888770d4ee845f80e5f0e5db56acb8b` |
 | Grok CLI (Grok Build) | 1.0.89, linux-x86_64 | Source Apache-2.0 (`github.com/xai-org/grok-build`); xAI's release build, used under xAI's terms | `https://x.ai/cli/grok-1.0.89-linux-x86_64.gz` | sha256 `404456474906572060fa36745266caf1e967e9084e656da9572b42d35febf342` |
 | Antigravity CLI (`agy`) | 1.5.11, linux-arm64 | Google's proprietary terms (not open source) | `https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.11-6132547114106880/linux-arm/cli_linux_arm64.tar.gz` | sha512 `5f703c88…13600585` (vendor manifest; full value in `Dockerfile`) |
@@ -46,3 +47,12 @@ Google's release manifest; Tandem runs it only on a person's own Gemini API key,
 Antigravity sign-in. Both are downloaded from their vendors when *you* build the runtime image and
 never redistributed by this repository, and the same rule applies: do not publish prebuilt Tandem
 images. Their use is governed by xAI's and Google's terms (see README, Vendor terms).
+
+## Happy Agent
+
+Earlier Tandem versions ran [Happy Agent](https://github.com/slopus/happy-agent) (MIT) in every
+workspace. Tandem no longer downloads or runs it, but its vendor integrations were the map for
+Tandem's own (`src/agents/`, `src/signin/`): how it drives the Claude Agent SDK, `codex app-server`,
+ACP agents and the vendors' sign-in CLIs. Happy Agent's copyright and permission notice:
+"Copyright (c) 2026 rig Contributors. Permission is hereby granted, free of charge, to any person
+obtaining a copy of this software …" (MIT; full text in its repository's `LICENSE`).

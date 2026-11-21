@@ -1,8 +1,8 @@
 // Application MCP servers: per-person registrations, the per-person credentials an application
-// sends with each message, and the proxy that runtimes reach those servers through.
+// sends with each message, and the proxy that a person's agents reach those servers through.
 //
-// A runtime never sees an application credential. Its MCP configuration names only the gateway
-// proxy, which it authenticates to with a per-runtime token. The proxy forwards each request to the
+// An agent never sees an application credential. Its MCP configuration names only the gateway
+// proxy, which it authenticates to with a per-person token. The proxy forwards each request to the
 // registered upstream URL with the person's latest credential, held in this process's memory only.
 import { createHmac, timingSafeEqual } from "node:crypto";
 
@@ -12,14 +12,7 @@ const TOOL_RE = /^[A-Za-z0-9_.-]{1,128}$/;
 const KEY_RE = /^[0-9a-f]{24}$/;
 export const MAX_SERVERS = 20;
 export const MAX_CREDENTIAL = 8192;
-/** Where the gateway keeps a person's registrations and the MCP config template. */
-export const MCP_DIR = "/home/agent/.agent-runtime";
-export const REGISTRY_FILE = "mcp-servers.json";
-export const TEMPLATE_FILE = "mcp.toml";
-/** The runtime entrypoint replaces this with MCP_PROXY_URL when it installs mcp.toml. */
-export const PROXY_URL_PLACEHOLDER = "@MCP_PROXY_URL@";
-export const PROXY_TOKEN_ENV = "MCP_PROXY_TOKEN";
-/** Happy's longest startup timeout (600 s); a request waiting for a credential ends before it. */
+/** How long the proxy holds a handshake that waits for the person's first credential. */
 const STARTUP_TIMEOUT_SEC = 600;
 const HOLD_MS = (STARTUP_TIMEOUT_SEC - 15) * 1000;
 const MAX_BODY = 4 * 1024 * 1024;
@@ -87,64 +80,7 @@ export function parseServer(
 // They decide where that person's credentials are sent, so the gateway signs them: a file the
 // agent edited is ignored.
 
-const registryMac = (secret: string, key: string, servers: McpServer[]) =>
-  createHmac("sha256", secret)
-    .update(`mcp-servers\0${key}\0${JSON.stringify(servers)}`)
-    .digest("hex");
-
-export function sealRegistry(
-  secret: string,
-  key: string,
-  servers: McpServer[],
-) {
-  return `${JSON.stringify({ version: 1, servers, mac: registryMac(secret, key, servers) })}\n`;
-}
-
-/** The registrations in a sealed file; `null` when the file was changed outside the gateway. */
-export function openRegistry(
-  secret: string,
-  key: string,
-  text: string,
-): McpServer[] | null {
-  if (!text.trim()) return [];
-  try {
-    const { servers, mac } = JSON.parse(text);
-    if (!Array.isArray(servers) || typeof mac !== "string") return null;
-    const expected = Buffer.from(registryMac(secret, key, servers));
-    const given = Buffer.from(mac);
-    if (given.length !== expected.length || !timingSafeEqual(given, expected))
-      return null;
-    return servers;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Happy's `mcp.toml` for these registrations: every server is the gateway proxy, authenticated
- * with the runtime's proxy token from the daemon environment. No upstream URL or credential.
- */
-export function renderMcpToml(servers: McpServer[]) {
-  const lines = [
-    "# Installed by the runtime entrypoint from the gateway's template on every start.",
-    "# Every server is the gateway's MCP proxy; the application's own credentials never come here.",
-  ];
-  for (const s of servers) {
-    lines.push(
-      "",
-      `[mcp_servers.${s.name}]`,
-      `url = "${PROXY_URL_PLACEHOLDER}/${s.name}"`,
-      `bearer_token_env_var = "${PROXY_TOKEN_ENV}"`,
-      // A server waits at the proxy until its first credential arrives, instead of failing.
-      `startup_timeout_sec = ${STARTUP_TIMEOUT_SEC}`,
-    );
-    if (s.enabledTools)
-      lines.push(`enabled_tools = ${JSON.stringify(s.enabledTools)}`);
-  }
-  return `${lines.join("\n")}\n`;
-}
-
-/** The token a runtime presents to the proxy. Derived, so it survives gateway restarts. */
+/** The token a person's agents present to the proxy. Derived, so it survives gateway restarts. */
 export function proxyToken(secret: string, key: string) {
   return createHmac("sha256", secret)
     .update(`mcp-proxy:${key}`)
@@ -347,8 +283,8 @@ export class McpProxy {
           !registration.enabledTools.includes(x.params?.name)
         )
           return synthesize(body!, COPY.disabled(name, String(x.params?.name)));
-    // A connection being set up waits for the person's first credential; Happy would otherwise
-    // mark the server failed and retry it only later.
+    // A connection being set up waits for the person's first credential; an agent would otherwise
+    // mark the server failed and retry it only later, if at all.
     const handshake = has("initialize");
     const deadline = Date.now() + (this.deps.holdMs ?? HOLD_MS);
     for (;;) {
@@ -387,8 +323,8 @@ export class McpProxy {
       }
       if (upstream.status === 401) {
         await upstream.body?.cancel().catch(() => {});
-        // That credential is spent. Never answer 401 to the runtime: Happy would stop using the
-        // server until it restarts. Drop it, unless a newer one arrived meanwhile.
+        // That credential is spent. Never answer 401 to an agent: it would stop using the server
+        // until it restarts. Drop it, unless a newer one arrived meanwhile.
         const map = this.#credentials.get(key);
         if (map?.get(name) === credential) map.delete(name);
         if (!body) return withoutCredential(req.method);
