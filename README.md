@@ -76,12 +76,11 @@ Checks:
 ```sh
 bun run typecheck && bun test       # unit tests (fake vendor programs and crun, real claude/codex when
                                     # installed, scripted vendor APIs, a stub MCP server)
-bun scripts/e2e.ts                  # against the running container (restarts it once): sign-ins, isolation
-                                    # probes from inside the sandboxes, the MCP proxy; its stub MCP server
-                                    # needs MCP_ALLOWED_ORIGINS=http://host.docker.internal:8791 and, on
-                                    # Linux, extra_hosts: ["host.docker.internal:host-gateway"]
-E2E_REAL_SUBJECT=<person> bun scripts/e2e.ts   # plus real turns, MCP tool calls included, for a person
-                                    # whose home holds real sign-ins
+sudo BUN=$HOME/.bun/bin/bun scripts/e2e/run.sh   # on a Docker host: builds the image, starts it with
+                                    # scripted vendor APIs, and drives /v1 for all five providers (sign-in,
+                                    # turns with shell commands in the sandboxes, questions, abort, MCP
+                                    # through the proxy, restarts, isolation probes), then measures capacity;
+                                    # output in evidence/e2e.txt and evidence/capacity.txt
 bun scripts/page-check.ts           # drives /connect in headless Chromium, screenshots to evidence/
                                     # (BROWSER_EXECUTABLE=/path/to/chromium if Playwright has none)
 ```
@@ -341,15 +340,21 @@ files (what lets a later turn resume a conversation) and the agents' working fol
 
 ### Capacity
 
-Measured on a 2-vCPU, no-KVM VM like the target servers (`evidence/`):
+Measured with the real image and gateway on a 2-vCPU, 4 GiB, no-KVM, no-swap VM like the target
+servers, against scripted vendor APIs (`evidence/capacity.txt`):
 
-- **A person between uses** costs no process and no memory: only their home and their rows in the store.
-- **During a turn** the person runs one vendor program, plus what its tools start. Each person's peak in
-  the per-vendor proofs: Claude Code 229-313 MiB, Codex 85 MiB, Antigravity 137 MiB, goose 70 MiB, Grok
-  Build 19 MiB (`evidence/claude-agent.txt`, `codex-agent.txt`, `acp-agents.txt`). A turn with one
-  shell command took 70-370 ms against a scripted vendor API, so the vendor's own response time is what
-  a person notices.
-- **The gateway** and the egress proxy hold a few tens of MiB.
+- **The image** is 1.80 GB (Tandem 0.3 with Happy Agent: 2.11 GB). **The gateway at rest** (with the
+  egress proxy) uses 47 MiB.
+- **A person between uses** costs no process: 15 connected people without a turn ran none. A vendor
+  program that ran a turn (or read the account) stays for `IDLE_MINUTES`, then ends.
+- **A turn** starts the vendor's program in about 0.1-0.2 s (median cold first turn: Claude 216 ms,
+  Codex 143, Grok 91, OpenRouter 178, Gemini 192; later turns 10-30 ms of Tandem), so the model's own
+  response time is what a person notices. Each person's peak while a program runs: Claude Code
+  143-176 MiB, Antigravity 112-138, goose 68-70, Codex 21-31, Grok Build 12-14.
+- **Many at once:** 5 people starting their first Claude turn at the same moment finished in under a
+  second, with the whole container at 845 MiB (about 155 MiB per person); 5 people on the five
+  providers at once peaked at 442 MiB. Nothing was killed. Size a server by the people active within
+  `IDLE_MINUTES` of each other: roughly 155 MiB each for Claude Code, less for the others.
 - **Limits:** each person's cgroup caps the memory and processes of all of their sandboxes
   together; at `RUNTIME_MEMORY_MB` the kernel first reclaims their caches, then ends one process tree
   (the one using the most), not the person's others. There is deliberately no `memory.high`: without
@@ -515,9 +520,11 @@ containing them must not be published. See `THIRD_PARTY.md`.
 - Pinned to the Claude Agent SDK 0.3.330, Claude Code 2.1.330, Codex 0.160.1, Grok Build 1.0.89, the
   Antigravity CLI 1.5.11, goose 1.60.2 and Smokescreen 0.1.0, for linux/arm64 and linux/amd64; crun
   comes from Debian trixie. Only linux/arm64 has been run.
-- Verified against scripted vendor APIs in real sandboxes, not yet with real accounts: Claude's sign-in
-  page and plan names, Claude Code's `auto` classifier, real usage-limit texts, the Codex, Grok and
-  Gemini model catalogs, and every vendor's account e-mail and plan.
+- Verified end to end against scripted vendor APIs in real sandboxes (`evidence/e2e.txt`), not yet with
+  real accounts: Claude's sign-in page and plan names, Claude Code's `auto` classifier (it asks
+  Anthropic's server, which a scripted API cannot stand in for; Claude's shell, questions and abort were
+  run under `workspace_write`), streamed text over the vendors' HTTPS, real usage-limit texts, the
+  Codex, Grok and Gemini model catalogs, and every vendor's account e-mail and plan.
 - A conversation's title is its first message's first line (or the `title` given at creation); set a
   `title` (or `PATCH` it) when that line must not show up in lists.
 - Antigravity and Grok Build cannot be limited to `enabledTools` themselves; the MCP proxy still refuses
