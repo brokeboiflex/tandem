@@ -459,7 +459,9 @@ export function createGateway(cfg: Config, deps: GatewayDeps) {
       (currentEffort && m.efforts.includes(currentEffort)
         ? currentEffort
         : m.defaultEffort);
-    if (!chosen || !m.efforts.includes(chosen))
+    // No effort named and none by default (Claude Code picks its own): the vendor decides.
+    if (!chosen) return { model: m.id, effort: null };
+    if (!m.efforts.includes(chosen))
       throw new HttpError(
         422,
         "invalid_effort",

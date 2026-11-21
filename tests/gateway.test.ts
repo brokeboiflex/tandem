@@ -29,7 +29,7 @@ import type {
 } from "../src/agents/types";
 import { CONTEXT_OPEN } from "../src/providers";
 import { fail } from "../src/agents/failures";
-import { FakeAgent, FakeSignIn, execs, fakeRuntime, written } from "./fakes";
+import { FakeAgent, FakeSignIn, MODELS, execs, fakeRuntime, written } from "./fakes";
 
 setDefaultTimeout(20_000);
 const dir = mkdtempSync(join(tmpdir(), "tandem-gw-"));
@@ -722,4 +722,18 @@ describe("MCP servers and instructions", () => {
       "/home/agent/projects/chats/CLAUDE.md",
     ]);
   });
+});
+
+test("a model without a default effort leaves the effort to the vendor unless one is named", async () => {
+  const saved = MODELS.claude[1]!.defaultEffort;
+  (MODELS.claude[1] as any).defaultEffort = null;
+  try {
+    await connectClaude("eff");
+    const r = await call("eff", "POST", "/v1/conversations", { provider: "claude", model: "claude-code/opus" });
+    expect(r.body.conversation.effort).toBeNull();
+    const named = await call("eff", "POST", "/v1/conversations", { provider: "claude", model: "claude-code/opus", effort: "low" });
+    expect(named.body.conversation.effort).toBe("low");
+  } finally {
+    (MODELS.claude[1] as any).defaultEffort = saved;
+  }
 });
