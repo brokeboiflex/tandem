@@ -33,6 +33,8 @@ import { ClaudeAgent } from "./agents/claude";
 import { CodexAgent } from "./agents/codex";
 import { ClaudeSignIn } from "./signin/claude";
 import { CodexSignIn } from "./signin/codex";
+import { acpAgents } from "./agents/acp-vendors";
+import { GrokSignIn } from "./signin/grok";
 import { Store as GatewayStore } from "./store";
 import { sseComment, sseEncode } from "./sse";
 
@@ -576,6 +578,7 @@ export function createGateway(cfg: Config, deps: GatewayDeps) {
             model: c.model,
             effort: c.effort,
             session: c.session,
+            usage: c.usage,
             text,
             mcpServers: agentServers(p),
             permissionMode: cfg.permissionMode as any,
@@ -1390,10 +1393,12 @@ export function standardAgents(
         idleMs: cfg.idleMs,
         log: (l: string) => log(l),
       }),
+      ...acpAgents({ sandboxes: runtime, apiKeys, idleMs: cfg.idleMs }),
     ] as Agent[],
     signIns: [
       new ClaudeSignIn({ sandboxes: runtime }),
       new CodexSignIn(runtime),
+      new GrokSignIn({ sandboxes: runtime }),
     ] as SignIn[],
   };
 }
