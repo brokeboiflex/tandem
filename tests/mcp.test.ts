@@ -859,7 +859,8 @@ describe("conversations: paging, search, rename, archive", () => {
         })
       ).status,
     ).toBe(400);
-    // The person's own title wins over the one generated from the first message; null goes back to it.
+    // The person's own title wins; null goes back to the generated one, which is the title given
+    // at creation ("Weekly plan") and is not replaced by the first message.
     await turn(
       { token: dave.token, conversation: more[1]! },
       { text: "Weekly plan for the team\nwith the details" },
@@ -874,7 +875,7 @@ describe("conversations: paging, search, rename, archive", () => {
           title: null,
         })
       ).body.conversation.title,
-    ).toBe("Weekly plan for the team");
+    ).toBe("Weekly plan");
     expect(
       (
         await call(bob.token, "PATCH", `/v1/conversations/${more[1]}`, {
