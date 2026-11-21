@@ -1,0 +1,12 @@
+# Runs scripts/sandbox-check.ts in a Tandem container with exactly compose.yaml's privileges, as its
+# own Compose project next to any running Tandem:
+#   docker build -t tandem-sandbox:check .
+#   docker compose -p tandem-sandbox -f compose.yaml -f scripts/sandbox-check.compose.yaml \
+#     run --rm -T tandem
+# .env needs AUTH_MODE=dev, DEV_AUTH_SECRET, SERVICE_SECRET, TANDEM_IMAGE=tandem-sandbox:check and
+# a fake SECRET, which must not reach any sandbox.
+services:
+  tandem:
+    volumes:
+      - ./scripts:/app/scripts:ro
+    command: ["bun", "scripts/sandbox-check.ts"]

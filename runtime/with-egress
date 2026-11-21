@@ -1,5 +1,0 @@
-#!/bin/sh
-# with-egress CMD...: runs CMD in a one-shot sandbox (src/runtime.ts) with the egress relay that the
-# daemon's entrypoint also starts, so vendor CLIs reach the egress proxy through HTTPS_PROXY.
-socat TCP-LISTEN:4750,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:/run/tandem/egress.sock 2>/dev/null &
-exec "$@"

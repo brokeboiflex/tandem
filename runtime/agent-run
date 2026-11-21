@@ -1,0 +1,32 @@
+#!/bin/sh
+# agent-run DIR CMD...: the first program in every sandbox (src/runtime.ts, under tini), run as the
+# person. The sandbox has loopback only; its ways out are the gateway's sockets at /run/tandem,
+# relayed here to loopback ports: the egress proxy (HTTPS_PROXY) and, when the person's MCP socket is
+# mounted, their MCP proxy. Then CMD replaces this script, in DIR (made if missing).
+set -eu
+dir=$1
+shift
+
+# PORT SOCKET: relays 127.0.0.1:PORT to SOCKET, and returns once it listens, so CMD's first
+# connection does not race the relay.
+relay() {
+  socat "TCP-LISTEN:$1,bind=127.0.0.1,fork,reuseaddr" "UNIX-CONNECT:$2" 2>/dev/null &
+  port=$(printf '%04X' "$1")
+  tries=0
+  until grep -q "0100007F:$port 00000000:0000 0A" /proc/net/tcp; do
+    tries=$((tries + 1))
+    if [ "$tries" -gt 500 ]; then
+      echo "agent-run: the relay on 127.0.0.1:$1 did not start" >&2
+      exit 1
+    fi
+    sleep 0.01
+  done
+}
+
+relay 4750 /run/tandem/egress.sock
+if [ -S /run/tandem/mcp.sock ]; then
+  relay 8790 /run/tandem/mcp.sock
+fi
+mkdir -p "$dir"
+cd "$dir"
+exec "$@"

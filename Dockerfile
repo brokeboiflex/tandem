@@ -1,9 +1,9 @@
-# Tandem: ONE image and ONE container. The gateway (Bun) runs every person's runtime as a sandboxed
-# process tree (crun: their own uid and namespaces) on the runtime filesystem built below and kept
-# read-only in this image. No KVM, no Docker socket. Build with BuildKit for linux/amd64 or
-# linux/arm64. Every download is pinned per architecture and verified by checksum. Do not publish
-# images built from this file: they contain Claude Code, the Grok CLI and Google's Antigravity CLI
-# (see THIRD_PARTY.md).
+# Tandem: ONE image and ONE container. The gateway (Bun) runs every vendor program of every person in
+# a sandbox of its own (crun: the person's uid and their own namespaces) on the runtime filesystem
+# built below and kept read-only in this image. No KVM, no Docker socket. Build with BuildKit for
+# linux/amd64 or linux/arm64. Every download is pinned per architecture and verified by checksum. Do
+# not publish images built from this file: they contain Claude Code, the Grok CLI and Google's
+# Antigravity CLI (see THIRD_PARTY.md).
 
 # Multi-arch index digest (covers linux/amd64 and linux/arm64).
 ARG BASE=debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
@@ -11,13 +11,7 @@ ARG BASE=debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b33
 # Downloads run natively on the build machine; only the selected target's artifacts are kept.
 FROM --platform=$BUILDPLATFORM ${BASE} AS fetch
 ARG TARGETARCH
-# Happy Agent standalone release (Bun-compiled single binary; embeds Claude Code 2.1.321 through the
-# Claude Agent SDK for the claude_code harness). Checksums: the release's .sha256 files, which match
-# GitHub's asset digests.
-ARG HAPPY_AGENT_VERSION=2026.11.6-preview.7
-ARG HAPPY_AGENT_SHA256_ARM64=7907e0b80b3ecfb2f7c615c38dc949ccb83cd7a98a6245fbb6dcd5ca3ce65a50
-ARG HAPPY_AGENT_SHA256_AMD64=4b6023e8380f50c0b7d04e12587fd599f6b3ba791061797ad9ed5cbef398106d
-# Codex: the version Happy Agent pins and tests its codex_cli harness against (GitHub asset digests).
+# Codex (`codex app-server`; the gateway speaks its 0.160.1 protocol). GitHub asset digests.
 ARG CODEX_VERSION=0.160.1
 ARG CODEX_SHA256_ARM64=f54dc5852042445bf41da3aa31156f3cb02f52c5a1a04074de73dc5598f7e1f7
 ARG CODEX_SHA256_AMD64=9226581be592d18f7e7f740a352fdb63aa61e45e39f7eb9b09d3888c84bba33f
@@ -25,42 +19,46 @@ ARG CODEX_SHA256_AMD64=9226581be592d18f7e7f740a352fdb63aa61e45e39f7eb9b09d3888c8
 # it every tool call fails with "failed to spawn code-mode host".
 ARG CODEX_CODE_MODE_HOST_SHA256_ARM64=e5e027e6689efda2e3570aa600179f0ebb18632803350e152ed6c9b97dcf9741
 ARG CODEX_CODE_MODE_HOST_SHA256_AMD64=8a69207d97545ac753b6585974e1e67a4c51ae5deacf06517db512bb25e0e3c2
-# Claude Code as a real program, so the daemon's provider-CLI sign-in can run `claude auth login`
-# (npm registry dist.integrity, hex). The gateway's Claude Agent SDK needs at least the Claude Code
-# it bundles (0.3.330: 2.1.330): an older one cannot read MCP servers from the initialize request.
+# Claude Code, the program the gateway's Claude Agent SDK runs, also for `claude auth login` (npm
+# registry dist.integrity, hex). The SDK needs at least the Claude Code it bundles (0.3.330:
+# 2.1.330): an older one cannot read MCP servers from the initialize request.
 ARG CLAUDE_CODE_VERSION=2.1.330
 ARG CLAUDE_CODE_SHA512_ARM64=578c9a9c0639100e54a70c113ed8d27ea0db36a0255097959f7358670d808264478dda52b0bb470336f14577e40276e3c135f3134b9e763431518d360113dcb0
 ARG CLAUDE_CODE_SHA512_AMD64=f469fe57b0ed27c3359f3b4ff42783565f60dd1b6b7a923bace153c8f4519d97bc0facde6c81ca982ecebc16aeb9cb803f45f493ce520cdfcb3d56728ec19ecd
-# Grok CLI, so the daemon's provider-CLI sign-in can run `grok login --device-auth`; Happy's grok
-# provider then reads its sign-in file. xAI publishes no checksum files: these are of the release
-# files as downloaded, which match the MD5 that xAI's storage reports for them.
+# Grok CLI (Grok Build: `grok agent stdio`, `grok login --device-auth`). xAI publishes no checksum
+# files: these are of the release files as downloaded, which match the MD5 that xAI's storage reports
+# for them.
 ARG GROK_VERSION=1.0.89
 ARG GROK_SHA256_ARM64=20496afea9dcec8ff1a3e3742a2966980888770d4ee845f80e5f0e5db56acb8b
 ARG GROK_SHA256_AMD64=404456474906572060fa36745266caf1e967e9084e656da9572b42d35febf342
-# Google's Antigravity CLI (agy) for the antigravity harness (`agy acp`), which runs Gemini on the
-# person's own Gemini API key (sha512 from the vendor's release manifests). The release path names
-# the version and its build.
+# Google's Antigravity CLI (`agy acp`), which runs Gemini on the person's own Gemini API key (sha512
+# from the vendor's release manifests). The release path names the version and its build.
 ARG AGY_RELEASE=1.5.11-6132547114106880
 ARG AGY_SHA512_ARM64=5f703c88e01851061c87c07b1a4ca54c1f5a6826ffada9fb005974a099e9a552ddb1f9ba2fe1194e2829803482c86084babf8cf91530a528bc7f659613600585
 ARG AGY_SHA512_AMD64=dad3c015e8964fcdc1639b13b7152f4cb84cb1bde385707e2bcdf095d6f1831f4f6521199aec499cc052f9e99906b7fdbc52c273df064d5cb7c84b068ba3ce50
+# Block's goose (`goose acp`) for OpenRouter models on the person's own key. GitHub asset digests of
+# the glibc builds (the release publishes no checksum files).
+ARG GOOSE_VERSION=1.60.2
+ARG GOOSE_SHA256_ARM64=7e74d796e93b89df374715dc669149cb634f74d778de0b87bb7c031b5b093731
+ARG GOOSE_SHA256_AMD64=5f6e463621a8428617ae4870eecee7a00a253e9bbfccb6340dfaa4f0ec2aaf32
 
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
  && rm -rf /var/lib/apt/lists/* && mkdir /out
 
 RUN set -eu; \
     case "$TARGETARCH" in \
-      arm64) happy=linux-arm64; happy_sha=$HAPPY_AGENT_SHA256_ARM64; \
-             codex=aarch64-unknown-linux-musl; codex_sha=$CODEX_SHA256_ARM64; \
+      arm64) codex=aarch64-unknown-linux-musl; codex_sha=$CODEX_SHA256_ARM64; \
              host_sha=$CODEX_CODE_MODE_HOST_SHA256_ARM64; \
              claude=linux-arm64; claude_sha=$CLAUDE_CODE_SHA512_ARM64; \
              grok=linux-aarch64; grok_sha=$GROK_SHA256_ARM64; \
-             agy=linux-arm/cli_linux_arm64; agy_sha=$AGY_SHA512_ARM64 ;; \
-      amd64) happy=linux-x64; happy_sha=$HAPPY_AGENT_SHA256_AMD64; \
-             codex=x86_64-unknown-linux-musl; codex_sha=$CODEX_SHA256_AMD64; \
+             agy=linux-arm/cli_linux_arm64; agy_sha=$AGY_SHA512_ARM64; \
+             goose=aarch64-unknown-linux-gnu; goose_sha=$GOOSE_SHA256_ARM64 ;; \
+      amd64) codex=x86_64-unknown-linux-musl; codex_sha=$CODEX_SHA256_AMD64; \
              host_sha=$CODEX_CODE_MODE_HOST_SHA256_AMD64; \
              claude=linux-x64; claude_sha=$CLAUDE_CODE_SHA512_AMD64; \
              grok=linux-x86_64; grok_sha=$GROK_SHA256_AMD64; \
-             agy=linux-x64/cli_linux_x64; agy_sha=$AGY_SHA512_AMD64 ;; \
+             agy=linux-x64/cli_linux_x64; agy_sha=$AGY_SHA512_AMD64; \
+             goose=x86_64-unknown-linux-gnu; goose_sha=$GOOSE_SHA256_AMD64 ;; \
       *) echo "unsupported TARGETARCH '$TARGETARCH': build with docker buildx --platform linux/arm64 or linux/amd64" >&2; exit 1 ;; \
     esac; \
     curl -fsSL -o /tmp/codex.tar.gz \
@@ -88,11 +86,11 @@ RUN set -eu; \
     echo "${agy_sha}  /tmp/agy.tar.gz" | sha512sum -c -; \
     tar -xzf /tmp/agy.tar.gz -C /tmp antigravity; \
     install -m 0755 /tmp/antigravity /out/agy; \
-    curl -fsSL -o /tmp/happy-agent.tar.gz \
-      "https://github.com/slopus/happy-agent/releases/download/v${HAPPY_AGENT_VERSION}/happy-agent-${HAPPY_AGENT_VERSION}-${happy}.tar.gz"; \
-    echo "${happy_sha}  /tmp/happy-agent.tar.gz" | sha256sum -c -; \
-    tar -xzf /tmp/happy-agent.tar.gz -C /tmp; \
-    install -m 0755 "/tmp/happy-agent-${happy}" /out/happy-agent; \
+    curl -fsSL -o /tmp/goose.tar.gz \
+      "https://github.com/block/goose/releases/download/v${GOOSE_VERSION}/goose-${goose}.tar.gz"; \
+    echo "${goose_sha}  /tmp/goose.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/goose.tar.gz -C /tmp ./goose; \
+    install -m 0755 /tmp/goose /out/goose; \
     rm -rf /tmp/*
 
 FROM ${BASE} AS runtime
@@ -104,21 +102,24 @@ COPY --from=fetch /out/ /usr/local/bin/
 
 # Version sanity checks with a throwaway HOME so nothing lands in the image's home directories.
 RUN export HOME=/tmp/version-check DISABLE_AUTOUPDATER=1 AGY_CLI_DISABLE_AUTO_UPDATE=true \
+      GOOSE_DISABLE_KEYRING=1 \
  && mkdir -p "$HOME" \
- && happy-agent --version && codex --version 2>/dev/null && claude --version \
- && grok --version && agy --version \
+ && codex --version 2>/dev/null && claude --version \
+ && grok --version && agy --version && goose --version \
  && rm -rf "$HOME"
 
 RUN useradd --create-home --home-dir /home/agent --uid 10001 --user-group --shell /bin/bash agent \
  && chmod 0700 /home/agent \
  && install -d -m 0755 /var/tmp/agent
 
-COPY runtime/happy.toml /opt/agent-runtime/happy.toml
-COPY runtime/entrypoint.sh /usr/local/bin/agent-runtime-entrypoint
-COPY runtime/happy-api /usr/local/bin/happy-api
-COPY runtime/with-egress /usr/local/bin/with-egress
-RUN chmod 0644 /opt/agent-runtime/happy.toml \
- && chmod 0755 /usr/local/bin/agent-runtime-entrypoint /usr/local/bin/happy-api /usr/local/bin/with-egress
+# The first program of every sandbox (src/runtime.ts), and the vendor settings every person's
+# programs read from the system (docs/agent-layer.md): Claude Code's managed settings and Codex's
+# system config and requirements. (COPY --chmod would give the new directories the files' mode.)
+COPY runtime/agent-run /usr/local/bin/agent-run
+COPY runtime/etc/claude-code/managed-settings.json /etc/claude-code/
+COPY runtime/etc/codex/config.toml runtime/etc/codex/requirements.toml /etc/codex/
+RUN chmod 0755 /usr/local/bin/agent-run /etc/claude-code /etc/codex \
+ && chmod 0644 /etc/claude-code/managed-settings.json /etc/codex/config.toml /etc/codex/requirements.toml
 
 
 # Stripe's Smokescreen, the runtimes' egress proxy (src/egress.ts). Release binary pinned per
@@ -155,8 +156,8 @@ COPY --from=smokescreen /out/smokescreen /usr/local/bin/smokescreen
 COPY --from=runtime / /opt/tandem/rootfs/
 WORKDIR /app
 COPY package.json bun.lock ./
-# --omit=optional: the Claude Agent SDK's optional packages are its own copy of Claude Code; the
-# gateway always starts the rootfs's /usr/local/bin/claude in a sandbox instead.
+# No optional dependencies: the Claude Agent SDK's would add a second, bundled Claude Code; the SDK
+# runs the pinned /usr/local/bin/claude of the runtime filesystem instead.
 RUN bun install --frozen-lockfile --production --omit=optional
 COPY src ./src
 COPY public ./public
