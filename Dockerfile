@@ -154,7 +154,9 @@ COPY --from=smokescreen /out/smokescreen /usr/local/bin/smokescreen
 COPY --from=runtime / /opt/tandem/rootfs/
 WORKDIR /app
 COPY package.json bun.lock ./
-RUN bun install --frozen-lockfile --production
+# --omit=optional: the Claude Agent SDK's optional packages are its own copy of Claude Code; the
+# gateway always starts the rootfs's /usr/local/bin/claude in a sandbox instead.
+RUN bun install --frozen-lockfile --production --omit=optional
 COPY src ./src
 COPY public ./public
 COPY runtime/egress-allowlist.txt runtime/seccomp-docker-default.json ./runtime/
