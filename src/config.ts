@@ -28,21 +28,6 @@ const oneOf = <T extends string>(
   return v;
 };
 
-function overrides(raw: string): Map<string, string> {
-  const map = new Map<string, string>();
-  for (const pair of raw
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean)) {
-    const [subject, volume] = pair.split("=");
-    if (!subject || !volume)
-      throw new Error(
-        'DEV_VOLUME_OVERRIDES must be "subject=volume[,subject=volume]"',
-      );
-    map.set(subject, volume);
-  }
-  return map;
-}
 
 /** "*" or a comma-separated list of http(s) origins. */
 function origins(raw: string): string[] {
@@ -76,50 +61,27 @@ export function loadConfig() {
     oidcAudience: env.OIDC_AUDIENCE ?? "",
     oidcJwksUrl: env.OIDC_JWKS_URL ?? "",
     serviceSecret: env.SERVICE_SECRET ?? "",
-    dockerHost: env.RUNTIME_DOCKER_HOST ?? "unix:///var/run/docker.sock",
-    // Fully qualified, so a socket proxy can allowlist exactly this image.
-    runtimeImage:
-      env.RUNTIME_IMAGE || "docker.io/library/tandem-runtime:2026.11.6-preview.7",
-    runtimeNetwork: env.RUNTIME_NETWORK || `${prefix}-runtimes`,
+    // The gateway's data volume: microsandbox's state, every person's home, the MCP sockets.
+    dataDir: (env.DATA_DIR || "/var/lib/tandem").replace(/\/+$/, ""),
+    // The runtime image archive built into the gateway image (Dockerfile), loaded into microsandbox
+    // on first start. RUNTIME_IMAGE names an image already in microsandbox's store instead.
+    runtimeImageArchive: env.RUNTIME_IMAGE_ARCHIVE || "/opt/tandem/runtime.tar",
+    runtimeImage: env.RUNTIME_IMAGE ?? "",
     runtimePrefix: prefix,
-    runtimePlatform: env.RUNTIME_PLATFORM ?? "",
     runtimeMemoryMb: num(env.RUNTIME_MEMORY_MB, 2048),
     runtimeCpus: num(env.RUNTIME_CPUS, 2),
-    runtimePids: num(env.RUNTIME_PIDS, 512),
-    bridgeAllow: env.BRIDGE_ALLOW ?? "",
     idleMs: Number(env.IDLE_MINUTES ?? 5) * 60_000,
     permissionMode: env.PERMISSION_MODE || "auto",
     restartAfterSignIn: flag(env.RESTART_AFTER_SIGN_IN, true),
-    devVolumeOverrides: overrides(env.DEV_VOLUME_OVERRIDES ?? ""),
-    mcpProxyPort: Number(env.MCP_PROXY_PORT || 8790),
-    mcpProxyUrl: (env.MCP_PROXY_URL ?? "").replace(/\/+$/, ""),
     mcpAllowedOrigins: origins(env.MCP_ALLOWED_ORIGINS ?? ""),
-    // --- Hardening (README, Security). Each protection has a safe default and an explicit opt-out.
-    runtimeOciRuntime: env.RUNTIME_OCI_RUNTIME || "auto",
-    runtimeUser: env.RUNTIME_USER ?? "10001:10001",
-    runtimeCapAdd: list(env.RUNTIME_CAP_ADD).map((c) => c.toUpperCase()),
-    runtimeNoNewPrivileges: flag(env.RUNTIME_NO_NEW_PRIVILEGES, true),
-    runtimeReadOnlyRootfs: flag(env.RUNTIME_READ_ONLY_ROOTFS, true),
-    runtimeTmpfsMb: num(env.RUNTIME_TMPFS_MB, 256),
-    runtimeDockerProxy: oneOf(
-      "RUNTIME_DOCKER_PROXY",
-      env.RUNTIME_DOCKER_PROXY,
-      ["auto", "required", "none"],
-      "auto",
-    ),
-    networkIsolation: oneOf(
-      "RUNTIME_NETWORK_ISOLATION",
-      env.RUNTIME_NETWORK_ISOLATION,
-      ["auto", "per_runtime", "shared"],
-      "auto",
-    ),
     egressMode: oneOf(
       "EGRESS_MODE",
       env.EGRESS_MODE,
-      ["auto", "allowlist", "open", "off"],
-      "auto",
+      ["allowlist", "open"],
+      "allowlist",
     ),
-    egressProxy: env.EGRESS_PROXY || `${prefix}-egress:4750`,
+    egressAllowDomains: list(env.EGRESS_ALLOW_DOMAINS),
+    egressAllowRanges: list(env.EGRESS_ALLOW_RANGES),
   };
   if (cfg.serviceSecret.length < 32)
     throw new Error("SERVICE_SECRET must be at least 32 characters");
@@ -134,13 +96,8 @@ export function loadConfig() {
     throw new Error(
       "OIDC_ISSUER, OIDC_AUDIENCE and OIDC_JWKS_URL are required when AUTH_MODE=oidc",
     );
-  if (
-    cfg.authMode !== "dev" &&
-    (cfg.devTokenRoute || cfg.devVolumeOverrides.size)
-  )
-    throw new Error(
-      "DEV_TOKEN_ROUTE and DEV_VOLUME_OVERRIDES are only allowed with AUTH_MODE=dev",
-    );
+  if (cfg.authMode !== "dev" && cfg.devTokenRoute)
+    throw new Error("DEV_TOKEN_ROUTE is only allowed with AUTH_MODE=dev");
   if (
     !["read_only", "workspace_write", "auto", "full_access"].includes(
       cfg.permissionMode,
@@ -149,32 +106,20 @@ export function loadConfig() {
     throw new Error(
       "PERMISSION_MODE must be read_only, workspace_write, auto or full_access",
     );
-  if (
-    cfg.mcpProxyUrl &&
-    !/^https?:\/\/[^/?#]+(\/[^?#]*)?$/.test(cfg.mcpProxyUrl)
-  )
-    throw new Error("MCP_PROXY_URL must be an http(s) URL without query or fragment");
-  if (!Number.isInteger(cfg.mcpProxyPort) || cfg.mcpProxyPort < 1 || cfg.mcpProxyPort > 65535)
-    throw new Error("MCP_PROXY_PORT must be a TCP port");
-  if (!["", "linux/amd64", "linux/arm64"].includes(cfg.runtimePlatform))
-    throw new Error("RUNTIME_PLATFORM must be empty (host platform), linux/amd64 or linux/arm64");
-  // Also the compose project name, which allows no dots.
-  if (!/^[a-z0-9][a-z0-9_-]*$/.test(cfg.runtimePrefix))
+  // Sandbox names and labels: <prefix>-<key>.
+  if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(cfg.runtimePrefix))
     throw new Error("RUNTIME_PREFIX must be lowercase letters, digits, '_' or '-'");
-  if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(cfg.runtimeOciRuntime))
-    throw new Error("RUNTIME_OCI_RUNTIME must be auto, default or a runtime name");
-  for (const cap of cfg.runtimeCapAdd)
-    if (!/^(CAP_)?[A-Z_]+$/.test(cap))
-      throw new Error(`RUNTIME_CAP_ADD: "${cap}" is not a capability name`);
-  for (const [name, value] of [
-    ["RUNTIME_MEMORY_MB", cfg.runtimeMemoryMb],
-    ["RUNTIME_CPUS", cfg.runtimeCpus],
-    ["RUNTIME_PIDS", cfg.runtimePids],
-    ["RUNTIME_TMPFS_MB", cfg.runtimeTmpfsMb],
-  ] as const)
-    if (!(value >= 0)) throw new Error(`${name} must be 0 (no limit) or more`);
-  if (!/^[A-Za-z0-9.-]+:\d+$/.test(cfg.egressProxy))
-    throw new Error("EGRESS_PROXY must be <container>:<port>");
+  // A microVM always has a fixed size: no "0 = no limit" here.
+  if (!(Number.isInteger(cfg.runtimeMemoryMb) && cfg.runtimeMemoryMb >= 512))
+    throw new Error("RUNTIME_MEMORY_MB must be a whole number of MiB, at least 512");
+  if (!(Number.isInteger(cfg.runtimeCpus) && cfg.runtimeCpus >= 1 && cfg.runtimeCpus <= 32))
+    throw new Error("RUNTIME_CPUS must be a whole number from 1 to 32");
+  if (!cfg.dataDir.startsWith("/") || cfg.dataDir.length > 60)
+    // Unix socket paths (DATA_DIR/run/<key>.sock) are limited to 107 bytes.
+    throw new Error("DATA_DIR must be an absolute path of at most 60 characters");
+  for (const r of cfg.egressAllowRanges)
+    if (!/^\d{1,3}(\.\d{1,3}){3}\/\d{1,2}$/.test(r))
+      throw new Error(`EGRESS_ALLOW_RANGES: "${r}" is not an IPv4 CIDR range`);
   return cfg;
 }
 

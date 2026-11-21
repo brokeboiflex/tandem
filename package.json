@@ -9,7 +9,8 @@
     "e2e": "bun scripts/e2e.ts"
   },
   "dependencies": {
-    "jose": "6.1.3"
+    "jose": "6.1.3",
+    "microsandbox": "0.7.16"
   },
   "devDependencies": {
     "@types/bun": "1.3.9",

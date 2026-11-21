@@ -1,7 +1,5 @@
-$ tsc --noEmit
-bun test v1.3.9 (cf6cdbbb)
 
- 54 pass
+ 125 pass
  0 fail
- 301 expect() calls
-Ran 54 tests across 3 files. [5.79s]
+ 685 expect() calls
+Ran 125 tests across 5 files. [10.50s]

@@ -1,5 +1,6 @@
 // Tandem gateway: authenticates people, maps each one to their own runtime, and exposes only the
-// /v1 façade. Everything Happy-specific lives in ./happy.ts; everything Docker-specific in ./runtime.ts.
+// /v1 façade. Everything Happy-specific lives in ./happy.ts; everything about the microVMs in ./runtime.ts.
+import { unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { devToken, verifier, type Principal } from "./auth";
 import { loadConfig, type Config } from "./config";
@@ -7,10 +8,9 @@ import * as H from "./happy";
 import * as M from "./mcp";
 import {
   CLAUDE_MODELS_COMMAND,
-  DockerRuntime,
   GEMINI_KEY_COMMAND,
+  MicroVmRuntime,
   runtimeKey,
-  StaleRuntime,
   type Runtime,
 } from "./runtime";
 import { sseComment, sseEncode, sseFrames } from "./sse";
@@ -37,8 +37,6 @@ class Person {
   restarting?: Promise<void>;
   /** The pending restart reloads vendor accounts (shown as `connecting`), not just config. */
   accountRestart = false;
-  /** Restarting a runtime that lost its network addresses (shown as `connecting`). */
-  recovering = false;
   events?: AbortController;
   lastUsed = Date.now();
   clients = new Set<Client>();
@@ -63,7 +61,7 @@ class Person {
   modelNamesFor?: string;
   /** When (daemon time) a turn last failed for want of a provider's sign-in; a newer sign-in clears it. */
   signinRequired: Partial<Record<H.ProviderId, number>> = {};
-  /** Registered MCP servers and title overrides, read once from the person's volume. */
+  /** Registered MCP servers and title overrides, read once from the person's home. */
   mcpServers?: M.McpServer[];
   mcpWrites: Promise<unknown> = Promise.resolve();
   titles?: Record<string, string>;
@@ -105,8 +103,8 @@ const tooLong = (maxLength: number) =>
     `This text is too long: at most ${maxLength} characters.`,
     { maxLength },
   );
-/** How often a runtime waiting to be restarted is asked whether it is still working. */
-const RECOVERY_POLL_MS = 2000;
+/** How long a started runtime may take to report ready before the start counts as failed. */
+const READY_TIMEOUT_MS = 300_000;
 
 export function createGateway(
   cfg: Config,
@@ -128,10 +126,11 @@ export function createGateway(
   const proxy = new M.McpProxy({
     secret: cfg.serviceSecret,
     servers: (key) => serversOf(person(key)),
-    address: (key) => runtime.address(key),
     fetchImpl: opts.fetchImpl,
     log,
   });
+  /** person key -> the listener on their runtime's MCP socket. */
+  const mcpListeners = new Map<string, { stop(force?: boolean): void }>();
   // Detected protections (src/security.ts); /healthz reports the effective egress mode.
   let egress: string = cfg.egressMode;
   void runtime.posture?.().then(
@@ -144,10 +143,6 @@ export function createGateway(
   function daemonFor(p: Person): Promise<H.Daemon> {
     p.lastUsed = Date.now();
     if (p.daemon) return Promise.resolve(p.daemon);
-    if (p.recovering)
-      return Promise.reject(
-        new HttpError(503, "runtime_unavailable", UNAVAILABLE),
-      );
     return (p.starting ??= start(p, false).finally(
       () => (p.starting = undefined),
     ));
@@ -156,72 +151,30 @@ export function createGateway(
   async function start(p: Person, restart: boolean) {
     const t0 = Date.now();
     await p.stopping;
-    let recovered = false;
     let d: H.Daemon;
     try {
-      const handle = await (
-        restart ? runtime.restart(p.key) : runtime.ensure(p.key)
-      ).catch(async (e) => {
-        if (!(e instanceof StaleRuntime)) throw e;
-        recovered = p.recovering = true;
-        await recover(p, e.message);
-        return runtime.ensure(p.key);
-      });
+      // The runtime's MCP requests arrive on its own socket: listen before it boots.
+      listenMcp(p.key);
+      const handle = await (restart ? runtime.restart(p.key) : runtime.ensure(p.key));
       d = new H.Daemon(handle, opts.fetchImpl);
-      for (const until = Date.now() + 90_000; ; await Bun.sleep(250)) {
+      // A person's first start includes Happy unpacking Claude Code into their home.
+      for (const until = Date.now() + READY_TIMEOUT_MS; ; await Bun.sleep(250)) {
         const health = await d.call("GET", "/v0/health").catch(() => null);
         if (health?.ready) break;
         if (Date.now() > until) throw new Error("runtime did not become ready");
       }
       await bootstrap(d, p);
-    } finally {
-      p.recovering = false;
+    } catch (e) {
+      log(`runtime start failed key=${p.key.slice(0, 8)}: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
+      throw e;
     }
     p.daemon = d;
     // A new runtime may run another Claude Code: its model names are read again.
     p.modelNamesFor = undefined;
     subscribe(p, d);
     log(`runtime ready key=${p.key.slice(0, 8)} ms=${Date.now() - t0}`);
-    // Streams opened during the recovery were answered `connecting`: send them the live state.
-    if (recovered) H.PROVIDER_IDS.forEach((id) => void publish(p, id));
     return d;
   }
-
-  /**
-   * A running runtime that lost the addresses it was created with for the gateway or the egress
-   * proxy (another container holds them, or the Engine refuses fixed addresses) is unreachable. It
-   * is restarted at the current addresses once nothing in it would be cut off: no run or sign-in in
-   * progress. A question or a code that waits for the person does not hold it up, because the person
-   * cannot answer before then. Until it is up again (`p.recovering`, set by start()) the person sees
-   * `connecting` and requests answer 503.
-   */
-  async function recover(p: Person, why: string) {
-    log(
-      `runtime must restart key=${p.key.slice(0, 8)} (${why}); waiting until it is idle`,
-    );
-    for (const id of H.PROVIDER_IDS)
-      emit(p, "provider.updated", recovering(p, id));
-    for (;;) {
-      const work = await runtime.activity?.(p.key).catch(() => null);
-      if (!work || !H.hasWork(work.project, work.clis, false)) break;
-      await Bun.sleep(RECOVERY_POLL_MS);
-    }
-    proxy.clear(p.key); // credentials last only while the runtime runs
-    await runtime.stop(p.key);
-    log(`runtime stopped key=${p.key.slice(0, 8)} (restarting)`);
-  }
-
-  /** The provider state while a runtime waits to restart: the last-known one, `connecting`. */
-  const recovering = (p: Person, id: H.ProviderId) => ({
-    provider: {
-      ...lastKnown(p, id),
-      status: "connecting" as const,
-      method: null,
-      account: null,
-      models: [],
-    },
-    connection: null,
-  });
 
   /** Idempotent on every daemon start: no admin bot, and the one project conversations live in. */
   async function bootstrap(d: H.Daemon, p: Person) {
@@ -400,6 +353,7 @@ export function createGateway(
     proxy.clear(p.key); // credentials last only while the runtime runs
     p.stopping = runtime.stop(p.key).finally(() => (p.stopping = undefined));
     await p.stopping;
+    closeMcp(p.key);
     log(`runtime stopped key=${p.key.slice(0, 8)} (idle)`);
   }
 
@@ -424,9 +378,6 @@ export function createGateway(
           log("runtime stop failed", (e as Error).message),
         );
     }
-    await runtime
-      .sweep?.()
-      .catch((e) => log("network sweep failed", (e as Error).message));
     // Adopt runtimes started outside the gateway (manual restart, crash recovery) so they idle out too.
     for (const key of await runtime.listRunning().catch(() => [])) {
       const p = person(key);
@@ -595,7 +546,7 @@ export function createGateway(
     return cli;
   }
 
-  // --- Files the gateway keeps in the person's volume ------------------------------------------------
+  // --- Files the gateway keeps in the person's home --------------------------------------------------
 
   /** One file from a running runtime; empty when it does not exist (cat exits 1). */
   async function readFile(p: Person, path: string) {
@@ -655,9 +606,7 @@ export function createGateway(
   async function listProviders({ p }: Ctx) {
     if (!p.daemon && !p.restarting)
       return json({
-        providers: H.PROVIDER_IDS.map((id) =>
-          p.recovering ? recovering(p, id).provider : lastKnown(p, id),
-        ),
+        providers: H.PROVIDER_IDS.map((id) => lastKnown(p, id)),
       });
     const states = await Promise.all(
       H.PROVIDER_IDS.map((id) => state(p, id, true, false)),
@@ -728,7 +677,7 @@ export function createGateway(
     // Choosing a key replaces any subscription sign-in still waiting for this person.
     if (H.CLI_IDS.includes(id))
       await d.call("POST", `/v0/provider-clis/${id}/cancel`, {});
-    // The key goes straight into the person's own volume (archive API: no argv, env or logs) and
+    // The key goes straight into the person's own home (standard input: no argv, env or logs) and
     // becomes Happy's documented `api_key` for the provider's account on the next daemon start.
     await runtime.writePrivateFile(p.key, H.RUNTIME_DIR, spec.file, `${key}\n`);
     await restartRuntime(p, 2 * 60_000);
@@ -862,7 +811,7 @@ export function createGateway(
         .call("POST", `/v0/provider-clis/${id}/cancel`, {})
         .catch(() => {});
     // Happy has no sign-out route: use the vendor CLI's own logout where it has one, then make
-    // sure no credential file is left on the volume.
+    // sure no credential file is left in the home.
     await runtime.exec(p.key, H.SIGN_OUT[id]);
     delete p.memos[id];
     delete p.signinRequired[id];
@@ -913,7 +862,7 @@ export function createGateway(
         for (const id of H.PROVIDER_IDS)
           void state(p, id).then(
             (s) => send?.("provider.updated", s),
-            () => p.recovering && send?.("provider.updated", recovering(p, id)),
+            () => {},
           );
       },
       cancel: leave,
@@ -1065,7 +1014,7 @@ export function createGateway(
     if (clean?.length > MAX_TITLE) throw tooLong(MAX_TITLE);
     const d = await daemonFor(p);
     const agent = await conversationAgent(d, p, params[0]!);
-    // Happy has no rename: the gateway keeps the person's own titles in their volume.
+    // Happy has no rename: the gateway keeps the person's own titles in their home.
     const titles = { ...(await titlesOf(p)) };
     if (clean === null) delete titles[agent.id];
     else titles[agent.id] = clean;
@@ -1470,16 +1419,10 @@ export function createGateway(
     });
   }
 
-  async function fetchHandler(
-    req: Request,
-    server?: { requestIP(req: Request): { address: string } | null },
-  ): Promise<Response> {
+  async function fetchHandler(req: Request): Promise<Response> {
     const url = new URL(req.url);
     const path = url.pathname;
     let name = "unmatched";
-    // Runtimes reach the gateway on their private network; they must never mint tokens.
-    const peer = server?.requestIP(req)?.address;
-    const fromRuntime = !!peer && !!runtime.isRuntimeAddress?.(peer);
     try {
       if (req.method === "GET" && path === "/healthz")
         return json({ ok: true, egress });
@@ -1488,8 +1431,7 @@ export function createGateway(
         req.method === "POST" &&
         path === "/dev/token" &&
         cfg.authMode === "dev" &&
-        cfg.devTokenRoute &&
-        !fromRuntime
+        cfg.devTokenRoute
       ) {
         const { subject } = await readJson(req);
         if (
@@ -1553,14 +1495,38 @@ export function createGateway(
     }
   }
 
-  /** The MCP proxy's own listener: reachable only on the private runtime network. */
-  async function mcpProxy(req: Request, server: any): Promise<Response> {
+  /** One MCP proxy request that arrived on runtime `from`'s own socket. */
+  async function mcpProxy(req: Request, server: any, from: string): Promise<Response> {
     try {
-      return await proxy.handle(req, server);
+      return await proxy.handle(req, server, from);
     } catch (e) {
       log("mcp_proxy_failed", (e as Error)?.name ?? "Error");
       return json({ error: "unavailable" }, 502);
     }
+  }
+
+  /**
+   * Listens on a runtime's MCP socket, the host end of its private vsock route. Only that runtime
+   * can connect to it, so the socket names the caller. Idempotent; kept while the runtime runs.
+   */
+  function listenMcp(key: string) {
+    const path = runtime.mcpSocket?.(key);
+    if (!path || mcpListeners.has(key)) return;
+    try {
+      unlinkSync(path); // left behind by a previous gateway process
+    } catch {}
+    mcpListeners.set(
+      key,
+      Bun.serve({
+        unix: path,
+        fetch: (req, server) => mcpProxy(req, server, key),
+      }),
+    );
+  }
+
+  function closeMcp(key: string) {
+    mcpListeners.get(key)?.stop(true);
+    mcpListeners.delete(key);
   }
 
   return { fetch: fetchHandler, mcpProxy, rediscover, idleSweep, people };
@@ -1568,20 +1534,16 @@ export function createGateway(
 
 if (import.meta.main) {
   const cfg = loadConfig();
-  const runtime = new DockerRuntime(cfg);
-  // Each protection is detected before serving; an explicitly required one that this host lacks
-  // stops the gateway here instead of running weaker than configured.
+  const runtime = new MicroVmRuntime(cfg);
+  // The runtime image is loaded and the hypervisor checked before serving: a host without KVM
+  // stops the gateway here.
   const posture = await runtime.posture().catch((e) => {
-    console.error(
-      `startup failed (Docker API ${cfg.dockerHost}): ${(e as Error).message}`,
-    );
+    console.error(`startup failed: ${(e as Error).message}`);
     process.exit(1);
   });
   console.log(
-    `security: sandbox=${posture.sandbox} docker_api=${posture.dockerApi} egress=${posture.egress} ` +
-      `network=${posture.network} rootfs=${cfg.runtimeReadOnlyRootfs ? "read-only" : "writable"} ` +
-      `user=${cfg.runtimeUser || "image default"} cap_add=${cfg.runtimeCapAdd.join(",") || "none"} ` +
-      `no_new_privileges=${cfg.runtimeNoNewPrivileges} limits=${cfg.runtimeMemoryMb}MiB/${cfg.runtimeCpus}cpu/${cfg.runtimePids}pids`,
+    `security: sandbox=${posture.sandbox} egress=${posture.egress} ` +
+      `limits=${cfg.runtimeMemoryMb}MiB/${cfg.runtimeCpus}cpu data=${cfg.dataDir}`,
   );
   for (const w of posture.warnings) console.warn(`WARNING: ${w}`);
   const gateway = createGateway(cfg, runtime);
@@ -1591,18 +1553,22 @@ if (import.meta.main) {
     fetch: gateway.fetch,
     idleTimeout: 255,
   });
-  // Runtimes reach the MCP proxy on its own port; publish only the API port.
-  Bun.serve({
-    hostname: cfg.host,
-    port: cfg.mcpProxyPort,
-    fetch: gateway.mcpProxy,
-    idleTimeout: 255,
-  });
   console.log(
-    `tandem gateway on ${cfg.host}:${cfg.port}, MCP proxy on port ${cfg.mcpProxyPort} (auth ${cfg.authMode}, idle ${cfg.idleMs / 60_000} min, permission mode ${cfg.permissionMode})`,
+    `tandem gateway on ${cfg.host}:${cfg.port} (auth ${cfg.authMode}, idle ${cfg.idleMs / 60_000} min, permission mode ${cfg.permissionMode})`,
   );
   await gateway
     .rediscover()
     .catch((e) => console.error("rediscovery failed", (e as Error).message));
   setInterval(() => void gateway.idleSweep(), 30_000);
+  // The microVMs live in this container: shut them down cleanly before it stops.
+  let stopping = false;
+  for (const signal of ["SIGTERM", "SIGINT"] as const)
+    process.on(signal, async () => {
+      if (stopping) return;
+      stopping = true;
+      const keys = await runtime.listRunning().catch(() => [] as string[]);
+      console.log(`stopping ${keys.length} runtime(s)`);
+      await Promise.allSettled(keys.map((k) => runtime.stop(k)));
+      process.exit(0);
+    });
 }

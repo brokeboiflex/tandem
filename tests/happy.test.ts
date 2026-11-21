@@ -3,7 +3,6 @@
 import { describe, expect, test } from "bun:test";
 import * as H from "../src/happy";
 import { ACTIVITY_COMMAND, GEMINI_KEY_COMMAND } from "../src/runtime";
-import { socketProxyPolicy } from "./fake-daemon";
 
 const fixture = (name: string) =>
   Bun.file(`${import.meta.dir}/fixtures/${name}`).json();
@@ -1246,12 +1245,7 @@ describe("Grok, OpenRouter and Gemini", () => {
     );
   });
 
-  test("every sign-out and the activity check are allowlisted for the socket proxy", async () => {
-    const policy = await socketProxyPolicy();
-    for (const id of H.PROVIDER_IDS)
-      expect(policy.commands.has(JSON.stringify(H.SIGN_OUT[id]))).toBe(true);
-    expect(policy.commands.has(JSON.stringify(ACTIVITY_COMMAND))).toBe(true);
-    expect(policy.commands.has(JSON.stringify(GEMINI_KEY_COMMAND))).toBe(true);
+  test("the activity check reads every provider CLI the gateway signs in with", () => {
     // It reads every provider CLI the gateway signs in with.
     for (const id of H.CLI_IDS)
       expect(ACTIVITY_COMMAND[2]).toMatch(new RegExp(`provider-clis/${id}[ ;]`));

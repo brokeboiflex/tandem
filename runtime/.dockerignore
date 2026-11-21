@@ -1,6 +1,0 @@
-# Build context whitelist.
-*
-!Dockerfile
-!happy.toml
-!entrypoint.sh
-!happy-api

@@ -1,8 +1,0 @@
-# amd64 runtime tandem-rt-83f5410341cb3fc74a1c6e06 (RUNTIME_PLATFORM=linux/amd64, Rosetta)
-claude signed-out turn on claude-code/haiku: run failed after 1.99 s; gateway: ["failed","signin_required"]
-codex signed-out turn on codex-cli/gpt-6-luna: run failed after 16.97 s; gateway: ["failed","signin_required"]
-# Emulation: Docker Desktop on Apple silicon with Rosetta (cpuinfo "VirtualApple"), not QEMU.
-# amd64 runtime: uname -m x86_64; /v0/health ready (2026.11.6-preview.7); provider-clis claude 2.1.321, codex 0.160.1.
-# amd64 timings (Rosetta) vs native arm64: new person 7.3-9.7 s (native 1.9-5 s); stopped runtime 7.0 s (1.1-1.7 s);
-#   sign-in start 1.1-2.3 s (0.3-0.7 s); API-key connect 13.3 s (3-8 s); idle footprint 221 MiB (120 MiB).
-# Non-real e2e with RUNTIME_PLATFORM=linux/amd64: see e2e-amd64.txt (E2E PASSED).

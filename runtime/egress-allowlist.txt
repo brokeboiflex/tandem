@@ -1,6 +1,7 @@
-# Hostnames runtimes may reach through the egress proxy by default (EGRESS_MODE=allowlist).
-# "*.example.com" matches every subdomain but not example.com itself. Add your own with
-# EGRESS_ALLOW_DOMAINS (package registries, your services) instead of editing this file.
+# Hostnames runtimes may reach by default (EGRESS_MODE=allowlist), on ports 80 and 443. The gateway
+# turns them into each microVM's network policy. "*.example.com" matches every subdomain; list
+# example.com itself on its own line. Add your own with EGRESS_ALLOW_DOMAINS (package registries,
+# your services) instead of editing this file.
 
 # Anthropic: Claude Code, Claude sign-in and API keys.
 anthropic.com

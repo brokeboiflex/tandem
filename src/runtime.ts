@@ -1,38 +1,35 @@
-// Runtime controller: one private container + named volume per person, behind a small interface
-// so a Kubernetes implementation can replace the Docker one.
-import { createHmac } from "node:crypto";
-import { hostname } from "node:os";
+// Runtime controller: one microVM per person, run by microsandbox inside the gateway's own
+// container. Each microVM boots the runtime image (built into the gateway image), mounts the
+// person's home from the gateway's data volume, publishes its Happy bridge on the container's
+// loopback only, and reaches the gateway's MCP proxy over a private vsock route.
+import { createHash, createHmac } from "node:crypto";
+import { mkdirSync, readFileSync } from "node:fs";
 import type { Config } from "./config";
-import { DockerError, dockerClient, type ExecResult } from "./docker";
+import { proxyToken, PROXY_TOKEN_ENV } from "./mcp";
 import {
-  chooseAddresses,
-  chooseOciRuntime,
-  dockerApiAccess,
-  inCidr,
-  isAddressPoolExhausted,
-  ISOLATED_GATEWAY,
-  peerAddresses,
-  pinPlan,
-  reservedAddresses,
-  runtimeContainerSpec,
-  runtimeNetworkSpec,
-  type LaunchValues,
-  type Peer,
-  type PeerAddresses,
+  egressRules,
+  RUNTIME_TMPDIR,
+  type EgressRules,
   type Posture,
 } from "./security";
 
+/** The Happy bridge inside each microVM (runtime/entrypoint.sh). */
 export const BRIDGE_PORT = 24790;
-const TOKEN_PATH = "/home/agent/.happy/agent/token";
-/**
- * The settings that name a runtime's peers, read inside the runtime: a Docker API proxy redacts
- * container environments (deploy/sockguard.yaml allowlists this exact command).
- */
-export const LAUNCH_VALUES_COMMAND = [
-  "sh",
-  "-c",
-  'echo "$HAPPY_BRIDGE_ALLOW" "$MCP_PROXY_URL" "$HTTPS_PROXY"',
-];
+/** Host ports for the bridges, on the gateway container's loopback only. */
+export const BRIDGE_HOST_PORTS = { first: 41000, last: 48999 };
+/** Inside each microVM the MCP proxy is this loopback port; the entrypoint forwards it over vsock. */
+export const MCP_GUEST_PORT = 8790;
+export const MCP_VSOCK_PORT = 8790;
+const HOME = "/home/agent";
+const TOKEN_PATH = `${HOME}/.happy/agent/token`;
+const ENTRYPOINT = "/usr/local/bin/agent-runtime-entrypoint";
+/** The runtime image's own user (runtime/Dockerfile). */
+const AGENT_UID = 10001;
+const EXEC_TIMEOUT_MS = 60_000;
+/** States microsandbox passes through while a runtime boots or stops; how long to wait them out. */
+const TRANSITIONAL = new Set(["starting", "draining"]);
+const SETTLE_MS = 60_000;
+
 /**
  * The daemon's runs and sign-ins, asked over its own socket inside the runtime: this answers also
  * when the gateway cannot reach the runtime's bridge. Read-only; the token goes through a shell
@@ -57,15 +54,25 @@ export const CLAUDE_MODELS_COMMAND = [
 
 /**
  * Whether Google accepts the person's Gemini API key: its free model list, asked from inside the
- * runtime through the egress proxy. The key goes from its file to curl's standard input through a
- * shell builtin, never into a process's arguments. (Happy's provider check cannot vouch for the
- * Antigravity account on an API key: it looks for Antigravity's own sign-in.)
+ * runtime. The key goes from its file to curl's standard input through a shell builtin, never into
+ * a process's arguments. (Happy's provider check cannot vouch for the Antigravity account on an
+ * API key: it looks for Antigravity's own sign-in.)
  */
 export const GEMINI_KEY_COMMAND = [
   "sh",
   "-c",
   'k=$(cat /home/agent/.agent-runtime/gemini-api-key) && echo "x-goog-api-key: $k" | curl -sf -m 15 -o /dev/null -H @- "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1"',
 ];
+
+/** Writes standard input to "$1/$2", owner-only, as the runtime's user: no content in argv. */
+const WRITE_FILE_COMMAND = [
+  "sh",
+  "-c",
+  'umask 077 && mkdir -p "$1" && cat > "$1/$2.tmp" && mv -f "$1/$2.tmp" "$1/$2"',
+  "write-file",
+];
+
+export type ExecResult = { exitCode: number; stdout: string };
 
 /** A running runtime as the gateway sees it. `token` is the daemon's owner token: memory only. */
 export type RuntimeHandle = {
@@ -75,27 +82,15 @@ export type RuntimeHandle = {
   startedAt: number;
 };
 
-/**
- * A running runtime was created with gateway or egress proxy addresses on its network that cannot
- * be restored (another container holds them, or the Engine refuses fixed addresses), so it cannot
- * reach the gateway or the Internet. It works again only once restarted.
- */
-export class StaleRuntime extends Error {}
-
 export interface Runtime {
-  /**
-   * Creates and starts the runtime when needed; resolves once its daemon token is readable.
-   * Rejects with StaleRuntime for a running runtime that must be restarted to be reachable.
-   */
+  /** Creates and starts the runtime when needed; resolves once its daemon token is readable. */
   ensure(key: string): Promise<RuntimeHandle>;
   stop(key: string): Promise<void>;
   restart(key: string): Promise<RuntimeHandle>;
   /** Keys of runtimes that are running now (rediscovery after a gateway restart). */
   listRunning(): Promise<string[]>;
-  /** The running runtime's own address on the private network: MCP proxy requests come from it. */
-  address(key: string): Promise<string | null>;
   exec(key: string, cmd: string[]): Promise<ExecResult>;
-  /** Writes one owner-only file into the runtime's home volume without argv or environment. */
+  /** Writes one owner-only file into the running runtime's home without argv or environment. */
   writePrivateFile(
     key: string,
     dir: string,
@@ -109,10 +104,11 @@ export interface Runtime {
   activity?(key: string): Promise<{ project: any; clis: any[] } | null>;
   /** Which protections this host provides (detected once). */
   posture?(): Promise<Posture>;
-  /** Housekeeping on the idle sweep: releases private networks of runtimes that stopped. */
-  sweep?(): Promise<void>;
-  /** True for a source address inside a runtime network (a runtime talking to the gateway). */
-  isRuntimeAddress?(ip: string): boolean;
+  /**
+   * The Unix socket the runtime's MCP proxy requests arrive on (its vsock route). The gateway
+   * listens there before the runtime starts; a request on it can only come from this runtime.
+   */
+  mcpSocket?(key: string): string;
 }
 
 /** Deterministic, non-reversible runtime identity for a person. */
@@ -123,647 +119,357 @@ export function runtimeKey(secret: string, subject: string) {
     .slice(0, 24);
 }
 
-/** Detected once per gateway process. */
-type Setup = {
-  posture: Posture;
-  /** The gateway's own container (null when BRIDGE_ALLOW pins an address outside Docker). */
-  self: { id: string; name: string } | null;
-  /** The egress proxy's container name (attached by name, so a recreated one is found again). */
-  egress: { host: string } | null;
+/** The microsandbox calls the controller makes: the SDK, or a fake in tests. */
+export type Msb = typeof import("microsandbox");
+
+/** What a runtime is created with; any change recreates a stopped runtime (its home is kept). */
+export type RuntimeSpec = {
+  image: string;
+  memoryMb: number;
+  cpus: number;
+  egress: EgressRules;
+  port: number;
+  socket: string;
 };
 
-const ipv4Config = (n: any) =>
-  (n?.IPAM?.Config ?? []).find((c: any) => /^\d+\.\d+\.\d+\.\d+\//.test(c?.Subnet ?? ""));
+export const specHash = (spec: RuntimeSpec) =>
+  createHash("sha256").update(JSON.stringify(spec)).digest("hex").slice(0, 16);
 
-export class DockerRuntime implements Runtime {
-  private docker;
+/** The first free bridge host port, or null when every one is taken. */
+export function freePort(used: Set<number>): number | null {
+  for (let p = BRIDGE_HOST_PORTS.first; p <= BRIDGE_HOST_PORTS.last; p++)
+    if (!used.has(p)) return p;
+  return null;
+}
+
+/** The image reference for a runtime image archive: its build-time digest (`<archive>.sha256`). */
+export function imageRef(archive: string) {
+  const sha = readFileSync(`${archive}.sha256`, "utf8").trim().split(/\s/)[0]!;
+  if (!/^[0-9a-f]{64}$/.test(sha))
+    throw new Error(`${archive}.sha256 does not hold a sha256 digest`);
+  return `tandem-runtime:${sha.slice(0, 16)}`;
+}
+
+const notFound = (e: unknown) =>
+  ["sandboxNotFound", "imageNotFound"].includes(
+    (e as { code?: string })?.code ?? "",
+  );
+
+export class MicroVmRuntime implements Runtime {
+  private msb: Promise<Msb>;
+  private ready?: Promise<string>;
   private tokens = new Map<string, string>();
-  private volumeOverrides = new Map<string, string>();
-  private ready?: Promise<Setup>;
-  /** Keys with an ensure() in flight: the sweep leaves their networks alone. */
-  private busy = new Map<string, number>();
-  private subnets = new Set<string>();
-  private warned = new Set<string>();
-  /** False once the Engine refused isolated gateway mode (Docker Engine before 28). */
-  private isolatedGateway = true;
-  /** Changes to one network's members, one at a time. */
-  private queues = new Map<string, Promise<void>>();
-  /** What each runtime container was created with (by container ID): it never changes. */
-  private launched = new Map<string, LaunchValues>();
+  private connected = new Map<string, Promise<any>>();
+  /** One create/start/stop at a time per person, and one port choice at a time overall. */
+  private queues = new Map<string, Promise<unknown>>();
+  private portLock: Promise<unknown> = Promise.resolve();
 
   constructor(
     private cfg: Config,
     private log: (...args: unknown[]) => void = console.log,
+    msb?: Msb,
   ) {
-    this.docker = dockerClient(cfg.dockerHost);
-    for (const [subject, volume] of cfg.devVolumeOverrides)
-      this.volumeOverrides.set(runtimeKey(cfg.serviceSecret, subject), volume);
+    this.msb = msb ? Promise.resolve(msb) : import("microsandbox");
   }
 
   private label = (name: string) => `${this.cfg.runtimePrefix}.${name}`;
-  private container = (key: string) => `${this.cfg.runtimePrefix}-rt-${key}`;
-  private volume = (key: string) =>
-    this.volumeOverrides.get(key) ?? `${this.cfg.runtimePrefix}-home-${key}`;
-  /** Each runtime gets its own network shared only with the gateway and the egress proxy. */
-  private ownNetwork = (key: string) => `${this.cfg.runtimePrefix}-net-${key}`;
+  private name = (key: string) => `${this.cfg.runtimePrefix}-${key}`;
+  private home = (key: string) => `${this.cfg.dataDir}/homes/${key}`;
+  mcpSocket = (key: string) => `${this.cfg.dataDir}/run/${key}.sock`;
 
-  private async inspect(key: string): Promise<any | null> {
-    return this.get(`/containers/${this.container(key)}/json`);
+  posture(): Promise<Posture> {
+    return this.setup().then(() => ({
+      sandbox: "microvm",
+      egress: this.cfg.egressMode,
+      warnings: [],
+    }));
   }
 
-  private async get(path: string): Promise<any | null> {
-    try {
-      return await this.docker.json("GET", path);
-    } catch (e) {
-      if (e instanceof DockerError && e.status === 404) return null;
-      throw e;
-    }
-  }
-
-  private warnOnce(message: string) {
-    if (this.warned.has(message)) return;
-    this.warned.add(message);
-    this.log(`WARNING: ${message}`);
-  }
-
-  posture() {
-    return this.setup().then((s) => s.posture);
-  }
-
-  /** Detects what this Docker Engine offers and finds the gateway's and egress proxy's containers. */
-  private setup(): Promise<Setup> {
+  /** Loads the runtime image into microsandbox once per image version; resolves to its reference. */
+  private setup(): Promise<string> {
     return (this.ready ??= (async () => {
-      const cfg = this.cfg;
-      const warnings: string[] = [];
-      const info = await this.docker.json("GET", "/info");
-      const oci = chooseOciRuntime(
-        cfg.runtimeOciRuntime,
-        Object.keys(info?.Runtimes ?? {}),
-        info?.DefaultRuntime || "runc",
+      const { Image } = await this.msb;
+      for (const dir of ["homes", "run"])
+        mkdirSync(`${this.cfg.dataDir}/${dir}`, {
+          recursive: true,
+          mode: 0o700,
+        });
+      const ref =
+        this.cfg.runtimeImage || imageRef(this.cfg.runtimeImageArchive);
+      const loaded = await Image.get(ref).then(
+        () => true,
+        (e) => {
+          if (notFound(e)) return false;
+          throw e;
+        },
       );
-      if (oci.warning) warnings.push(oci.warning);
-
-      const plugins = await this.docker
-        .raw("GET", "/plugins")
-        .then((r) => r.status)
-        .catch((e) => (e instanceof DockerError ? e.status : 0));
-      const dockerApi = dockerApiAccess(plugins);
-      if (dockerApi === "unrestricted" && cfg.runtimeDockerProxy === "required")
-        throw new Error(
-          "RUNTIME_DOCKER_PROXY=required, but RUNTIME_DOCKER_HOST answers every Docker API call: put the socket proxy in front (compose.socket-proxy.yaml)",
-        );
-      if (dockerApi === "unrestricted" && cfg.runtimeDockerProxy === "auto")
-        warnings.push(
-          "The gateway has unrestricted Docker API access, which is root on this host. Use the socket proxy (compose.socket-proxy.yaml, README) or set RUNTIME_DOCKER_PROXY=none to accept this.",
-        );
-
-      // The gateway attaches itself to every runtime network, so it has to be a container here.
-      const me = await this.get(`/containers/${hostname()}/json`);
-      const self: Setup["self"] = me
-        ? { id: me.Id, name: String(me.Name ?? "").replace(/^\//, "") }
-        : null;
-      if (!self && !cfg.bridgeAllow)
-        throw new Error(
-          "the gateway is not running in a Docker container of this Engine; set BRIDGE_ALLOW",
-        );
-      let network: Posture["network"] =
-        cfg.networkIsolation === "shared" ? "shared" : "per_runtime";
-      if (!self && network === "per_runtime") {
-        network = "shared";
-        warnings.push(
-          `The gateway runs outside Docker (BRIDGE_ALLOW), so runtimes share ${cfg.runtimeNetwork} and can reach each other. Run the gateway in a container for one network per runtime.`,
-        );
-      }
-
-      let egress: Posture["egress"] =
-        cfg.egressMode === "auto" ? "allowlist" : cfg.egressMode;
-      let egressContainer: Setup["egress"] = null;
-      if (egress !== "off") {
-        const host = cfg.egressProxy.split(":")[0]!;
-        const c = await this.get(`/containers/${host}/json`);
-        if (c?.State?.Running) egressContainer = { host };
-        else if (cfg.egressMode === "auto") {
-          egress = "off";
-          warnings.push(
-            `The egress proxy (${host}) is not running, so runtimes get direct Internet access. Start it (compose.yaml) or set EGRESS_MODE=off to accept this.`,
-          );
-        } else
+      if (!loaded) {
+        if (this.cfg.runtimeImage)
           throw new Error(
-            `EGRESS_MODE=${cfg.egressMode}, but the egress proxy container ${host} is not running`,
+            `RUNTIME_IMAGE ${ref} is not in microsandbox's image store`,
           );
+        const t0 = Date.now();
+        this.log(`loading runtime image ${ref}`);
+        await Image.load(this.cfg.runtimeImageArchive, { tag: ref });
+        this.log(`runtime image ${ref} loaded in ${Date.now() - t0} ms`);
       }
-
-      const posture: Posture = {
-        ociRuntime: oci.runtime,
-        sandbox: oci.sandbox,
-        dockerApi,
-        egress,
-        network,
-        warnings,
-      };
-      return { posture, self, egress: egressContainer };
+      return ref;
     })().catch((e) => {
-      this.ready = undefined; // a Docker hiccup at boot must not stick
+      this.ready = undefined; // a failed load must not stick
       throw e;
     }));
   }
 
-  /** Runs changes to one network's members one at a time (pins and removals). */
-  private serial<T>(network: string, job: () => Promise<T>): Promise<T> {
-    const run = (this.queues.get(network) ?? Promise.resolve()).then(job, job);
+  private serial<T>(key: string, job: () => Promise<T>): Promise<T> {
+    const run = (this.queues.get(key) ?? Promise.resolve()).then(job, job);
     const tail = run.then(
       () => {},
       () => {},
     );
-    this.queues.set(network, tail);
+    this.queues.set(key, tail);
     void tail.then(() => {
-      if (this.queues.get(network) === tail) this.queues.delete(network);
+      if (this.queues.get(key) === tail) this.queues.delete(key);
     });
     return run;
   }
 
-  /**
-   * Puts the gateway and the egress proxy (by name: it may have been recreated) on a runtime network
-   * at their addresses: those its running runtimes were created with, or the reserved ones on a
-   * network nobody runs on yet. Either one somewhere else, for example a recreated egress proxy that
-   * Docker gave the gateway's old address, leaves and joins again at its own. Resolves to the
-   * network as it is afterwards.
-   */
-  private pin(network: string, s: Setup): Promise<any> {
-    return this.serial(network, () => this.pinNow(network, s));
-  }
-
-  private async pinNow(network: string, s: Setup) {
-    const n = await this.docker.json("GET", `/networks/${network}`);
-    const config = ipv4Config(n);
-    const refs: [Peer, string, (id: string, m: any) => boolean][] = [];
-    if (s.self) refs.push(["gateway", s.self.id, (id) => id === s.self!.id]);
-    if (s.egress)
-      refs.push(["egress", s.egress.host, (_, m) => m.Name === s.egress!.host]);
-    const members = Object.entries<any>(n?.Containers ?? {}).map(([id, m]) => ({
-      id,
-      name: String(m.Name ?? ""),
-      ip: String(m.IPv4Address ?? "").split("/")[0]!,
-      peer: refs.find(([, , is]) => is(id, m))?.[0],
-    }));
-    let want: PeerAddresses = {};
-    if (config?.Subnet) {
-      const current: PeerAddresses = {};
-      for (const m of members) if (m.peer) current[m.peer] = m.ip;
-      const launched = await Promise.all(
-        members
-          .filter(
-            (m) => !m.peer && m.name.startsWith(`${this.cfg.runtimePrefix}-rt-`),
-          )
-          .map((m) => this.launchValues(m.id)),
-      );
-      const expected = launched
-        .filter((v): v is LaunchValues => !!v)
-        .map((v) => peerAddresses(v, config.Subnet));
-      const unknown = expected.length < launched.length;
-      want = chooseAddresses(
-        current,
-        expected,
-        reservedAddresses(config.Subnet, config.Gateway ? [config.Gateway] : []),
-      );
-      // A runtime whose settings could not be read may depend on where a peer is now: move nothing.
-      if (unknown) Object.assign(want, current);
-    }
-    const plan = pinPlan(
-      members,
-      refs.map(([peer]) => peer),
-      want,
-    );
-    for (const peer of plan.blocked)
-      this.warnOnce(
-        `The ${peer} cannot take its address ${want[peer]} on ${network}: another container holds it. Runtimes there that expect it are restarted once idle.`,
-      );
-    if (!plan.disconnect.length && !plan.connect.length) return n;
-    const ref = (peer: Peer) => refs.find(([p]) => p === peer)![1];
-    for (const peer of plan.disconnect)
-      await this.docker
-        .json("POST", `/networks/${network}/disconnect`, { Container: ref(peer) })
-        .catch((e) => {
-          if (!(e instanceof DockerError && /not connected/i.test(e.message)))
-            throw e;
-        });
-    for (const { peer, ip } of plan.connect) {
-      await this.connect(network, ref(peer), ip);
-      const was = members.find((m) => m.peer === peer)?.ip;
-      if (was)
-        this.log(`${peer} moved on ${network}: ${was} -> ${ip ?? "any"}`);
-    }
-    return this.docker.json("GET", `/networks/${network}`);
-  }
-
-  /** Joins a network at `ip`; where Docker puts it when the Engine (or its API proxy) refuses that. */
-  private async connect(network: string, container: string, ip?: string) {
-    const join = (endpoint?: object) =>
-      this.docker
-        .json("POST", `/networks/${network}/connect`, {
-          Container: container,
-          ...(endpoint ? { EndpointConfig: endpoint } : {}),
-        })
-        .catch((e) => {
-          if (!(e instanceof DockerError && /already exists/i.test(e.message)))
-            throw e;
-        });
-    if (!ip) return join();
-    try {
-      await join({ IPAMConfig: { IPv4Address: ip } });
-    } catch (e) {
-      if (!(e instanceof DockerError)) throw e;
-      this.warnOnce(
-        `Docker refused a fixed address on a runtime network (${e.message.slice(0, 160)}), so runtimes running while the gateway or the egress proxy is recreated may have to be restarted once idle (README, Operations).`,
-      );
-      await join();
-    }
-  }
-
-  /** What a runtime container was created with, read once inside it; null while it cannot be read. */
-  private async launchValues(id: string): Promise<LaunchValues | null> {
-    const known = this.launched.get(id);
-    if (known) return known;
-    const r = await this.docker
-      .exec(id, LAUNCH_VALUES_COMMAND, this.cfg.runtimeUser || "agent")
-      .catch(() => null);
-    if (r?.exitCode !== 0) return null;
-    const [allow = "", mcpProxyUrl = "", httpsProxy = ""] = r.stdout
-      .replace(/\n$/, "")
-      .split(" ");
-    const v = { allow, mcpProxyUrl, httpsProxy };
-    this.launched.set(id, v);
-    return v;
-  }
-
-  /**
-   * Addresses on a runtime network: the gateway's (the only source the bridge port accepts) and
-   * the egress proxy's. Runtimes get addresses, not names: Docker's embedded DNS does not answer
-   * inside gVisor sandboxes.
-   */
-  private addressesOn(
-    network: string,
-    n: any,
-    s: Setup,
-  ): { allow: string; gateway?: string; egress?: string } {
-    for (const c of n?.IPAM?.Config ?? []) {
-      if (c?.Subnet) this.subnets.add(c.Subnet);
-      if (c?.Gateway && n.Internal)
-        this.warnOnce(
-          `Runtime networks have a host-side address (${network}: ${c.Gateway}), so services on the Docker host that listen on all interfaces are reachable from runtimes. Docker Engine 28 or later removes it (isolated gateway mode).`,
-        );
-    }
-    const ipOf = (match: (id: string, c: any) => boolean) => {
-      for (const [id, c] of Object.entries<any>(n?.Containers ?? {}))
-        if (match(id, c))
-          return String(c.IPv4Address ?? "").split("/")[0] || undefined;
-    };
-    const egress = s.egress
-      ? ipOf((_, c) => c.Name === s.egress!.host)
-      : undefined;
-    if (s.egress && !egress)
-      throw new Error(`egress proxy is not attached to ${network}`);
-    // Also with BRIDGE_ALLOW, a gateway in a container is the runtime's MCP proxy at this address.
-    const gateway = s.self ? ipOf((id) => id === s.self!.id) : undefined;
-    if (this.cfg.bridgeAllow || !s.self)
-      return { allow: this.cfg.bridgeAllow, gateway, egress };
-    if (!gateway) throw new Error(`gateway is not attached to ${network}`);
-    return { allow: `${gateway}/32`, gateway, egress };
-  }
-
-  /**
-   * Rejoins a running runtime's network where the runtime expects the gateway and the egress proxy
-   * (after either was recreated). StaleRuntime when those addresses cannot be restored.
-   */
-  private async rejoin(c: any, s: Setup) {
-    const network = c.HostConfig.NetworkMode;
-    const n = await this.pin(network, s);
-    const at = this.addressesOn(network, n, s);
-    const subnet = ipv4Config(n)?.Subnet;
-    const v = subnet ? await this.launchValues(c.Id) : null;
-    const want = v ? peerAddresses(v, subnet) : {};
-    const lost = (["gateway", "egress"] as const).filter(
-      (peer) => want[peer] && want[peer] !== at[peer],
-    );
-    if (lost.length)
-      throw new StaleRuntime(
-        `${lost.join(" and ")} no longer at ${lost.map((p) => want[p]).join(", ")} on ${network}`,
-      );
-  }
-
-  /** Creates (or reuses) the network a stopped runtime will start on; `fresh` when just created. */
-  private async networkFor(
-    key: string,
-    s: Setup,
-  ): Promise<{ name: string; fresh: boolean; n: any }> {
-    const own = s.posture.network === "per_runtime";
-    const name = own ? this.ownNetwork(key) : this.cfg.runtimeNetwork;
-    const spec = runtimeNetworkSpec(
-      this.cfg,
-      name,
-      s.posture.egress,
-      own ? key : undefined,
-      this.isolatedGateway,
-    );
-    let fresh = true;
-    try {
-      await this.docker.json("POST", "/networks/create", spec);
-    } catch (e) {
-      if (!(e instanceof DockerError)) throw e;
-      if (
-        e.status === 400 &&
-        /gateway.?mode/i.test(e.message) &&
-        this.isolatedGateway
-      ) {
-        this.isolatedGateway = false; // an older Engine: addressesOn() warns about the host address
-        return this.networkFor(key, s);
-      }
-      if (e.status === 409) {
-        fresh = false;
-        const existing = await this.get(`/networks/${name}`);
-        // A network from another egress mode or an older Tandem: recreate a private one; report a
-        // shared one.
-        const wanted = (spec as { Options?: Record<string, string> }).Options?.[
-          ISOLATED_GATEWAY
-        ];
-        if (
-          existing &&
-          (existing.Internal !== spec.Internal ||
-            (wanted && existing.Options?.[ISOLATED_GATEWAY] !== wanted))
-        ) {
-          if (own) {
-            await this.removeNetwork(name, s);
-            return this.networkFor(key, s);
-          }
-          this.warnOnce(
-            `${name} was created with other settings (Internal=${existing.Internal}); remove it once no runtime uses it`,
-          );
-        }
-      } else if (
-        own &&
-        this.cfg.networkIsolation === "auto" &&
-        isAddressPoolExhausted(e.message)
-      ) {
-        this.warnOnce(
-          `Docker has no free address pool for another runtime network; runtimes now share ${this.cfg.runtimeNetwork} (they can reach each other). Enlarge default-address-pools (README) or set RUNTIME_NETWORK_ISOLATION=shared.`,
-        );
-        const shared = this.cfg.runtimeNetwork;
-        await this.docker
-          .json(
-            "POST",
-            "/networks/create",
-            runtimeNetworkSpec(
-              this.cfg,
-              shared,
-              s.posture.egress,
-              undefined,
-              this.isolatedGateway,
-            ),
-          )
-          .catch((e2) => {
-            if (!(e2 instanceof DockerError && e2.status === 409)) throw e2;
-          });
-        return { name: shared, fresh: false, n: await this.pin(shared, s) };
-      } else throw e;
-    }
-    return { name, fresh, n: await this.pin(name, s) };
-  }
-
-  private removeNetwork(name: string, s: Setup) {
-    return this.serial(name, async () => {
-      for (const id of [s.egress?.host, s.self?.id])
-        if (id)
-          await this.docker
-            .json("POST", `/networks/${name}/disconnect`, { Container: id })
-            .catch(() => {});
-      await this.docker.raw("DELETE", `/networks/${name}`).catch((e) => {
-        if (!(e instanceof DockerError && e.status === 404)) throw e;
+  /** Every runtime of this instance, running or stopped. */
+  private async all(): Promise<any[]> {
+    const { Sandbox } = await this.msb;
+    const out: any[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await Sandbox.listWith((l: any) => {
+        let b = l.label(this.label("runtime"), "1").limit(100);
+        if (cursor) b = b.cursor(cursor);
+        return b;
       });
+      out.push(...page.sandboxes);
+      cursor = page.nextCursor ?? undefined;
+    } while (cursor);
+    return out;
+  }
+
+  private async handleOf(key: string): Promise<any | null> {
+    const { Sandbox } = await this.msb;
+    return Sandbox.get(this.name(key)).catch((e: unknown) => {
+      if (notFound(e)) return null;
+      throw e;
     });
   }
 
   /**
-   * Where a runtime reaches the gateway's MCP proxy: MCP_PROXY_URL, or the gateway's address on that
-   * runtime's own network (an address, not a name: Docker's DNS does not answer inside gVisor; and in
-   * NO_PROXY, so it bypasses the egress proxy). Empty (no MCP servers in the runtime) without either.
+   * The runtime once it is not between states: microsandbox reports `starting` and `draining`
+   * while a boot or a stop (also one from outside the gateway) is under way.
    */
-  private mcpProxyUrl(key: string, gateway?: string) {
-    const base =
-      this.cfg.mcpProxyUrl ||
-      (gateway ? `http://${gateway}:${this.cfg.mcpProxyPort}` : "");
-    return base ? `${base}/mcp/${key}` : "";
+  private async settled(key: string): Promise<any | null> {
+    for (const until = Date.now() + SETTLE_MS; ; await Bun.sleep(500)) {
+      const h = await this.handleOf(key);
+      if (!h || !TRANSITIONAL.has(h.status) || Date.now() > until) return h;
+    }
+  }
+
+  /** A live connection to a running runtime, reused for exec. */
+  private sandbox(key: string): Promise<any> {
+    let c = this.connected.get(key);
+    if (!c) {
+      c = this.handleOf(key).then((h) => {
+        if (h?.status !== "running") throw new Error("runtime is not running");
+        return h.connect();
+      });
+      c.catch(() => this.connected.delete(key));
+      this.connected.set(key, c);
+    }
+    return c;
+  }
+
+  /**
+   * Runs `job` on the live connection; a failure drops that connection, so a runtime restarted
+   * outside the gateway is reconnected on the next call instead of failing on a stale one.
+   */
+  private async use<T>(key: string, job: (sb: any) => Promise<T>): Promise<T> {
+    try {
+      return await job(await this.sandbox(key));
+    } catch (e) {
+      this.connected.delete(key);
+      throw e;
+    }
+  }
+
+  private forget(key: string) {
+    this.connected.delete(key);
+    this.tokens.delete(key);
   }
 
   async ensure(key: string): Promise<RuntimeHandle> {
-    this.busy.set(key, (this.busy.get(key) ?? 0) + 1);
-    try {
-      return await this.ensureNow(key);
-    } finally {
-      const n = (this.busy.get(key) ?? 1) - 1;
-      if (n) this.busy.set(key, n);
-      else this.busy.delete(key);
-    }
+    return this.serial(key, () => this.ensureNow(key));
   }
 
   private async ensureNow(key: string): Promise<RuntimeHandle> {
-    const s = await this.setup();
-    const volume = this.volume(key);
-    let c = await this.inspect(key);
-    if (c?.State?.Running) {
-      // After a gateway restart: rejoin the runtime's network so it is reachable again.
-      await this.rejoin(c, s);
-      return this.handle(key);
+    const image = await this.setup();
+    let h = await this.settled(key);
+    if (h?.status === "running") {
+      await this.startDaemon(key);
+      return this.handle(key, h);
     }
-    const image = await this.docker.json(
-      "GET",
-      `/images/${encodeURIComponent(this.cfg.runtimeImage)}/json`,
-    );
-    const network = await this.networkFor(key, s);
-    const at = this.addressesOn(network.name, network.n, s);
-    const spec = runtimeContainerSpec(this.cfg, {
-      key,
-      volume,
-      network: network.name,
-      allow: at.allow,
-      ociRuntime: s.posture.ociRuntime,
-      egress: s.posture.egress,
-      egressProxy: `${at.egress}:${this.cfg.egressProxy.split(":")[1]}`,
-      // Runtimes reach the gateway (and its MCP proxy) directly, never through the egress proxy.
-      directHosts: [
-        s.self?.name,
-        at.gateway,
-        this.cfg.mcpProxyUrl && new URL(this.cfg.mcpProxyUrl).hostname,
-      ].filter((h): h is string => !!h),
-      imageId: image.Id,
-      devVolumeOverride: this.volumeOverrides.has(key),
-      mcpProxyUrl: this.mcpProxyUrl(key, at.gateway),
+    const labels = h?.config()?.labels ?? {};
+    const port =
+      Number(labels[this.label("port")]) || (await this.allocatePort());
+    const spec: RuntimeSpec = {
+      image,
+      memoryMb: this.cfg.runtimeMemoryMb,
+      cpus: this.cfg.runtimeCpus,
+      egress: egressRules(this.cfg),
+      port,
+      socket: this.mcpSocket(key),
+    };
+    const hash = specHash(spec);
+    // A stopped runtime is recreated whenever anything in its spec changed (image, limits, egress).
+    // Its home is a separate directory, so nothing the person keeps is lost.
+    if (h && labels[this.label("spec")] !== hash) {
+      const { Sandbox } = await this.msb;
+      await Sandbox.remove(this.name(key));
+      h = null;
+    }
+    this.forget(key);
+    if (h)
+      await h.startDetached().catch(async (e: unknown) => {
+        // Started meanwhile by someone else (msb, a crash recovery): use it.
+        if ((await this.settled(key))?.status !== "running") throw e;
+      });
+    else await this.create(key, spec, hash);
+    await this.startDaemon(key);
+    return this.handle(key, await this.handleOf(key));
+  }
+
+  /** The lowest bridge host port no runtime of this instance holds (running or stopped). */
+  private allocatePort(): Promise<number> {
+    const run = this.portLock.then(async () => {
+      const used = new Set(
+        (await this.all()).map((h) =>
+          Number(h.config()?.labels?.[this.label("port")]),
+        ),
+      );
+      const port = freePort(used);
+      if (port === null)
+        throw new Error("no free bridge port: too many runtimes on this host");
+      return port;
     });
-    // A stopped runtime is recreated whenever anything in its spec changed (image, settings, the
-    // gateway's address, a network that was recreated). Running work is never cut off.
-    const stale =
-      c &&
-      (c.Image !== image.Id ||
-        network.fresh ||
-        c.Config.Labels?.[this.label("spec")] !==
-          spec.Labels[this.label("spec")]);
-    if (stale) {
-      await this.docker.raw("DELETE", `/containers/${this.container(key)}`);
-      c = null;
-    }
-    if (!c) {
-      if (this.volumeOverrides.has(key))
-        await this.docker.json("GET", `/volumes/${volume}`); // dev override must already exist
-      else
-        await this.docker.json("POST", "/volumes/create", {
-          Name: volume,
-          Labels: { [this.label("home")]: "1", [this.label("key")]: key },
-        });
-      await this.create(key, spec);
-    }
-    await this.docker.raw("POST", `/containers/${this.container(key)}/start`);
-    return this.handle(key);
+    this.portLock = run.catch(() => {});
+    return run;
   }
 
-  private async create(key: string, spec: object) {
-    const q = new URLSearchParams({ name: this.container(key) });
-    // Empty means the Engine's own platform; otherwise run that platform's image variant.
-    if (this.cfg.runtimePlatform) q.set("platform", this.cfg.runtimePlatform);
-    try {
-      await this.docker.json("POST", `/containers/create?${q}`, spec);
-    } catch (e) {
-      if (!(e instanceof DockerError && e.status === 409)) throw e; // created concurrently
-    }
+  private async create(key: string, spec: RuntimeSpec, hash: string) {
+    const { Sandbox, NetworkPolicyBuilder } = await this.msb;
+    const home = this.home(key);
+    mkdirSync(home, { recursive: true, mode: 0o700 });
+    const policy = buildPolicy(NetworkPolicyBuilder, spec.egress);
+    let b = Sandbox.builder(this.name(key))
+      .image(spec.image)
+      .cpus(spec.cpus)
+      .memory(spec.memoryMb)
+      .user("agent")
+      .label(this.label("runtime"), "1")
+      .label(this.label("key"), key)
+      .label(this.label("port"), String(spec.port))
+      .label(this.label("spec"), hash)
+      .volume(HOME, (m: any) => m.bind(home).owner(AGENT_UID, AGENT_UID))
+      .port(spec.port, BRIDGE_PORT)
+      .vsock(spec.socket, MCP_VSOCK_PORT)
+      .detached(true);
+    if (policy)
+      b = b.network((n: any) => n.strict(false).policyFromBuilder(policy));
+    await b.create();
   }
 
-  private async handle(key: string): Promise<RuntimeHandle> {
-    const c = await this.inspect(key);
-    if (!c?.State?.Running) throw new Error("runtime is not running");
+  /** Starts the Happy daemon (the runtime entrypoint) unless it already runs in this boot. */
+  private startDaemon(key: string) {
+    return this.use(key, (sb) => this.startDaemonOn(key, sb));
+  }
+
+  private async startDaemonOn(key: string, sb: any) {
+    const running = await sb.execWith("pgrep", (b: any) =>
+      b.args(["-x", "happy-agent"]).user("agent").timeout(EXEC_TIMEOUT_MS),
+    );
+    if (running.status?.code === 0) return;
+    // The daemon writes a new owner token when it starts: the previous boot's must not be read.
+    this.tokens.delete(key);
+    await sb.execWith("rm", (b: any) =>
+      b.args(["-f", TOKEN_PATH]).user("agent").timeout(EXEC_TIMEOUT_MS),
+    );
+    await sb.execDetachedWith(ENTRYPOINT, (b: any) =>
+      b
+        .user("agent")
+        .env("HOME", HOME)
+        .env("TMPDIR", RUNTIME_TMPDIR)
+        .env("MCP_PROXY_URL", `http://127.0.0.1:${MCP_GUEST_PORT}/mcp/${key}`)
+        .env("MCP_VSOCK_PORT", String(MCP_VSOCK_PORT))
+        // The MCP proxy token only reaches the gateway's proxy, and only over this runtime's own
+        // vsock route.
+        .env(PROXY_TOKEN_ENV, proxyToken(this.cfg.serviceSecret, key)),
+    );
+  }
+
+  private async handle(key: string, h: any): Promise<RuntimeHandle> {
+    if (h?.status !== "running") throw new Error("runtime is not running");
+    const port = Number(h.config()?.labels?.[this.label("port")]);
     return {
       key,
-      url: `http://${this.container(key)}:${BRIDGE_PORT}`,
+      url: `http://127.0.0.1:${port}`,
       token: await this.token(key),
-      startedAt: Date.parse(c.State.StartedAt),
+      startedAt: h.updatedAt?.getTime?.() ?? Date.now(),
     };
   }
 
-  /** Reads the daemon token once per runtime through the exec API; kept only in memory. */
+  /** Reads the daemon token once per runtime boot; kept only in memory. */
   private async token(key: string): Promise<string> {
     const cached = this.tokens.get(key);
     if (cached) return cached;
-    const deadline = Date.now() + 60_000;
+    const deadline = Date.now() + 120_000;
     while (Date.now() < deadline) {
-      const r = await this.exec(key, ["cat", TOKEN_PATH]);
-      const token = r.stdout.trim();
-      if (r.exitCode === 0 && /^[A-Za-z0-9_-]{43}$/.test(token)) {
+      const r = await this.exec(key, ["cat", TOKEN_PATH]).catch(() => null);
+      const token = r?.stdout.trim() ?? "";
+      if (r?.exitCode === 0 && /^[A-Za-z0-9_-]{43}$/.test(token)) {
         this.tokens.set(key, token);
         return token;
       }
-      await Bun.sleep(250); // a fresh volume gets its token on the daemon's first start
+      await Bun.sleep(250); // a fresh home gets its token on the daemon's first start
     }
     throw new Error("runtime daemon token did not appear");
   }
 
-  /**
-   * The runtime's address on its own network (per runtime, or the shared fallback), where its MCP
-   * proxy requests come from. Read fresh on every call: a recreated runtime gets a new address.
-   */
-  async address(key: string) {
-    const c = await this.inspect(key);
-    const network = c?.HostConfig?.NetworkMode;
-    return (
-      (c?.State?.Running &&
-        network &&
-        c.NetworkSettings?.Networks?.[network]?.IPAddress) ||
-      null
-    );
-  }
-
-  async stop(key: string) {
-    await this.docker.raw(
-      "POST",
-      `/containers/${this.container(key)}/stop?t=30`,
-    );
-    // A stopped runtime keeps nothing outside its volume: drop its container and private network
-    // so idle people hold no network (address pools are limited). The next start recreates both.
-    const s = await this.setup();
-    const network = this.ownNetwork(key);
-    const c = await this.inspect(key);
-    if (c?.HostConfig?.NetworkMode !== network || c.State?.Running) return;
-    await this.docker.raw("DELETE", `/containers/${this.container(key)}`);
-    // Another container still on it keeps the network: the sweep removes it later.
-    await this.removeNetwork(network, s).catch((e) =>
-      this.log(`network kept for now: ${(e as Error).message}`),
-    );
+  stop(key: string) {
+    return this.serial(key, async () => {
+      this.forget(key);
+      const h = await this.settled(key);
+      if (h?.status !== "running") return;
+      const sb = await h.connect();
+      // Graceful first, so the daemon can finish writing; a hung guest is killed.
+      await sb.stopWithTimeout(30_000).catch(() => sb.kill());
+    });
   }
 
   async restart(key: string) {
-    // Restarting keeps the runtime's settings, so it cannot help one that lost its peers' addresses.
-    const c = await this.inspect(key);
-    if (c?.State?.Running) await this.rejoin(c, await this.setup());
-    await this.docker.raw(
-      "POST",
-      `/containers/${this.container(key)}/restart?t=30`,
-    );
-    return this.handle(key);
-  }
-
-  private async running() {
-    const filters = JSON.stringify({
-      label: [`${this.label("runtime")}=1`],
-      status: ["running"],
-    });
-    return this.docker.json<any[]>(
-      "GET",
-      `/containers/json?filters=${encodeURIComponent(filters)}`,
-    );
+    await this.stop(key);
+    return this.ensure(key);
   }
 
   async listRunning() {
-    return (await this.running())
-      .map((c) => c.Labels[this.label("key")])
-      .filter(Boolean);
+    return (await this.all())
+      .filter((h) => h.status === "running")
+      .map((h) => h.config()?.labels?.[this.label("key")])
+      .filter((k): k is string => typeof k === "string" && !!k);
   }
 
-  /**
-   * Removes private networks whose runtime is not running (stopped outside the gateway), and puts the
-   * gateway and the egress proxy back where the runtimes still running expect them.
-   */
-  async sweep() {
-    const s = await this.setup();
-    const filters = JSON.stringify({
-      label: [`${this.label("runtime-network")}=1`],
+  /** Always as the runtime's own user. */
+  exec(key: string, cmd: string[]): Promise<ExecResult> {
+    const [file, ...args] = cmd;
+    return this.use(key, async (sb) => {
+      const o = await sb.execWith(file!, (b: any) =>
+        b.args(args).user("agent").timeout(EXEC_TIMEOUT_MS),
+      );
+      return { exitCode: o.status?.code ?? -1, stdout: o.stdout() };
     });
-    const networks = await this.docker.json<any[]>(
-      "GET",
-      `/networks?filters=${encodeURIComponent(filters)}`,
-    );
-    const containers = await this.running();
-    const running = new Set(
-      containers.map((c) => c.Labels[this.label("key")]).filter(Boolean),
-    );
-    for (const id of this.launched.keys())
-      if (!containers.some((c) => c.Id === id)) this.launched.delete(id);
-    for (const n of networks) {
-      const key = n.Labels?.[this.label("key")];
-      if (key && !running.has(key) && !this.busy.has(key))
-        await this.removeNetwork(n.Name, s).catch(() => {});
-      // A recreated egress proxy (compose up) joins the networks still in use at its address.
-      else await this.pin(n.Name, s).catch(() => {});
-    }
-  }
-
-  isRuntimeAddress(ip: string) {
-    for (const subnet of this.subnets) if (inCidr(ip, subnet)) return true;
-    return false;
-  }
-
-  /** Always as the runtime's own user, named explicitly so a socket proxy can verify it. */
-  exec(key: string, cmd: string[]) {
-    return this.docker.exec(
-      this.container(key),
-      cmd,
-      this.cfg.runtimeUser || "agent",
-    );
   }
 
   async activity(key: string) {
@@ -783,7 +489,53 @@ export class DockerRuntime implements Runtime {
     }
   }
 
-  writePrivateFile(key: string, dir: string, name: string, content: string) {
-    return this.docker.putFile(this.container(key), dir, name, content);
+  async writePrivateFile(
+    key: string,
+    dir: string,
+    name: string,
+    content: string,
+  ) {
+    if (!dir.startsWith(`${HOME}/`) || !/^[A-Za-z0-9._-]+$/.test(name))
+      throw new Error("writePrivateFile: path outside the runtime home");
+    const [file, ...args] = WRITE_FILE_COMMAND;
+    const o = await this.use<any>(key, (sb) =>
+      sb.execWith(file!, (b: any) =>
+        b
+          .args([...args, dir, name])
+          .user("agent")
+          .stdinBytes(Buffer.from(content))
+          .timeout(EXEC_TIMEOUT_MS),
+      ),
+    );
+    if (o.status?.code !== 0) throw new Error(`writing ${name} failed`);
   }
 }
+
+/** The microsandbox network policy for these egress rules; null keeps its default (public only). */
+export function buildPolicy(
+  NetworkPolicyBuilder: Msb["NetworkPolicyBuilder"],
+  rules: EgressRules,
+) {
+  if (rules.mode === "open" && !rules.ranges.length) return null;
+  // Inbound traffic reaches a runtime only through its published bridge port.
+  let p: any = new NetworkPolicyBuilder()
+    .defaultIngress("allow")
+    .defaultEgress("deny")
+    // Name resolution through microsandbox's own DNS gateway on the host side.
+    .egress((r: any) => r.udp().tcp().port(53).allowHost());
+  if (rules.mode === "open") p = p.egress((r: any) => r.allowPublic());
+  else {
+    if (rules.exact.length)
+      p = p.egress((r: any) =>
+        r.tcp().ports([80, 443]).allowDomains(rules.exact),
+      );
+    if (rules.suffixes.length)
+      p = p.egress((r: any) =>
+        r.tcp().ports([80, 443]).allowDomainSuffixes(rules.suffixes),
+      );
+  }
+  for (const cidr of rules.ranges)
+    p = p.egress((r: any) => r.tcp().allow((d: any) => d.cidr(cidr)));
+  return p;
+}
+

@@ -1,7 +1,0 @@
-$ bun run typecheck && bun test
-$ tsc --noEmit
- 82 pass
- 0 fail
- 452 expect() calls
-Ran 82 tests across 4 files. [5.67s]
-# per file: tests/gateway.test.ts 17, tests/happy.test.ts 19, tests/mcp.test.ts 21 (MCP), tests/security.test.ts 25 (hardening)

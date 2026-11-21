@@ -1,16 +1,18 @@
-// End-to-end check against a running stack (docker compose up). Uses the Docker CLI on the host only
-// to measure footprint and to force-stop a runtime; everything else goes through the /v1 façade.
+// End-to-end check against a running Tandem container (docker compose up) on a KVM host. Uses the
+// Docker CLI on the host only to run `msb` inside that container (stop a microVM, run a probe inside
+// one, read its footprint) and to restart the container; everything else goes through the /v1 façade.
 //
 //   bun scripts/e2e.ts                      sign-in flows, wrong codes, isolation, cold start, footprint;
-//                                           restarts the gateway container once (reads after a restart)
+//                                           restarts the Tandem container once (reads after a restart)
 //   E2E_REAL_SUBJECT=<subject> bun scripts/e2e.ts
-//                                           also real turns for that subject's signed-in accounts (its runtime
-//                                           volume must hold real logins, e.g. through DEV_VOLUME_OVERRIDES),
-//                                           including MCP tool calls through the gateway's proxy
+//                                           also real turns for that subject's signed-in accounts (its home
+//                                           must hold real logins), including MCP tool calls through the
+//                                           gateway's proxy
 //
-// The MCP checks run a stub MCP server on this host (E2E_STUB_PORT, default 8791) that the gateway
-// reaches at E2E_STUB_URL (default http://host.docker.internal:8791/mcp); the gateway's
-// MCP_ALLOWED_ORIGINS must allow that origin.
+// E2E_CONTAINER names the Tandem container (default: the compose service `tandem`). The MCP checks
+// run a stub MCP server on this host (E2E_STUB_PORT, default 8791) that the gateway reaches at
+// E2E_STUB_URL (default http://host.docker.internal:8791/mcp; on Linux give the container
+// `extra_hosts: ["host.docker.internal:host-gateway"]`); MCP_ALLOWED_ORIGINS must allow that origin.
 import { devToken } from "../src/auth";
 import { CONTEXT_OPEN, PROVIDER_IDS } from "../src/happy";
 import { COPY } from "../src/mcp";
@@ -47,16 +49,35 @@ const stubPort = Number(process.env.E2E_STUB_PORT || 8791);
 const stubUrl =
   process.env.E2E_STUB_URL || `http://host.docker.internal:${stubPort}/mcp`;
 const stub = startStubMcp({ port: stubPort });
-/** Runs a shell snippet inside a runtime; values travel through the exec environment, not argv. */
+/** The one Tandem container. */
+const GATEWAY =
+  process.env.E2E_CONTAINER ||
+  docker("ps", "-q", "--filter", "label=com.docker.compose.service=tandem").split("\n")[0]!;
+if (!GATEWAY) throw new Error("No Tandem container: set E2E_CONTAINER or start compose.yaml.");
+const msb = (...args: string[]) => docker("exec", GATEWAY, "msb", ...args);
+/** A person's microVM (src/runtime.ts). */
+const vm = (subject: string) => `${PREFIX}-${runtimeKey(serviceSecret, subject)}`;
+/** Its status in microsandbox (`running`, `stopped`, ...), or null while it does not exist. */
+const vmStatus = (subject: string) => {
+  const line = msb("ls").split("\n").find((l) => l.startsWith(`${vm(subject)} `));
+  return line ? line.trim().split(/\s+/)[2]! : null;
+};
+/** The daemon's MCP settings, exported for a probe: they live only in its own environment. */
+const DAEMON_ENV =
+  "eval \"$(tr '\\0' '\\n' < /proc/$(pgrep -xo happy-agent)/environ | grep -E '^(MCP_PROXY_TOKEN|MCP_PROXY_URL)=' | sed 's/^/export /')\"; ";
+/** Runs a shell snippet inside a person's microVM as `agent`; `env` values pass as variables. */
 const inRuntime = (subject: string, script: string, env: Record<string, string> = {}) =>
   Bun.spawnSync(
-    ["docker", "exec", ...Object.keys(env).flatMap((k) => ["-e", k]), container(subject), "sh", "-c", script],
+    [
+      "docker", "exec", ...Object.keys(env).flatMap((k) => ["-e", k]), GATEWAY,
+      "sh", "-c",
+      `exec msb exec -u agent ${Object.keys(env).map((k) => `-e "${k}=$${k}"`).join(" ")} "$0" -- sh -c "$1"`,
+      vm(subject), DAEMON_ENV + script,
+    ],
     { env: { ...process.env, ...env } },
   )
     .stdout.toString()
     .trim();
-const container = (subject: string) =>
-  `${PREFIX}-rt-${runtimeKey(serviceSecret, subject)}`;
 
 async function client(subject: string) {
   const token = await devToken(secret, subject);
@@ -123,66 +144,29 @@ async function waitFor<T>(
 // --- 1. Reads never start a runtime; opening the event stream does ------------------------------
 const alice = await client(`e2e-alice-${run}`);
 const bob = await client(`e2e-bob-${run}`);
-// The Docker Engine API on the host, read directly: inspecting and following events through the CLI
-// is too slow to time a start.
-const dockerSocket = (process.env.DOCKER_HOST ?? "").startsWith("unix://")
-  ? process.env.DOCKER_HOST!.slice(7)
-  : "/var/run/docker.sock";
-const engine = (path: string, signal?: AbortSignal) =>
-  fetch(`http://docker${path}`, { unix: dockerSocket, signal } as RequestInit);
-/** The runtime container's state: null while it does not exist. */
-const containerState = async (subject: string) => {
-  const res = await engine(`/containers/${container(subject)}/json`);
-  return res.ok ? ((await res.json()) as any).State : null;
-};
-const running = async (subject: string) =>
-  (await containerState(subject))?.Running === true;
+const running = async (subject: string) => vmStatus(subject) === "running";
 const allUnknown = (r: { status: number; body: any }) =>
   r.status === 200 &&
   r.body.providers.length === PROVIDER_IDS.length &&
   r.body.providers.every((p: any) => p.status === "unknown" && p.checkedAt === null);
-/** Engine events about one person's runtime (network, volume, container), as they arrive here. */
-async function watchRuntime(subject: string) {
-  const key = runtimeKey(serviceSecret, subject);
-  const seen: { at: number; what: string }[] = [];
-  const ac = new AbortController();
-  const res = await engine("/events", ac.signal);
-  void (async () => {
-    const decoder = new TextDecoder();
-    let buffer = "";
-    try {
-      for await (const chunk of res.body!) {
-        buffer += decoder.decode(chunk, { stream: true });
-        for (let nl; (nl = buffer.indexOf("\n")) >= 0; ) {
-          const ev = JSON.parse(buffer.slice(0, nl));
-          buffer = buffer.slice(nl + 1);
-          const name = ev.Actor?.Attributes?.name ?? ev.Actor?.ID ?? "";
-          if (name.includes(key))
-            seen.push({ at: performance.now(), what: `${ev.Type} ${ev.Action}` });
-        }
-      }
-    } catch {}
-  })();
-  return { seen, stop: () => ac.abort() };
-}
-/** Opens the stream; reports when Docker began the start, when the container ran and the live state came. */
+/** Opens the stream; reports when the microVM ran and when the live state came. */
 async function wakeAndTime(c: Client) {
-  const watch = await watchRuntime(c.subject);
   const since = c.events.length;
   const t0 = performance.now();
+  let started: number | undefined;
+  let watching = true;
+  const watch = (async () => {
+    while (watching && started === undefined) {
+      if (vmStatus(c.subject) === "running") started = performance.now() - t0;
+      else await Bun.sleep(100);
+    }
+  })();
   await c.listen();
-  const state = await c.live(since);
+  const state = await c.live(since, 300_000);
   const live = state ? performance.now() - t0 : undefined;
-  watch.stop();
-  const first = watch.seen[0];
-  const started = watch.seen.find((e) => e.what === "container start");
-  return {
-    first: first && first.at - t0,
-    firstWhat: first?.what,
-    started: started && started.at - t0,
-    live,
-    state,
-  };
+  watching = false;
+  await watch;
+  return { started, live, state };
 }
 const ms = (v?: number) => (v === undefined ? "never" : `${v.toFixed(0)} ms`);
 
@@ -195,12 +179,12 @@ check(
   "new person: other reads answer 409 runtime_stopped",
 );
 await Bun.sleep(2000);
-check((await containerState(alice.subject)) === null, "…and no runtime is created");
+check(vmStatus(alice.subject) === null, "…and no runtime is created");
 let woke = await wakeAndTime(alice);
 check(
-  woke.first !== undefined && woke.first < 500 && woke.started !== undefined,
-  "cold start: opening /v1/events starts creating a fresh runtime at once",
-  `${woke.firstWhat} after ${ms(woke.first)}, container started after ${ms(woke.started)}`,
+  woke.started !== undefined,
+  "cold start: opening /v1/events boots a fresh microVM",
+  `microVM running after ${ms(woke.started)}`,
 );
 check(
   !!woke.state && woke.state.every((p: any) => p.status !== "unknown"),
@@ -213,7 +197,7 @@ for (const p of woke.state ?? [])
 // The UI closes, then the runtime stops (as after an idle stop): reads still start nothing.
 alice.close();
 await Bun.sleep(500);
-docker("stop", "-t", "30", container(alice.subject));
+msb("stop", vm(alice.subject));
 const stoppedAt = Date.now();
 t0 = performance.now();
 const warm = await alice.call("GET", "/v1/providers");
@@ -227,8 +211,8 @@ check(
 await Bun.sleep(3000);
 check(!(await running(alice.subject)), "stopped runtime: …and starts nothing");
 
-// After a gateway restart nothing is remembered: `unknown`, and still nothing started.
-docker("restart", "-t", "10", `${PREFIX}-gateway`);
+// After a restart of the Tandem container nothing is remembered: `unknown`, and still nothing started.
+docker("restart", "-t", "60", GATEWAY);
 await waitFor(
   () => fetch(`${BASE}/healthz`).then((res) => res.ok, () => false),
   60_000,
@@ -240,9 +224,9 @@ await Bun.sleep(3000);
 check(!(await running(alice.subject)), "after a gateway restart: …and starts nothing");
 woke = await wakeAndTime(alice);
 check(
-  woke.started !== undefined && woke.first !== undefined && woke.first < 500,
-  "stopped runtime: opening /v1/events starts it at once",
-  `${woke.firstWhat} after ${ms(woke.first)}, container started after ${ms(woke.started)}`,
+  woke.started !== undefined,
+  "stopped runtime: opening /v1/events boots it again",
+  `microVM running after ${ms(woke.started)}`,
 );
 check(
   !!woke.state && woke.state.every((p: any) => p.status !== "unknown") && (await running(alice.subject)),
@@ -250,59 +234,63 @@ check(
   `${ms(woke.live)} after opening`,
 );
 // With the stream open, a runtime stopped behind the gateway's back is restarted at once and the
-// live state comes again on the same stream (a restart waits for the container to finish stopping).
+// live state comes again on the same stream (a restart waits for the microVM to finish stopping).
 {
   const since = alice.events.length;
   t0 = performance.now();
-  docker("stop", "-t", "10", container(alice.subject));
-  const again = await alice.live(since, 120_000);
+  msb("stop", vm(alice.subject));
+  const again = await alice.live(since, 300_000);
   check(
     !!again && (await running(alice.subject)),
     "open stream: a runtime stopped outside the gateway is restarted and reports live again",
     `${seconds(t0)} after the stop`,
   );
 }
+// The bridges listen on the container's own loopback: the host sees only the API port.
 check(
-  docker("port", container(alice.subject)) === "",
-  "runtime publishes no host ports",
+  docker("port", GATEWAY).split("\n").every((l) => l.startsWith("8787/tcp")),
+  "only the API port is published",
+  docker("port", GATEWAY).replace(/\n/g, ", "),
 );
-const allow = docker(
-  "inspect",
-  "-f",
-  "{{range .Config.Env}}{{println .}}{{end}}",
-  container(alice.subject),
-)
-  .split("\n")
-  .find((l) => l.startsWith("HAPPY_BRIDGE_ALLOW="));
+const bridge = inRuntime(alice.subject, "pgrep -a socat | grep -o 'range=[0-9./]*' | head -1");
 check(
-  !!allow && /\/32$/.test(allow),
-  "runtime bridge accepts only the gateway address",
-  allow,
+  /^range=\d+\.\d+\.\d+\.\d+\/32$/.test(bridge) && !bridge.includes("127.0.0.1"),
+  "runtime bridge accepts only its microVM's own gateway address",
+  bridge,
 );
-// Another container on the private network cannot even open the bridge port, and the bridge still needs the token.
-const probe = Bun.spawnSync([
-  "docker",
-  "run",
-  "--rm",
-  "--network",
-  docker("inspect", "-f", "{{.HostConfig.NetworkMode}}", container(alice.subject)),
-  "--entrypoint",
-  "curl",
-  process.env.RUNTIME_IMAGE || "tandem-runtime:2026.11.6-preview.7",
-  "-sS",
-  "-m",
-  "5",
-  "-o",
-  "/dev/null",
-  "-w",
-  "%{http_code}",
-  `http://${container(alice.subject)}:24790/v0/health`,
-]);
-check(
-  probe.exitCode !== 0 && !probe.stdout.toString().startsWith("2"),
-  "a neighbour container on the runtime network is refused",
-  probe.stderr.toString().trim().slice(0, 80),
+// From inside a microVM: no other person's microVM, no gateway API, no host, no cloud metadata, and
+// only allowlisted hosts on the Internet.
+await bob.listen();
+await bob.live(0, 300_000);
+const aliceIp = inRuntime(alice.subject, "hostname -I | cut -d' ' -f1");
+/** "blocked" when the connection fails or microsandbox answers its own denial; else the HTTP status. */
+const probe = (url: string) => {
+  const out = inRuntime(bob.subject, `curl -s -m 8 -w '\\n%{http_code}' "$U" | tail -c 400; true`, { U: url });
+  const code = out.slice(-3);
+  // microsandbox answers a denied plain-HTTP request itself: 403 with JSON naming the destination.
+  const denied = code === "403" && /"code"\s*:/.test(out) && /"domain"\s*:/.test(out);
+  return code === "000" || denied ? "blocked" : code;
+};
+const bobGateway = inRuntime(
+  bob.subject,
+  "awk '$2==\"00000000\"{print $3; exit}' /proc/net/route",
 );
+const dotted = (hex: string) =>
+  hex.length === 8
+    ? [6, 4, 2, 0].map((i) => parseInt(hex.slice(i, i + 2), 16)).join(".")
+    : "0.0.0.0";
+for (const [url, label] of [
+  [`http://${aliceIp}:24790/v0/health`, "another person's microVM"],
+  [`http://${dotted(bobGateway)}:8787/healthz`, "the gateway API from a microVM"],
+  [`http://${dotted(bobGateway)}:${41000}/v0/health`, "the bridge ports from a microVM"],
+  ["http://169.254.169.254/latest/meta-data/", "cloud metadata"],
+  ["https://example.com/", "a host outside the allowlist"],
+] as const) {
+  const code = probe(url);
+  check(code === "blocked", `a microVM cannot reach ${label}`, code);
+}
+const allowed = probe("https://api.anthropic.com/v1/models");
+check(/^[1-5]\d\d$/.test(allowed), "a microVM reaches an allowlisted vendor", allowed);
 
 // --- 2. Connect -> cancel for every provider that signs in ---------------------------------------------
 for (const id of ["claude", "codex", "grok"]) {
@@ -434,8 +422,8 @@ check(
   "second person: no conversations",
 );
 check(
-  container(alice.subject) !== container(bob.subject),
-  "second person: separate runtime container",
+  vm(alice.subject) !== vm(bob.subject) && vmStatus(bob.subject) === "running",
+  "second person: a separate microVM",
 );
 
 // --- 6. MCP servers, the proxy, instructions ---------------------------------------------------------
@@ -494,28 +482,22 @@ check(
   noCredential.slice(0, 160),
 );
 const aliceProxyToken = inRuntime(alice.subject, 'printf %s "$MCP_PROXY_TOKEN"');
-const aliceProxyUrl = inRuntime(alice.subject, 'printf %s "$MCP_PROXY_URL"');
-// Bob's runtime reaches the proxy only on its own network: it tries Alice's path there with its token.
+const aliceKey = runtimeKey(serviceSecret, alice.subject);
+// Bob's runtime reaches the proxy only through its own route: it tries Alice's path there.
 check(
-  inRuntime(bob.subject, `curl -s -m 10 -o /dev/null -w '%{http_code}' -X POST -H "authorization: Bearer $MCP_PROXY_TOKEN" --data "$BODY" "\${MCP_PROXY_URL%/*}/$KEY/stub"`, {
+  inRuntime(bob.subject, `curl -s -m 10 -o /dev/null -w '%{http_code}' -X POST -H "authorization: Bearer $MCP_PROXY_TOKEN" --data "$BODY" "\${MCP_PROXY_URL%/mcp/*}/mcp/$KEY/stub"`, {
     BODY: probeBody,
-    KEY: runtimeKey(serviceSecret, alice.subject),
+    KEY: aliceKey,
   }) === "401",
   "proxy: another person's runtime cannot use its own token on this person's path",
 );
-const neighbour = Bun.spawnSync(
-  [
-    "docker", "run", "--rm", "-e", "T", "-e", "U", "-e", "BODY",
-    "--network", docker("inspect", "-f", "{{.HostConfig.NetworkMode}}", container(alice.subject)),
-    "--entrypoint", "sh", process.env.RUNTIME_IMAGE || "tandem-runtime:2026.11.6-preview.7",
-    "-c", `curl -s -m 10 -o /dev/null -w '%{http_code}' -X POST -H "authorization: Bearer $T" --data "$BODY" "$U/stub"`,
-  ],
-  { env: { ...process.env, T: aliceProxyToken, U: aliceProxyUrl, BODY: probeBody } },
-);
 check(
-  neighbour.stdout.toString() === "403",
-  "proxy: a leaked runtime token is refused from any other container",
-  neighbour.stdout.toString(),
+  inRuntime(bob.subject, `curl -s -m 10 -o /dev/null -w '%{http_code}' -X POST -H "authorization: Bearer $T" --data "$BODY" "\${MCP_PROXY_URL%/mcp/*}/mcp/$KEY/stub"`, {
+    BODY: probeBody,
+    KEY: aliceKey,
+    T: aliceProxyToken,
+  }) === "403",
+  "proxy: a leaked runtime token is refused from any other microVM",
 );
 
 // --- 7. Real turns (optional) -----------------------------------------------------------------------
@@ -607,7 +589,7 @@ if (realSubject) {
       `reply "${first.reply}", ${first.deltas.length} streamed deltas`,
     );
     t0 = performance.now();
-    docker("stop", "-t", "30", container(realSubject)); // forced stop (the idle stop does the same after IDLE_MINUTES)
+    msb("stop", vm(realSubject)); // stopped outside the gateway (the idle stop does the same after IDLE_MINUTES)
     const second = await ask(
       conv.id,
       "What single word did you reply with in your previous message? Answer with just that word.",
@@ -668,12 +650,15 @@ if (realSubject) {
 
   // The credentials never entered the runtime: not its configuration, environment, files or logs.
   const marker = `(valid|expired)-e2e-${run}`;
-  const rt = container(realSubject);
+  const logsOf = (...args: string[]) => {
+    const p = Bun.spawnSync(args);
+    return p.stdout.toString() + p.stderr.toString();
+  };
   const leaks = [
-    docker("inspect", rt),
+    msb("inspect", vm(realSubject)),
     inRuntime(realSubject, 'cat /proc/[0-9]*/environ 2>/dev/null | tr "\\0" "\\n"'),
-    Bun.spawnSync(["docker", "logs", rt]).stdout.toString() + Bun.spawnSync(["docker", "logs", rt]).stderr.toString(),
-    Bun.spawnSync(["docker", "logs", `${PREFIX}-gateway`]).stdout.toString() + Bun.spawnSync(["docker", "logs", `${PREFIX}-gateway`]).stderr.toString(),
+    logsOf("docker", "exec", GATEWAY, "msb", "logs", vm(realSubject)),
+    logsOf("docker", "logs", GATEWAY),
   ].filter((text) => new RegExp(marker).test(text)).length;
   const files = inRuntime(
     realSubject,
@@ -720,11 +705,10 @@ if (realSubject) {
 
 // --- 8. Idle footprint ----------------------------------------------------------------------------
 await Bun.sleep(5000);
+console.log(`      idle footprint ${vm(alice.subject)}:`);
+console.log(msb("metrics", vm(alice.subject)).replace(/^/gm, "        "));
 console.log(
-  `      idle footprint ${container(alice.subject)}: ${docker("stats", "--no-stream", "--format", "{{.MemUsage}} cpu={{.CPUPerc}} pids={{.PIDs}}", container(alice.subject))}`,
-);
-console.log(
-  `      gateway: ${docker("stats", "--no-stream", "--format", "{{.MemUsage}} cpu={{.CPUPerc}}", `${PREFIX}-gateway`)}`,
+  `      Tandem container (gateway and every microVM): ${docker("stats", "--no-stream", "--format", "{{.MemUsage}} cpu={{.CPUPerc}}", GATEWAY)}`,
 );
 
 alice.close();

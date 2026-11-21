@@ -83,7 +83,7 @@ export function parseServer(
 }
 
 // ---------------------------------------------------------------------------------------------
-// Persistence. Registrations live in the person's own volume, which their agent can write to.
+// Persistence. Registrations live in the person's own home, which their agent can write to.
 // They decide where that person's credentials are sent, so the gateway signs them: a file the
 // agent edited is ignored.
 
@@ -206,8 +206,6 @@ const plain = (status: number, error: string) =>
     { status, headers: { "cache-control": "no-store" } },
   );
 
-const normalizeIp = (ip: string) => ip.replace(/^::ffff:/, "");
-
 /**
  * GET (the optional server-to-client stream) and DELETE (ending a session) without a usable
  * credential: "no stream offered" and "ended", answers that never mark the server failed.
@@ -219,17 +217,14 @@ const withoutCredential = (method: string) =>
 
 export type ProxyDeps = {
   secret: string;
-  /** The person's registrations (loaded from their volume when needed). */
+  /** The person's registrations (loaded from their home when needed). */
   servers: (key: string) => Promise<McpServer[]>;
-  /** The runtime's own address on the private network, or null if it is not running. */
-  address: (key: string) => Promise<string | null>;
   fetchImpl?: typeof fetch;
   log?: (...args: unknown[]) => void;
   holdMs?: number;
 };
 
 type ServerLike = {
-  requestIP(req: Request): { address: string } | null;
   timeout(req: Request, seconds: number): void;
 };
 
@@ -306,8 +301,11 @@ export class McpProxy {
     });
   }
 
-  /** Handles one request from a runtime: `/mcp/<runtime key>/<server name>`. */
-  async handle(req: Request, server: ServerLike): Promise<Response> {
+  /**
+   * Handles one request from a runtime: `/mcp/<runtime key>/<server name>`. `from` is the runtime
+   * whose own socket (its vsock route) the request arrived on.
+   */
+  async handle(req: Request, server: ServerLike, from: string): Promise<Response> {
     const m = new URL(req.url).pathname.match(/^\/mcp\/([^/]+)\/([^/]+)$/);
     if (!m || !KEY_RE.test(m[1]!) || !isServerName(m[2]))
       return plain(404, "not_found");
@@ -319,10 +317,7 @@ export class McpProxy {
     if (given.length !== expected.length || !timingSafeEqual(given, expected))
       return plain(401, "unauthorized");
     // The token alone is not enough: the request must come from that person's own runtime.
-    const from = server.requestIP(req)?.address;
-    const address = await this.deps.address(key).catch(() => null);
-    if (!from || !address || normalizeIp(from) !== normalizeIp(address))
-      return plain(403, "forbidden");
+    if (from !== key) return plain(403, "forbidden");
     const registration = (await this.deps.servers(key)).find(
       (s) => s.name === name,
     );

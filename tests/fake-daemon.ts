@@ -1,6 +1,7 @@
 // A small stateful stand-in for one person's Happy Agent daemon, served over real HTTP, plus a fake
 // Runtime that hands the gateway one such daemon per runtime key. Shapes follow tests/fixtures.
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   apiKeyOf,
   happyId,
@@ -10,7 +11,6 @@ import {
 import {
   CLAUDE_MODELS_COMMAND,
   GEMINI_KEY_COMMAND,
-  StaleRuntime,
   type Runtime,
   type RuntimeHandle,
 } from "../src/runtime";
@@ -378,25 +378,10 @@ export function fakeDaemon(
 
 export type FakeDaemon = ReturnType<typeof fakeDaemon>;
 
-/** deploy/sockguard.yaml: the exec commands and archive folders the socket proxy lets through. */
-export async function socketProxyPolicy() {
-  const policy = Bun.YAML.parse(
-    await Bun.file(new URL("../deploy/sockguard.yaml", import.meta.url)).text(),
-  ) as any;
-  return {
-    commands: new Set<string>(
-      policy.request_body.exec.allowed_commands.map((c: string[]) =>
-        JSON.stringify(c),
-      ),
-    ),
-    paths: policy.request_body.container_archive.allowed_paths as string[],
-  };
-}
-
 export class FakeRuntime implements Runtime {
   daemons = new Map<string, FakeDaemon>();
   calls: string[] = [];
-  /** Every command run inside a runtime, in full (checked against the socket proxy's policy). */
+  /** Every command run inside a runtime, in full. */
   execs: string[][] = [];
   files: { key: string; dir: string; name: string; content: string }[] = [];
   /** The volume as the runtime would see it: "<key>:<path>" -> content. */
@@ -405,12 +390,8 @@ export class FakeRuntime implements Runtime {
   claudeInitialize = readFileSync(new URL("./fixtures/claude-initialize.json", import.meta.url), "utf8");
   /** When set, every `cat` ends with this exit code, as if killed by a restart. */
   failReads?: number;
-  /** Source address a runtime's requests come from; tests change it to play a neighbour. */
-  addresses = new Map<string, string>();
   /** How long starting a runtime takes (a real one takes a second or more). */
   startDelayMs = 0;
-  /** Running runtimes that lost their network addresses: unreachable until stopped. */
-  stale = new Set<string>();
   /** What a runtime's daemon reports from inside (activity), by key. */
   agents = new Map<string, any[]>();
   private token = "t".repeat(43);
@@ -431,19 +412,14 @@ export class FakeRuntime implements Runtime {
   async ensure(key: string) {
     this.calls.push(`ensure ${key}`);
     await Bun.sleep(this.startDelayMs);
-    if (this.stale.has(key))
-      throw new StaleRuntime("gateway no longer at 172.30.0.1");
     return this.handle(key);
   }
   async restart(key: string) {
     this.calls.push(`restart ${key}`);
-    if (this.stale.has(key))
-      throw new StaleRuntime("gateway no longer at 172.30.0.1");
     return this.handle(key);
   }
   async stop(key: string) {
     this.calls.push(`stop ${key}`);
-    this.stale.delete(key);
   }
   async activity(key: string) {
     this.calls.push(`activity ${key}`);
@@ -477,8 +453,10 @@ export class FakeRuntime implements Runtime {
       };
     return { exitCode: 0, stdout: "" };
   }
-  async address(key: string) {
-    return this.daemons.has(key) ? (this.addresses.get(key) ?? "127.0.0.1") : null;
+  /** Each runtime's MCP socket, where the gateway listens for its proxy requests. */
+  private sockets = mkdtempSync("/tmp/tmcp-"); // short: Unix socket paths are limited
+  mcpSocket(key: string) {
+    return join(this.sockets, `${key}.sock`);
   }
   async writePrivateFile(
     key: string,
@@ -490,7 +468,7 @@ export class FakeRuntime implements Runtime {
     this.files.push({ key, dir, name, content });
     this.volume.set(`${key}:${dir}/${name}`, content);
   }
-  /** Simulates `docker stop` or a crash behind the gateway's back. */
+  /** Simulates a microVM stopped or crashed behind the gateway's back. */
   kill(key: string) {
     this.daemons.get(key)?.stop();
     this.daemons.delete(key);

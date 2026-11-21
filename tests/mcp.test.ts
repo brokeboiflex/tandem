@@ -1,6 +1,9 @@
-// Application MCP servers through the real gateway handlers and the real proxy listener, with a
-// fake runtime, fake per-person daemons and a real Streamable HTTP MCP server (scripts/stub-mcp.ts).
+// Application MCP servers through the real gateway handlers and the real per-runtime proxy sockets,
+// with a fake runtime, fake per-person daemons and a real Streamable HTTP MCP server
+// (scripts/stub-mcp.ts).
 import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
+import { mkdtempSync } from "node:fs";
+import { join } from "node:path";
 import { devToken } from "../src/auth";
 import type { Config } from "../src/config";
 import { createGateway } from "../src/gateway";
@@ -9,7 +12,7 @@ import * as M from "../src/mcp";
 import { runtimeKey } from "../src/runtime";
 import { sseFrames } from "../src/sse";
 import { STUB_CUSTOMER, startStubMcp } from "../scripts/stub-mcp";
-import { FakeRuntime, GOOD_CODE_PREFIX, socketProxyPolicy } from "./fake-daemon";
+import { FakeRuntime, GOOD_CODE_PREFIX } from "./fake-daemon";
 
 setDefaultTimeout(30_000);
 const stub = startStubMcp();
@@ -23,21 +26,18 @@ const cfg = {
   oidcAudience: "",
   oidcJwksUrl: "",
   serviceSecret: "test-service-secret-at-least-32-characters",
-  dockerHost: "",
-  runtimeImage: "x",
-  runtimeNetwork: "x",
+  dataDir: "/tmp/tandem-test",
+  runtimeImageArchive: "/nonexistent/runtime.tar",
+  runtimeImage: "",
   runtimePrefix: "test",
-  runtimePlatform: "",
-  runtimeMemoryMb: 1,
+  runtimeMemoryMb: 1024,
   runtimeCpus: 1,
-  runtimePids: 1,
-  bridgeAllow: "",
   idleMs: 60_000,
   permissionMode: "auto",
   restartAfterSignIn: false,
-  devVolumeOverrides: new Map(),
-  mcpProxyPort: 0,
-  mcpProxyUrl: "",
+  egressMode: "allowlist",
+  egressAllowDomains: [],
+  egressAllowRanges: [],
   mcpAllowedOrigins: [new URL(stub.url).origin],
 } as Config;
 
@@ -46,10 +46,8 @@ const log = (...a: unknown[]) => logs.push(a.map(String).join(" "));
 const runtime = new FakeRuntime();
 const gateway = createGateway(cfg, runtime, { log });
 const api = Bun.serve({ port: 0, fetch: gateway.fetch, idleTimeout: 60 });
-const proxy = Bun.serve({ port: 0, fetch: gateway.mcpProxy, idleTimeout: 60 });
 afterAll(() => {
   api.stop(true);
-  proxy.stop(true);
   stub.stop();
   runtime.stopAll();
 });
@@ -91,7 +89,9 @@ function rpc(
     opts.token === undefined
       ? M.proxyToken(cfg.serviceSecret, key(subject))
       : opts.token;
-  return fetch(`http://127.0.0.1:${proxy.port}/mcp/${key(subject)}/${name}`, {
+  // Through the socket the gateway listens on for this person's runtime (its vsock route).
+  return fetch(`http://runtime/mcp/${key(subject)}/${name}`, {
+    unix: runtime.mcpSocket(key(subject)),
     method: opts.method ?? "POST",
     headers: {
       ...(token ? { authorization: `Bearer ${token}` } : {}),
@@ -245,7 +245,13 @@ describe("registering MCP servers", () => {
   });
 
   test("registrations survive a gateway restart; a file edited inside the runtime is ignored", async () => {
-    const again = createGateway(cfg, runtime, { log });
+    // The same runtimes and homes, but these gateways listen on their own MCP sockets: the main
+    // gateway keeps serving the proxy for the tests below.
+    const sockets = mkdtempSync("/tmp/tmcp-"); // short: Unix socket paths are limited
+    const restarted = Object.assign(Object.create(runtime), {
+      mcpSocket: (k: string) => join(sockets, `${k}.sock`),
+    }) as FakeRuntime;
+    const again = createGateway(cfg, restarted, { log });
     const headers = { authorization: `Bearer ${alice.token}` };
     // Reads never start a runtime: the app's event stream does, and reads wait for that start.
     expect(
@@ -269,7 +275,7 @@ describe("registering MCP servers", () => {
       path,
       sealed.replace(stub.url, "https://attacker.example/mcp"),
     );
-    const third = createGateway(cfg, runtime, { log });
+    const third = createGateway(cfg, restarted, { log });
     const stream3 = await third.fetch(
       new Request("http://x/v1/events", { headers }),
     );
@@ -300,10 +306,22 @@ describe("the proxy refuses anyone but the person's own runtime", () => {
         })
       ).status,
     ).toBe(401);
-    runtime.addresses.set(key("alice"), "10.9.9.9"); // the token leaked to another container
-    expect((await rpc("alice", "stub", lookup())).status).toBe(403);
-    runtime.addresses.delete(key("alice"));
-    const res = await fetch(`http://127.0.0.1:${proxy.port}/mcp/zz/stub`, {
+    // The token leaked to another person's runtime: it arrives on that runtime's socket.
+    const leaked = await gateway.mcpProxy(
+      new Request(`http://runtime/mcp/${key("alice")}/stub`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${M.proxyToken(cfg.serviceSecret, key("alice"))}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(lookup()),
+      }),
+      { timeout() {} },
+      key("bob"),
+    );
+    expect(leaked.status).toBe(403);
+    const res = await fetch("http://runtime/mcp/zz/stub", {
+      unix: runtime.mcpSocket(key("alice")),
       method: "POST",
       body: "{}",
     });
@@ -458,7 +476,21 @@ describe("credentials: per message, per person, memory only", () => {
     for (const p of gateway.people.values()) p.lastUsed = 0;
     await gateway.idleSweep();
     expect(runtime.calls).toContain(`stop ${key("alice")}`);
-    const res = await rpc("alice", "stub", lookup(), { session });
+    // Its socket is closed with it, and nothing is held for it any more.
+    expect(rpc("alice", "stub", lookup(), { session })).rejects.toThrow();
+    const res = await gateway.mcpProxy(
+      new Request(`http://runtime/mcp/${key("alice")}/stub`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${M.proxyToken(cfg.serviceSecret, key("alice"))}`,
+          "content-type": "application/json",
+          "mcp-session-id": session,
+        },
+        body: JSON.stringify(lookup()),
+      }),
+      { timeout() {} },
+      key("alice"),
+    );
     expect((await res.json()).result.content[0].text).toBe(
       M.COPY.expired("stub"),
     );
@@ -780,17 +812,3 @@ describe("Happy's MCP configuration", () => {
   });
 });
 
-describe("socket proxy policy (deploy/sockguard.yaml)", () => {
-  test("every command the gateway ran in a runtime and every folder it wrote to is allowlisted", async () => {
-    const policy = await socketProxyPolicy();
-    expect(runtime.execs.length).toBeGreaterThan(0);
-    expect(
-      runtime.execs.filter((c) => !policy.commands.has(JSON.stringify(c))),
-    ).toEqual([]);
-    expect(
-      [...new Set(runtime.files.map((f) => f.dir))].filter(
-        (d) => !policy.paths.includes(d),
-      ),
-    ).toEqual([]);
-  });
-});

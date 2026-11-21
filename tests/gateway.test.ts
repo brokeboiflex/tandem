@@ -10,7 +10,6 @@ import {
   FakeRuntime,
   GOOD_CODE_PREFIX,
   GOOD_KEY_PREFIX,
-  socketProxyPolicy,
 } from "./fake-daemon";
 
 const cfg = {
@@ -23,21 +22,18 @@ const cfg = {
   oidcAudience: "",
   oidcJwksUrl: "",
   serviceSecret: "test-service-secret-at-least-32-characters",
-  dockerHost: "",
-  runtimeImage: "x",
-  runtimeNetwork: "x",
+  dataDir: "/tmp/tandem-test",
+  runtimeImageArchive: "/nonexistent/runtime.tar",
+  runtimeImage: "",
   runtimePrefix: "test",
-  runtimePlatform: "",
-  runtimeMemoryMb: 1,
+  runtimeMemoryMb: 1024,
   runtimeCpus: 1,
-  runtimePids: 1,
-  bridgeAllow: "",
   idleMs: 60_000,
   permissionMode: "workspace_write",
   restartAfterSignIn: false,
-  devVolumeOverrides: new Map(),
-  mcpProxyPort: 0,
-  mcpProxyUrl: "",
+  egressMode: "allowlist",
+  egressAllowDomains: [],
+  egressAllowRanges: [],
   mcpAllowedOrigins: [] as string[],
 } as Config;
 
@@ -1021,52 +1017,6 @@ describe("conversations and isolation between people", () => {
     expect(runtime.calls).toContain(`stop ${key}`);
   });
 
-  test("a runtime that lost its network addresses restarts once idle, never mid-run; meanwhile the person sees connecting", async () => {
-    const key = runtimeKey(cfg.serviceSecret, "rita");
-    const rita = await tokenFor("rita");
-    const agent = { id: "busyconvo", status: "working", pendingQuestionId: null };
-    runtime.stale.add(key);
-    runtime.agents.set(key, [agent]);
-    runtime.calls.length = 0;
-    const stream = await listen(rita);
-    await until(() => stream.updates().length >= PROVIDER_IDS.length);
-    const statuses = (list: any[]) => list.map((p) => p.status);
-    expect(statuses(stream.updates().map((u) => u.data.provider))).toEqual(
-      PROVIDER_IDS.map(() => "connecting"),
-    );
-    expect(
-      statuses((await call(rita, "GET", "/v1/providers")).body.providers),
-    ).toEqual(PROVIDER_IDS.map(() => "connecting"));
-    const change = await call(rita, "PUT", "/v1/instructions", { text: "x" });
-    expect([change.status, change.body.error]).toEqual([
-      503,
-      "runtime_unavailable",
-    ]);
-    // A run in progress holds the restart up.
-    await until(
-      () => runtime.calls.filter((c) => c === `activity ${key}`).length >= 2,
-      10_000,
-    );
-    expect(runtime.calls).not.toContain(`stop ${key}`);
-    // A question that waits for the person does not: they cannot answer it before the restart.
-    agent.pendingQuestionId = "q1" as any;
-    await until(() => runtime.calls.includes(`stop ${key}`), 10_000);
-    // Then it starts at the current addresses, and the open stream gets the live state.
-    await until(
-      () =>
-        stream
-          .updates()
-          .some((u) => u.data.provider.status === "not_connected"),
-      10_000,
-    );
-    const calls = runtime.calls.filter((c) => !c.startsWith("activity"));
-    expect(calls).toEqual([`ensure ${key}`, `stop ${key}`, `ensure ${key}`]);
-    expect(
-      statuses((await call(rita, "GET", "/v1/providers")).body.providers),
-    ).toEqual(PROVIDER_IDS.map(() => "not_connected"));
-    stream.close();
-  });
-
   test("runtime names come from HMAC(secret, subject)", () => {
     const a = runtimeKey(cfg.serviceSecret, "alice");
     expect(a).toMatch(/^[0-9a-f]{24}$/);
@@ -1488,17 +1438,3 @@ describe("error codes a client translates", () => {
   });
 });
 
-describe("socket proxy policy (deploy/sockguard.yaml)", () => {
-  test("every command the gateway ran in a runtime and every folder it wrote to is allowlisted", async () => {
-    const policy = await socketProxyPolicy();
-    expect(runtime.execs.length).toBeGreaterThan(0);
-    expect(
-      runtime.execs.filter((c) => !policy.commands.has(JSON.stringify(c))),
-    ).toEqual([]);
-    expect(
-      [...new Set(runtime.files.map((f) => f.dir))].filter(
-        (d) => !policy.paths.includes(d),
-      ),
-    ).toEqual([]);
-  });
-});

@@ -1,8 +1,0 @@
-$ bun run typecheck && bun test
-$ tsc --noEmit
-bun test v1.3.9 (cf6cdbbb)
-
- 58 pass
- 0 fail
- 289 expect() calls
-Ran 58 tests across 3 files. [2.89s]

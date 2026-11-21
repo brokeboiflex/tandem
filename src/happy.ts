@@ -12,7 +12,7 @@ export const PROVIDER_IDS: ProviderId[] = [
 ];
 export const PROJECT_ID = "chats";
 export const PROJECT_PATH = "/home/agent/projects/chats";
-/** The gateway's private folder in the person's volume (not the agents' workspace). */
+/** The gateway's private folder in the person's home (not the agents' workspace). */
 export const RUNTIME_DIR = "/home/agent/.agent-runtime";
 export const INSTRUCTIONS_FILE = "instructions.md";
 export const MAX_INSTRUCTIONS = 64_000;
@@ -110,9 +110,8 @@ export const providerOf = (account: unknown) =>
   PROVIDER_IDS.find((id) => happyId(id) === account) ?? null;
 
 /**
- * How disconnecting signs a person out (run inside the runtime; deploy/sockguard.yaml allowlists
- * each exactly): the vendor CLI's own sign-out where it has one, then no credential file is left
- * on the volume. Grok can leave a copy of its sign-in file beside it (`auth.json.corrupt.*`); an
+ * How disconnecting signs a person out (run inside the runtime as its own user): the vendor CLI's
+ * own sign-out where it has one, then no credential file is left in the home. Grok can leave a copy of its sign-in file beside it (`auth.json.corrupt.*`); an
  * OpenRouter or Gemini key is only the gateway's file.
  */
 export const SIGN_OUT: Record<ProviderId, string[]> = {

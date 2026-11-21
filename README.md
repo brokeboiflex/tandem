@@ -3,76 +3,111 @@
 Tandem gives every person their own private, always-resumable AI workspace behind one small HTTP API:
 Claude Code, Codex, Grok, Gemini and OpenRouter models. Each person signs in with **their own**
 Claude, ChatGPT or Grok account through the vendor's own sign-in, or brings **their own** Anthropic,
-Gemini or OpenRouter API key, inside **their own** Linux container. Your application talks to Tandem; Tandem
+Gemini or OpenRouter API key, inside **their own** microVM. Your application talks to Tandem; Tandem
 never sees passwords and never shares an account between people.
 
-Under the hood each workspace runs one unmodified [Happy Agent](https://github.com/slopus/happy-agent)
-daemon with the official Claude Code, Codex, Grok and Google Antigravity CLIs. Tandem adds the parts a
-multi-user service needs: authentication, one container per person, start-on-demand and idle stop, a narrow façade over
-Happy's owner-level API, and a friendlier sign-in flow.
+Tandem is **one container**: deploy it once (Docker Compose, Dokploy, any Docker host with KVM) and
+talk to it over HTTP. Inside it, the gateway runs every person's workspace as a hardware-isolated
+microVM through [microsandbox](https://github.com/superradcompany/microsandbox) (libkrun on KVM),
+booted on demand and stopped when idle. No Docker socket, no container per person.
+
+Each workspace runs one unmodified [Happy Agent](https://github.com/slopus/happy-agent) daemon with the
+official Claude Code, Codex, Grok and Google Antigravity CLIs. Tandem adds the parts a multi-user
+service needs: authentication, one microVM per person, start-on-demand and idle stop, a narrow façade
+over Happy's owner-level API, and a friendlier sign-in flow.
 
 ## How it is isolated
 
-- **One container and one volume per person.** Names are `tandem-rt-<id>` and `tandem-home-<id>`,
-  where `<id>` is an HMAC of the person's id (`sub` of the service JWT) under `SERVICE_SECRET`. The
-  gateway derives the runtime only from the verified token, so one person can never address another's.
-- **Vendor credentials stay in the person's volume.** `claude auth login`, `codex login` and
-  `grok login --device-auth` run inside the container and store their sign-in there, and the gateway
-  writes a person's own API key there. Tandem does not read, copy or log them.
+- **One microVM and one home per person.** The microVM is `<prefix>-<id>` and its home
+  `DATA_DIR/homes/<id>`, where `<id>` is an HMAC of the person's id (`sub` of the service JWT) under
+  `SERVICE_SECRET`. The gateway derives the runtime only from the verified token, so one person can
+  never address another's. Each microVM has its own kernel; the boundary between people is the
+  hypervisor (KVM), not a shared kernel.
+- **Vendor credentials stay in the person's home.** `claude auth login`, `codex login` and
+  `grok login --device-auth` run inside the microVM and store their sign-in there, and the gateway
+  writes a person's own API key there (through standard input, never a command line). Tandem does not
+  read, copy or log them.
 - **The daemon token never leaves the gateway.** Happy's owner token (shutdown, drain, debug, config,
-  bots, remote connections) is read once per runtime through the Docker exec API and kept in memory. The
-  gateway can send only an allowlisted set of daemon requests (`src/happy.ts`).
-- **A private network per person, no published ports.** Each runtime sits alone on its own internal
-  network with the gateway and the egress proxy (see [Security](#security)). Inside it, a tiny `socat`
-  bridge forwards TCP 24790 to the daemon's Unix socket and accepts connections from the gateway's
-  address only; the daemon still requires its token on every request.
+  bots, remote connections) is read once per boot inside the microVM and kept in memory. The gateway can
+  send only an allowlisted set of daemon requests (`src/happy.ts`).
+- **No way in but the gateway.** Inside each microVM a tiny `socat` bridge forwards TCP 24790 to the
+  daemon's Unix socket and accepts connections only from that microVM's own network gateway; microsandbox
+  publishes it on the Tandem container's loopback only, and the daemon still requires its token on every
+  request. A microVM cannot reach another person's microVM, the gateway's API, the host, private
+  networks or cloud metadata (see [Security](#security)).
 - **Application credentials stay in gateway memory.** The token your app sends for its own MCP server
-  (`mcpAuth`) is held in the gateway's memory for that person only, never written to the container, a
-  file or a log. The runtime reaches your MCP server only through the gateway's MCP proxy, which accepts
-  a per-runtime token from that runtime's own address and adds the person's latest credential on the way
-  out (see [Connecting your app's MCP server](#connecting-your-apps-mcp-server)).
+  (`mcpAuth`) is held in the gateway's memory for that person only, never written to the microVM, a
+  file or a log. The runtime reaches your MCP server only through the gateway's MCP proxy, over a vsock
+  route that exists for that person's microVM only, and the proxy adds the person's latest credential on
+  the way out (see [Connecting your app's MCP server](#connecting-your-apps-mcp-server)).
 - **Hardened defaults.** Built-in admin bot archived on every start, Happy relay/mobile/Tailcat off,
   sub-agents limited to their own harness (a Claude chat cannot start Codex work) and none at all on
-  Grok and OpenRouter (see [Happy's own agent loop](#happys-own-agent-loop-grok-and-openrouter)), gVisor
-  when the host has it, a non-root user without Linux capabilities, `no-new-privileges`, a read-only
-  root filesystem, memory/CPU/process limits and an egress allowlist.
+  Grok and OpenRouter (see [Happy's own agent loop](#happys-own-agent-loop-grok-and-openrouter)), the
+  agents run as the non-root `agent` user, fixed memory and vCPUs per microVM, and an egress allowlist.
 
 ## Quick start (local)
 
-Requirements: Docker Engine or Docker Desktop with Compose and Buildx, Bun 1.3.9, about 3 GB for
-images. Runtimes build for **linux/arm64** and **linux/amd64**.
+Requirements: a **Linux host with KVM** (`ls -l /dev/kvm`), Docker Engine with Compose and Buildx,
+Bun 1.3.9, about 6 GB of disk. A VM works if it has nested virtualization (most cloud "VPS" plans do
+not expose it; check `/dev/kvm`). On a Mac with Apple M3 or later and macOS 15+, use a
+[Lima](https://lima-vm.io) VM with nested virtualization:
+`limactl create --vm-type=vz --set '.nestedVirtualization=true' template:docker-rootful`. Under nested
+virtualization a person's first start takes minutes instead of seconds (see [Limitations](#limitations)).
+The image builds for **linux/arm64** and **linux/amd64**.
 
 ```sh
 bun install --frozen-lockfile
-docker buildx build --load -t tandem-runtime:2026.11.6-preview.7 runtime   # person runtime, host platform
-docker buildx build --load -t tandem-gateway:0.1.0 .                       # gateway
-docker buildx build --load -t tandem-egress:0.1.0 egress                   # egress proxy (Smokescreen)
-# Both platforms (needs the containerd image store; never push these images):
-#   docker buildx build --platform linux/arm64,linux/amd64 --load -t tandem-runtime:2026.11.6-preview.7 runtime
 cp .env.example .env    # then set AUTH_MODE=dev, DEV_TOKEN_ROUTE=true and two random secrets:
                         #   DEV_AUTH_SECRET and SERVICE_SECRET (e.g. `openssl rand -hex 32` each)
-docker compose up -d --no-build
+docker compose up -d --build   # one image: the gateway, microsandbox and the runtime image it boots
 open http://127.0.0.1:8787/connect                              # demo sign-in page
 ```
+
+The first start loads the runtime image into microsandbox (about 20 s, once per image version).
 
 Checks:
 
 ```sh
-bun run typecheck && bun test       # unit tests (fixtures from the pinned daemon, a stub MCP server)
-bun scripts/e2e.ts                  # against the running stack (restarts its gateway once); its stub MCP
-                                    # server needs MCP_ALLOWED_ORIGINS=http://host.docker.internal:8791 in .env
+bun run typecheck && bun test       # unit tests (fixtures from the pinned daemon, a fake microsandbox,
+                                    # a stub MCP server)
+bun scripts/e2e.ts                  # against the running container (restarts it once): sign-ins, isolation
+                                    # probes from inside the microVMs, the MCP proxy; its stub MCP server
+                                    # needs MCP_ALLOWED_ORIGINS=http://host.docker.internal:8791 and, on
+                                    # Linux, extra_hosts: ["host.docker.internal:host-gateway"]
 E2E_REAL_SUBJECT=<person> bun scripts/e2e.ts   # plus real turns, MCP tool calls included, for a person
-                                    # whose volume holds real sign-ins
-bun scripts/e2e-hardening.ts        # proves the protections below against the running stack
-bun scripts/e2e-gateway-restart.ts  # recreates the gateway and the egress proxy (see Operations) with
-                                    # event streams open: nothing is restarted, everything reconnects;
-                                    # E2E_REAL_SUBJECT=<person> keeps a one-word turn in flight meanwhile
+                                    # whose home holds real sign-ins
 bun scripts/page-check.ts           # drives /connect in headless Chromium, screenshots to evidence/
                                     # (BROWSER_EXECUTABLE=/path/to/chromium if Playwright has none)
 ```
 
 `bun scripts/token.ts <person>` prints a local development token for `curl`. `bun scripts/stub-mcp.ts`
 runs the test MCP server on its own (a `lookup_customer` tool that requires `Bearer valid-…`).
+Inside the container, `msb ls`, `msb metrics <name>` and `msb exec -u agent <name> -- sh` inspect the
+microVMs.
+
+## Deploying on Dokploy
+
+Tandem deploys as one Compose service. The server must expose KVM: a dedicated/bare-metal server, or a
+cloud VM with nested virtualization. Check on the server with `ls -l /dev/kvm` and
+`grep -cE 'vmx|svm' /proc/cpuinfo` (more than 0 on x86). Without KVM, Tandem refuses to start.
+
+1. In Dokploy, create a **Compose** service (Docker Compose type, not Stack: Swarm services cannot get
+   the `/dev/kvm` device) from this repository, compose path `compose.yaml`. If the Dokploy instance
+   has several servers, select one with KVM.
+2. In **Environment**, set the production variables from `.env.example`: `AUTH_MODE=oidc` with
+   `OIDC_ISSUER`, `OIDC_AUDIENCE`, `OIDC_JWKS_URL`, a random `SERVICE_SECRET` (keep it: changing it
+   orphans every home), `MCP_ALLOWED_ORIGINS` (your app's origin) and, as needed, `EGRESS_ALLOW_DOMAINS`,
+   `RUNTIME_MEMORY_MB`, `RUNTIME_CPUS`, `IDLE_MINUTES`. Dokploy writes them to `.env`, which
+   `compose.yaml` reads.
+3. In **Domains**, add your Tandem hostname for service `tandem`, port `8787`, with HTTPS. Dokploy's
+   proxy reaches the container over its own network; the `127.0.0.1` port binding in `compose.yaml` is
+   for local use (set `GATEWAY_PORT` if 8787 is taken on the server).
+4. Deploy. The build compiles the runtime image inside the Tandem image (about 3 GB with the runtime
+   archive; build time is mostly the vendor downloads). Health: `GET /healthz`.
+
+Back up the `tandem-data` volume to keep people's homes (their sign-ins and conversations) and the
+image cache; the cache is rebuilt automatically if lost. Your app reaches Tandem at its domain, and
+Tandem's gateway reaches your app's MCP endpoint at the origins in `MCP_ALLOWED_ORIGINS`.
 
 ## API
 
@@ -96,7 +131,7 @@ While a stream is open, a runtime that stops on its own (a crash, `docker stop`)
 | `GET /v1/providers/:id/connect` | Current `{ connection }` (or `null`). |
 | `POST /v1/providers/:id/connect/code` | `{ code }` from the Claude page. A rejected code answers `status: "waiting"` with `error.code` `wrong_code` (paste the whole code again) or `wrong_code_reissued` (Claude refused it for good: `url` is a new sign-in page to open again). |
 | `DELETE /v1/providers/:id/connect` | Cancels the sign-in. |
-| `DELETE /v1/providers/:id` | Signs out with the vendor CLI and removes its credentials from the volume (for OpenRouter and Gemini: the key). |
+| `DELETE /v1/providers/:id` | Signs out with the vendor CLI and removes its credentials from the home (for OpenRouter and Gemini: the key). |
 | `GET /v1/events` | Server-Sent Events for this person only: `provider.updated`, `conversation.run`, `conversation.message`, `conversation.delta`, `conversation.question`, `conversation.context` (`{ conversationId, context }`, the same `context` as above after each measurement, `null` after compaction). Opening it starts the person's runtime, and it keeps the runtime from stopping while it is open. Its first `provider.updated` for each provider is the live state, sent once the runtime is up. The stream closes when the token expires; reconnect with a fresh one. |
 | `POST /v1/conversations` | `{ provider, model, effort?, title? }` → `201 { conversation }`. |
 | `GET /v1/conversations` | `{ conversations, nextCursor }`, newest activity first. `?limit=` (1-200, default 50), `?cursor=<nextCursor>` for the next page, `?query=` to search titles (case-insensitive). |
@@ -201,7 +236,7 @@ are ISO 8601.
    `provider.updated`. Grok runs the Grok CLI's own `grok login --device-auth`; the person confirms the
    code on xAI's page.
 4. **Claude, OpenRouter or Gemini with an API key**: `POST /connect` with `method: "api_key"`
-   (OpenRouter and Gemini have no other way). The key is written to the person's volume, becomes Happy's
+   (OpenRouter and Gemini have no other way). The key is written to the person's home, becomes Happy's
    documented `api_key` setting for that account, and is verified; a refused key is removed again. Happy's
    own provider check verifies Claude and OpenRouter keys (for OpenRouter one minimal request to the first
    model in `runtime/happy.toml`, billed to that key; an account without credits is refused too). A
@@ -228,7 +263,7 @@ own credentials**, so the server enforces exactly what the person may see and do
      -d '{"url":"https://app.example.com/mcp","description":"Our app","enabledTools":["lookup_customer"]}'
    ```
 
-   The registration is stored in the person's volume, signed by the gateway (a copy edited inside the
+   The registration is stored in the person's home, signed by the gateway (a copy edited inside the
    runtime is ignored), and survives restarts. A change to the servers or `enabledTools` restarts the
    person's runtime once it is idle, because Happy reads its MCP configuration when it starts. Optionally
    `PUT /v1/instructions` with standing instructions about your app.
@@ -248,13 +283,12 @@ own credentials**, so the server enforces exactly what the person may see and do
 
 The agent calls your tools as `mcp__app__<tool>`. How a call travels:
 
-- Each runtime's `mcp.toml` lists your server as `http://<gateway>:8790/mcp/<runtime id>/app`, where
-  `<gateway>` is the gateway's address on that runtime's own network (never a name, which gVisor cannot
-  resolve, and in `NO_PROXY`, so the call bypasses the egress proxy), authenticated
-  with a per-runtime proxy token from the runtime's environment (`MCP_PROXY_TOKEN`). Your URL and the
-  person's credential never enter the runtime.
-- The proxy accepts a request only with the right token **and** from that runtime's own address on the
-  private network, looks up the person's registration, and forwards the request to your `url` with the
+- Each runtime's `mcp.toml` lists your server as `http://127.0.0.1:8790/mcp/<runtime id>/app`: inside the
+  microVM that port is forwarded over vsock to a Unix socket of the gateway that exists for this runtime
+  only. Calls are authenticated with a per-runtime proxy token from the daemon's environment
+  (`MCP_PROXY_TOKEN`). Your URL and the person's credential never enter the runtime.
+- The proxy accepts a request only with the right token **and** on that runtime's own socket, looks up
+  the person's registration, and forwards the request to your `url` with the
   person's latest `mcpAuth` value as `Authorization`. JSON responses and SSE streams pass through
   unchanged, including questions your server asks mid-call (MCP elicitation), which reach the person as
   permission questions on `GET /v1/events` and are answered through `/v1/.../questions`.
@@ -279,177 +313,107 @@ only small MCP tools directly; larger ones it may fail to load.
 
 All settings are environment variables, documented with defaults in `.env.example`. The important ones:
 `AUTH_MODE` (`oidc` with `OIDC_ISSUER`/`OIDC_AUDIENCE`/`OIDC_JWKS_URL`, or `dev`), `SERVICE_SECRET`,
-`RUNTIME_DOCKER_HOST`, `RUNTIME_IMAGE`, `IDLE_MINUTES` (default 5; a runtime never stops while a run, a
-question or a sign-in is open), `PERMISSION_MODE` (default `auto`, the safest mode in which MCP tools run;
-never use `full_access` for people's chats) and, for application MCP servers, `MCP_ALLOWED_ORIGINS`,
-`MCP_PROXY_PORT` (default 8790, never published) and `MCP_PROXY_URL` (default: the gateway's address on
-each runtime's own network). `RUNTIME_PREFIX` names every container, volume, network and label of one
-instance, so several instances can share a Docker Engine (each with its own directory, `.env`, prefix
-and `GATEWAY_PORT`). The hardening settings are described under [Security](#security).
+`RUNTIME_MEMORY_MB` and `RUNTIME_CPUS` (each microVM's size, default 2048 MiB and 2), `IDLE_MINUTES`
+(default 5; a runtime never stops while a run, a question or a sign-in is open), `PERMISSION_MODE`
+(default `auto`, the safest mode in which MCP tools run; never use `full_access` for people's chats),
+`MCP_ALLOWED_ORIGINS` for application MCP servers, and the egress settings under
+[Security](#security). `RUNTIME_PREFIX` names every microVM and label of one instance.
 
-Each runtime keeps all its state on its volume: Happy's database, the conversations, the vendor sign-ins
-and the agents' working folder. Tandem has no database of its own.
+Each runtime keeps all its state in its home (`DATA_DIR/homes/<id>`, on the `tandem-data` volume):
+Happy's database, the conversations, the vendor sign-ins and the agents' working folder. Tandem has no
+database of its own.
+
+### Capacity
+
+A stopped runtime costs only its home on disk; a running one costs its microVM. Memory is a ceiling,
+not a reservation: the host gives a microVM pages as it touches them and gets them back only when it
+stops, so plan on up to `RUNTIME_MEMORY_MB` (plus ~100 MiB for the VMM) per person working at the same
+time. An idle running daemon uses about 200-300 MiB inside its microVM, but its start touches more: in
+the tests a running microVM held about 1.5 GiB of host memory with the default 2 GiB ceiling. The idle stop
+(`IDLE_MINUTES`) returns everything. Start-up: a microVM boots in about a second on KVM hardware; a
+person's very first start also lets Happy unpack its Claude Code copy into the home, once. Disk: the
+image (~3 GB, mostly the runtime archive), the loaded runtime image in `DATA_DIR/msb` (~2 GB, once per
+version), and each home (sign-ins, conversations, the 341 MiB unpacked Claude Code, the agents' files).
+
+Bridge ports are allocated from 41000-48999 on the container's loopback, which caps one Tandem
+container at 8000 people with a microVM (running or stopped).
 
 ## Operations and upgrades
 
-**Restarting or redeploying.** The gateway and the egress proxy can be recreated at any time, together
-or alone and in any order (`docker compose up -d`, with or without `--force-recreate` or `--no-deps`).
-Running runtimes are not restarted and runs in progress continue. A runtime reaches both by address
-(gVisor has no DNS), so each one keeps a fixed address on every runtime network: the gateway the
-subnet's last address, the egress proxy the one before it. Docker gives every other container the
-lowest free address, so nothing else takes them while either container is being recreated. At startup
-and every 30 seconds the gateway puts itself and the egress proxy back at the addresses each running
-runtime was created with, also when a recreated egress proxy got the gateway's address in the meantime.
-What a restart does interrupt:
+**Restarting or redeploying.** On `SIGTERM` the gateway stops every running microVM gracefully, then
+exits (`stop_grace_period: 60s` in `compose.yaml`; `init: true` reaps the microVM processes). After a
+restart nothing runs until it is used again: reads answer from memory (`unknown` after a restart, see
+Other notes), and opening `/v1/events` boots the person's microVM. What a restart interrupts:
 
+- Runs in progress stop; their conversations stay in the person's home.
 - Open `/v1/events` streams close. Reconnect them (as `EventSource` does); the first
   `provider.updated` per provider after reconnecting is the live state.
 - `mcpAuth` credentials live in the gateway's memory only. Until the next message brings them again,
   MCP tool calls answer `Sign-in for <name> expired or is missing`.
-- A recreated egress proxy drops the outbound connections that were open through it, and the vendor
-  CLIs retry them. Under gVisor, new connections work again only after about 30 seconds (up to a
-  minute): each sandbox notices the proxy's new hardware address at the same IP address only when its
-  neighbour entry expires. Under runc they work at once. The gateway is reachable from runtimes at once
-  either way, so a gateway-only redeploy has no such pause.
 
-**When an address cannot be restored.** If another container holds the address a running runtime
-expects, or the Docker Engine refuses fixed addresses (29.0 releases before 29.0.4 and 29.1 releases
-before 29.1.3 do, moby#51583), the gateway logs a `WARNING:` and restarts that runtime at the current
-addresses once nothing in it would be cut off: no run and no sign-in in progress. A question or a code
-that waits for the person does not hold it up, because the person cannot answer it before the
-restart. Meanwhile the person's providers show `connecting` and their requests answer
-`503 runtime_unavailable`; then the live state follows on the stream. The volume is kept.
+**A microVM stopped or crashed outside the gateway** (for example `msb stop`) is booted again as soon
+as the person's event stream is open, or on their next request.
 
-**Upgrading** from a version without fixed addresses: pull, rebuild the images (Quick start) and run
-`docker compose up -d --no-build`. Running runtimes need nothing else: the new gateway reads from inside
-each one the gateway and egress proxy addresses it was created with and takes them again, moving the
-egress proxy if an earlier restart left it on the gateway's address, and they keep running. Runtimes
-started afterwards get the fixed addresses. With the socket proxy, recreate the proxy together with the
-gateway so that its new policy is active first (Compose does not notice a changed mounted file):
-`docker compose -f compose.yaml -f compose.socket-proxy.yaml up -d --no-build --force-recreate docker-proxy gateway`.
+**Upgrading.** Rebuild and recreate the container (`docker compose up -d --build`, or redeploy in
+Dokploy). A new runtime image version is loaded once at start. Each stopped microVM is recreated from
+the new image the next time it starts; its home is a separate directory and is kept. A running one is
+never cut off: it moves to the new image after its next stop. The same applies to changes of
+`RUNTIME_MEMORY_MB`, `RUNTIME_CPUS` and the egress settings. Old images stay in microsandbox's cache
+until `docker compose exec tandem msb image prune`.
+
+**Upgrading from the Docker-based Tandem (0.1).** Homes move from Docker volumes to directories: for
+each `tandem-home-<id>` volume, copy its contents to `DATA_DIR/homes/<id>` in the new container's data
+volume (same `<id>`, same `SERVICE_SECRET`), owned by `10001:10001`, then remove the old
+`tandem-rt-*` containers, `tandem-net-*` networks, the egress proxy and, if used, the socket proxy.
 
 ## Security
 
 The threat Tandem is built against: an agent with a shell inside its runtime (possibly steered by
-prompt injection) tries to break out to the host, or to reach what it should not over the network.
-Four protections stack up. Each has a safe default, is detected at startup, degrades with a `WARNING:`
-line instead of locking anyone out when the host cannot provide it, and has an explicit setting to
-require it or to relax it. The gateway logs one `security:` line with what it found at startup;
-`GET /healthz` reports the egress mode. `bun scripts/e2e-hardening.ts` proves each one on a running
-stack.
+prompt injection) tries to break out to the host or to other people's runtimes, or to reach what it
+should not over the network. The gateway logs one `security:` line at startup; `GET /healthz` reports
+the egress mode.
 
-### 1. Sandbox: gVisor when available
+### 1. A microVM per person
 
-`RUNTIME_OCI_RUNTIME=auto` (default) runs runtimes under gVisor (`runsc`) when the Docker Engine
-offers it, so the agent talks to gVisor's user-space kernel instead of the host's. Without it, runtimes
-use the Engine's default (`runc`) and the gateway warns. `default` accepts the Engine default silently;
-any other value (`runsc`, `runsc-kvm`, `kata-runtime`) is required, and the gateway refuses to start
-when the Engine lacks it. Docker Desktop has no gVisor: use a Linux host or VM for it.
+Every runtime is its own virtual machine with its own Linux kernel, run by microsandbox (libkrun) on
+the host's KVM. A process inside it, root or not, talks to that guest kernel only; to reach the host or
+another person it has to escape the hypervisor. The Tandem container itself needs only the `/dev/kvm`
+device (Docker's default seccomp profile and capabilities, no privileged mode, no Docker socket). It runs
+as root inside the container because `/dev/kvm`'s group differs between hosts; the microVMs, not the
+container, are the boundary between people.
 
-Install gVisor on a Linux Docker host (x86_64 or arm64, kernel 5.6+), from
-[gvisor.dev](https://gvisor.dev/docs/user_guide/install/):
+Each microVM gets fixed vCPUs and memory (`RUNTIME_CPUS`, `RUNTIME_MEMORY_MB`), its own copy-on-write
+root disk over the shared, read-only runtime image, and exactly one mount: the person's own home at
+`/home/agent`. The agents run as the image's non-root `agent` user (uid 10001). Codex's bubblewrap
+sandbox and Happy's own sandbox (used by Grok and OpenRouter shell commands) work inside the microVM.
 
-```sh
-sudo apt-get update && sudo apt-get install -y apt-transport-https ca-certificates curl gnupg
-curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" \
-  | sudo tee /etc/apt/sources.list.d/gvisor.list > /dev/null
-sudo apt-get update && sudo apt-get install -y runsc    # the package registers runsc in /etc/docker/daemon.json
-sudo systemctl reload docker
-docker info --format '{{json .Runtimes}}'               # must list "runsc"; then restart the gateway
-```
+### 2. What a microVM can reach
 
-Happy Agent, Claude Code (including its Bash tool) and Codex run under gVisor; Codex's own
-bubblewrap sandbox works there too, while under `runc` it cannot create namespaces (the container
-remains the boundary). Grok and OpenRouter conversations run shell commands in Happy's own sandbox,
-which needs the same user namespaces: under `runc` with the defaults below those commands fail
-(`create user namespace: Operation not permitted`), while chat, file tools and MCP tools work. Gemini's
-shell commands run in Antigravity's own sandbox, which was not exercised in this release's tests. Docker's
-embedded DNS does not answer inside gVisor sandboxes, so runtimes get
-the gateway and the egress proxy by address, never by name. Expect a slower first start of a fresh
-volume (Happy unpacks Claude Code once) and more processes per runtime in `docker stats`.
+Each microVM has its own small network with only its host-side gateway on it; microsandbox enforces a
+policy on every connection the guest opens:
 
-### 2. Locked-down runtime containers
+- **Other people's microVMs, the gateway's API, the host, private and link-local networks and cloud
+  metadata: never.** (The listed `EGRESS_ALLOW_RANGES` are the only exception.)
+- **The Internet:** with `EGRESS_MODE=allowlist` (default) only the hostnames in
+  `runtime/egress-allowlist.txt` (Anthropic, OpenAI/ChatGPT, xAI's sign-in `auth.x.ai` and Grok endpoint
+  `cli-chat-proxy.grok.com`, `openrouter.ai`, the Gemini API `generativelanguage.googleapis.com`, GitHub)
+  plus `EGRESS_ALLOW_DOMAINS`, on ports 80 and 443. Hostnames are matched on what the connection
+  reveals (the DNS query and the TLS SNI), without decrypting it, like a CONNECT proxy's allowlist.
+  Vendor telemetry outside the list (for example Datadog log intake, Antigravity's
+  `play.googleapis.com`) is refused. `EGRESS_MODE=open` allows any public address.
+- **The gateway's MCP proxy:** only through a vsock route to a Unix socket of the gateway that exists for
+  this microVM alone (`DATA_DIR/run/<id>.sock`), which the entrypoint exposes at `127.0.0.1:8790` inside
+  the microVM. A request on that socket can only come from that person's runtime.
 
-| Setting | Default | Effect |
-| --- | --- | --- |
-| `RUNTIME_USER` | `10001:10001` | the image's `agent` user; empty = the image's own user |
-| `RUNTIME_CAP_ADD` | empty | `CapDrop: ALL` always; add back only what you need (comma-separated) |
-| `RUNTIME_NO_NEW_PRIVILEGES` | `true` | setuid binaries cannot raise privileges |
-| `RUNTIME_READ_ONLY_ROOTFS` | `true` | read-only root filesystem; writable: the person's volume (`/home/agent`) and a `noexec` `/tmp` tmpfs of `RUNTIME_TMPFS_MB` (256) |
-| `RUNTIME_MEMORY_MB`, `RUNTIME_CPUS`, `RUNTIME_PIDS` | `2048`, `2`, `512` | `0` lifts a limit |
-
-`TMPDIR` points into the volume (`~/.cache/tmp`), so the 341 MiB Claude Code binary Happy unpacks lands
-there once per person instead of in memory or a container layer. A stopped runtime is recreated when
-any of these settings, the image or its network changes; a running one is never cut off.
-
-### 3. Narrow Docker access for the gateway
-
-The plain Engine socket is root on the host. The gateway detects whether its Docker API is filtered
-and warns when it is not (`RUNTIME_DOCKER_PROXY=auto`); `required` refuses to start without a filter,
-`none` accepts the plain socket silently. The optional filter is
-[Sockguard](https://github.com/CodesWhat/sockguard), a maintained Docker API proxy that inspects
-request bodies (path- or section-based proxies such as Tecnativa's or wollomatic's cannot refuse a
-privileged container):
-
-```sh
-docker compose -f compose.yaml -f compose.socket-proxy.yaml up -d
-```
-
-The gateway then talks to a Unix socket on a private volume (the proxy has no network at all). The
-policy, `deploy/sockguard.yaml`, is default-deny: the gateway may only create, start, stop, inspect,
-exec into and copy files into containers, volumes and networks that carry Tandem's ownership label
-(`<RUNTIME_PREFIX>.home=1`, which every person volume has always had; Sockguard stamps it on whatever
-the gateway creates). It cannot see or touch other containers, run privileged containers, add
-capabilities, share host namespaces or devices, mount host paths, run another image, or exec as root
-or anything but its own few commands. Notes:
-
-- `RUNTIME_IMAGE` must be fully qualified (`docker.io/library/tandem-runtime:…`, the default).
-- If the proxy logs `permission denied on upstream socket`, set
-  `DOCKER_SOCKET_GID=$(stat -c %g /var/run/docker.sock)`. Rootless Docker: set `DOCKER_SOCKET` to
-  `$XDG_RUNTIME_DIR/docker.sock`.
-- Relaxing a runtime setting (another user, capabilities, no limits, another OCI runtime) needs the
-  matching change in `deploy/sockguard.yaml`.
-- The policy lets the gateway give itself and the egress proxy fixed addresses on runtime networks
-  (`endpoint_config.allow_static_addressing`; MAC addresses, links and endpoint driver options stay
-  refused), and run two read-only commands inside runtimes: one that prints the addresses a runtime
-  was created with (the proxy hides container environments) and one that asks its daemon whether a run
-  is in progress (see Operations).
-- Containers created before switching to the proxy lack the label: remove the stopped
-  `<prefix>-rt-*` containers once (they hold no data); volumes keep working.
-
-### 4. Network isolation and egress control
-
-Each runtime gets its own internal Docker network (`<prefix>-net-<id>`) shared only with the gateway
-and the egress proxy, at fixed addresses (see Operations): no route out, no access to other runtimes,
-other apps' containers or the host.
-On Docker Engine 28+ the network is created in isolated gateway mode, so the host has no address on
-it either; older Engines keep one and the gateway warns that services listening on all host
-interfaces are reachable. Networks are removed when a runtime stops. If Docker runs out of address
-pools, runtimes fall back to one shared internal network with a warning
-(`RUNTIME_NETWORK_ISOLATION=auto`; `per_runtime` never falls back, `shared` always shares); enlarge
-`default-address-pools` in `daemon.json` for many concurrent people.
-
-All outbound traffic goes through the egress proxy, Stripe's
-[Smokescreen](https://github.com/stripe/smokescreen) (`egress/`), via `HTTPS_PROXY`/`HTTP_PROXY`, which
-Claude Code, Codex, the Grok CLI, Happy, git and curl honour (`NO_PROXY` lists the gateway). It allows
-only the hostnames in `egress/allowlist.txt` (Anthropic, OpenAI/ChatGPT, xAI's sign-in `auth.x.ai` and
-Grok endpoint `cli-chat-proxy.grok.com`, `openrouter.ai`, the Gemini API
-`generativelanguage.googleapis.com`, GitHub) and refuses private, loopback,
-link-local and CGNAT addresses in every mode. Vendor telemetry outside the list (for example Datadog
-log intake, Antigravity's `play.googleapis.com`) is refused. People open the vendors' sign-in pages (`accounts.x.ai` for Grok) in their own
-browser, not in the runtime.
+People open the vendors' sign-in pages (`accounts.x.ai` for Grok) in their own browser, not in the
+runtime. The gateway itself (not the runtimes) calls your app's MCP servers, only at
+`MCP_ALLOWED_ORIGINS`.
 
 | Setting | Default | Effect |
 | --- | --- | --- |
-| `EGRESS_MODE` | `auto` | `auto`/`allowlist`: the allowlist; `open`: any public host; `off`: no proxy, runtimes get direct Internet access (and the host and LAN). `auto` falls back to `off` with a warning when the proxy container is missing; an explicit mode is required |
-| `EGRESS_ALLOW_DOMAINS` | empty | extra hostnames, e.g. `registry.npmjs.org,pypi.org,files.pythonhosted.org,git.example.com`; `*.example.com` covers subdomains only |
-| `EGRESS_ALLOW_RANGES` | empty | private CIDRs runtimes may reach anyway, e.g. an internal registry |
-| `EGRESS_PROXY` | `<prefix>-egress:4750` | the egress proxy container and port |
-
-People's MCP servers keep working: runtimes reach them only through the gateway's MCP proxy (the
-gateway's address on the runtime's network, port `MCP_PROXY_PORT`, outside the egress proxy), and the
-gateway makes the upstream calls itself, only to `MCP_ALLOWED_ORIGINS`.
+| `EGRESS_MODE` | `allowlist` | `allowlist`: the hosts above; `open`: any public address |
+| `EGRESS_ALLOW_DOMAINS` | empty | extra hostnames, e.g. `registry.npmjs.org,pypi.org,files.pythonhosted.org,git.example.com`; `*.example.com` covers subdomains (list the apex too) |
+| `EGRESS_ALLOW_RANGES` | empty | IPv4 CIDRs runtimes may reach anyway (TCP), e.g. an internal registry |
 
 ### Happy's own agent loop (Grok and OpenRouter)
 
@@ -469,9 +433,9 @@ prompt, tools, sandbox and compaction with the vendor's model. Consequences:
   Claude (OpenRouter's reasoning guide asks for them) there. Happy reads
   their names, context windows and efforts from OpenRouter. Edit the list and rebuild the image to
   change it.
-- **The OpenRouter key** is the person's own: written by the gateway to the person's volume and put into
+- **The OpenRouter key** is the person's own: written by the gateway to the person's home and put into
   the generated `happy.toml` as Happy's `api_key` at each start, like the Anthropic key, never into a
-  process environment. The person's own agent can read it, as it can every file on the volume.
+  process environment. The person's own agent can read it, as it can every file in the home.
 
 ### Gemini: Google's agent on the person's own API key
 
@@ -498,25 +462,24 @@ a typed failure: Antigravity reports it as text and ends the turn normally.
 ### Other notes
 
 - **Tokens.** Service JWTs are verified on every request; event streams close when the token expires. In
-  production use `AUTH_MODE=oidc`. Development tokens (`AUTH_MODE=dev`) are for local use only, and
-  `POST /dev/token` refuses requests from runtime networks.
+  production use `AUTH_MODE=oidc`. Development tokens (`AUTH_MODE=dev`) are for local use only;
+  runtimes cannot reach `POST /dev/token` (or any gateway route) at all.
 - **Secrets in transit.** Login codes and API keys pass through the gateway in memory only: they are not
   logged, stored or echoed (unit-tested). Error responses never include request or daemon bodies.
 - **Last-known provider state.** For a stopped runtime the gateway answers `GET /v1/providers` from the
   views it last read (status, method, account e-mail and plan, models, `checkedAt`), kept in memory per
-  person: no tokens, keys or codes. It is not persisted. After a gateway restart the answer is `unknown`
-  until the runtime has run, instead of reading the volume: a stopped runtime's container is removed, so
-  reading its files would mean creating a container just for that, outside the gateway's narrow Docker
-  access. Answering a read is never a reason to start a runtime: an app that prefetches at sign-in must
-  not wake every person's container.
+  person: no tokens, keys or codes. It is not persisted. After a restart the answer is `unknown` until
+  the runtime has run. Answering a read is never a reason to start a runtime: an app that prefetches at
+  sign-in must not boot every person's microVM.
 - **Application credentials.** `mcpAuth` values live only in the gateway's memory, keyed by person, and go
   only to that person's registered URL on an allowed origin (no redirects followed). The runtime's proxy
-  token is in its environment, so the person's agent can read it; it is useless elsewhere, because the
-  proxy port is not published and the proxy also checks the caller's address. With it the agent can do
-  what its MCP tools already can. Keep `MCP_ALLOWED_ORIGINS` to your own app: the gateway can reach
-  networks the runtimes cannot.
-- **Images.** Every download in `runtime/Dockerfile` and `egress/Dockerfile` is pinned and
-  checksum-verified; Sockguard is pinned by digest. Do not publish runtime images (see Vendor terms).
+  token is in its daemon's environment, so the person's agent can read it; it is useless elsewhere,
+  because the proxy accepts it only on that person's own vsock route. With it the agent can do what its
+  MCP tools already can. Keep `MCP_ALLOWED_ORIGINS` to your own app: the gateway can reach networks the
+  runtimes cannot.
+- **Images.** Every download in the `Dockerfile` is pinned and checksum-verified, and the npm
+  dependencies (microsandbox included) are locked in `bun.lock`. Do not publish Tandem images (see
+  Vendor terms).
 
 ## Vendor terms
 
@@ -537,28 +500,30 @@ package at build time; prebuilt images containing it must not be published. See 
 
 ## Limitations
 
-- Pinned to Happy Agent 2026.11.6-preview.7, Codex 0.160.1, Claude Code 2.1.321, the Grok CLI 1.0.89 and
-  the Antigravity CLI 1.5.11, for linux/arm64 and linux/amd64. `RUNTIME_PLATFORM` can run the non-native variant under emulation, which is slow and only
-  meant for testing.
+- Needs KVM. Hosts without `/dev/kvm` (most shared cloud VPS plans, Docker Desktop) cannot run Tandem;
+  the gateway refuses to start there.
+- **Not yet measured on bare-metal KVM.** This release was verified (`evidence/e2e-microvm.txt`) on Apple
+  M4 hardware inside a Lima VM with nested virtualization, where every guest page fault crosses two
+  hypervisors: a microVM boots in 2.5-4 s, but the live state after a person's first start arrives after
+  about 100 s and after later starts about 75 s (the same runtime as a plain container in that VM is
+  ready in 3 s), almost all of it Happy Agent loading its 341 MiB binary. Expect close to container
+  speed on a KVM host without nesting; measure it on your server before relying on it.
+- One Tandem container serves one host's capacity (see Capacity). More people means a bigger server;
+  several Tandem containers on several servers need your app to send each person to the same one.
+- Pinned to Happy Agent 2026.11.6-preview.7, Codex 0.160.1, Claude Code 2.1.321, the Grok CLI 1.0.89,
+  the Antigravity CLI 1.5.11 and microsandbox 0.7.16 (beta software), for linux/arm64 and linux/amd64.
 - Happy's `claude_code` harness always starts the Claude Code copy embedded in Happy Agent (byte-identical
   to the official 2.1.321 build) and ignores the `executable` setting in this version.
-- Claude Code and Codex turns with real accounts were not run under gVisor in this release's tests
-  (sign-in flows, Claude Code's Bash tool against a stand-in API and Codex's sandbox were). Grok and
-  OpenRouter were verified without real accounts: Grok's device sign-in up to the code, OpenRouter's key
-  check against OpenRouter, and Happy's own loop (Auto review, file and MCP tools) against a stand-in
-  OpenRouter API under `runc`. Gemini was verified up to Google's key check: the gateway's check, and a
-  turn that reached the Gemini API through the egress proxy and came back "API key not valid"; no
-  Gemini turn, tool call or MCP call has run with a real key.
+- Grok and OpenRouter were verified without real accounts: Grok's device sign-in up to the code,
+  OpenRouter's key check against OpenRouter, and Happy's own loop (Auto review, file and MCP tools)
+  against a stand-in OpenRouter API. Gemini was verified up to Google's key check; no Gemini turn, tool
+  call or MCP call has run with a real key.
 - Gemini earlier read "not offered" here, because Antigravity's own sign-in fails under Happy (it needs a
   terminal) and Google's terms forbid it for third-party software. It is offered on the person's own
   Gemini API key instead (see Security, Gemini).
-- The Docker runtime controller is for a single host. A Kubernetes implementation of the `Runtime`
-  interface (`src/runtime.ts`) is the path to multiple hosts.
-- Under gVisor, new outbound connections from running runtimes pause for about 30 seconds (up to a
-  minute) after the egress proxy container is recreated (see Operations).
 - Happy generates a conversation's title from its first messages, which include that message's
   `context`; set a `title` (or `PATCH` it) when the context must not show up there. Happy has no rename,
-  so `PATCH` titles are kept by the gateway in the person's volume.
+  so `PATCH` titles are kept by the gateway in the person's home.
 - MCP server and `enabledTools` changes apply after the automatic idle restart; standing instructions
   apply to new conversations.
 - The signed registration file can be rolled back by the person's own agent to an earlier version the
