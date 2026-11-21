@@ -9,6 +9,9 @@
 //   FAIL_USAGE     HTTP 429 `usage_limit_reached` with a reset time (body and rate-limit headers)
 //   RECALL         text naming every earlier message of the person it was sent (proves history)
 // A tool's result always answers with "TOOL_RESULT_SEEN <output>"; anything else "hello from mock".
+// Codex's catalog models run in code mode: their only tool is `exec`, JavaScript that calls the
+// nested tools (`await tools.exec_command({ cmd })`), offered in an `additional_tools` input item;
+// then each call above is a script making that one call.
 // It is also OpenAI's sign-in issuer for `codex login --device-auth --experimental_issuer <origin>`
 // (device code, then tokens whose id_token names DEVICE_EMAIL on a Plus plan).
 import { appendFileSync } from "node:fs";
@@ -144,6 +147,24 @@ export async function handle(req: Request) {
     log("TOOL_RESULT " + out.slice(0, 500));
     return say(id, "TOOL_RESULT_SEEN " + out.slice(0, 300));
   }
+  /** Code mode's nested tools, by their JavaScript names (`exec_command`, `mcp__app__lookup_customer`). */
+  const nested = items
+    .filter((i) => i?.type === "additional_tools")
+    .flatMap((i) => i.tools ?? [])
+    .flatMap((t: any) => (t.type === "namespace" ? t.tools ?? [] : [t]))
+    .find((t: any) => t.type === "custom" && t.name === "exec");
+  const script = (source: string) => {
+    log(`CALL exec ${JSON.stringify(source)}`);
+    return done(id, [
+      {
+        type: "custom_tool_call",
+        id: "ctc" + id,
+        call_id: "call_" + Date.now(),
+        name: "exec",
+        input: source,
+      },
+    ]);
+  };
   const mine = personMessages(items);
   const text = mine.at(-1) ?? JSON.stringify(last ?? {});
   const call = (tool: string, args: unknown) => {
@@ -161,6 +182,10 @@ export async function handle(req: Request) {
     ]);
   };
   const shell = (cmd: string, extra: Record<string, unknown> = {}) => {
+    if (nested && /\bexec_command\(/.test(nested.description ?? ""))
+      return script(
+        `const r = await tools.exec_command(${JSON.stringify({ cmd, ...extra })});\ntext(typeof r === "string" ? r : r.output ?? JSON.stringify(r));`,
+      );
     if (tools.includes("exec_command"))
       return call("exec_command", { cmd, ...extra });
     if (tools.includes("shell_command"))
@@ -171,6 +196,24 @@ export async function handle(req: Request) {
     return say(id, "no shell tool");
   };
   const mcp = (tool: string, args: unknown) => {
+    const js = (nested?.description ?? "").match(
+      new RegExp(`\\b(mcp__[A-Za-z0-9_]+__${tool})\\(`),
+    )?.[1];
+    if (js)
+      return script(
+        `const r = await tools.${js}(${JSON.stringify(args)});\ntext(typeof r === "string" ? r : JSON.stringify(r));`,
+      );
+    // Deferred (MCP tools are): not in the description, but on `tools` and listed in ALL_TOOLS.
+    if (nested)
+      return script(
+        [
+          `const t = ALL_TOOLS.find((x) => x.name.endsWith(${JSON.stringify(tool)}));`,
+          `if (!t) { text("no MCP tool ${tool} in " + ALL_TOOLS.map((x) => x.name).join(",")); exit(); }`,
+          `const f = tools[t.name] ?? tools[t.name.replace(/[^A-Za-z0-9_$]/g, "_")];`,
+          `const r = await f(${JSON.stringify(args)});`,
+          `text(typeof r === "string" ? r : JSON.stringify(r));`,
+        ].join("\n"),
+      );
     const name = tools.find((t) => t.startsWith("mcp__") && t.endsWith(`/${tool}`));
     if (!name) {
       log(`NO MCP TOOL ${tool}`);

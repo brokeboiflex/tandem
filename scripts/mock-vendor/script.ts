@@ -77,11 +77,13 @@ export function decide(
       log("CALL " + t.name);
       return { call: { name: t.name, args: argsFor(t.schema, null, { id: "42" }) } };
     }
-    // Grok Build offers MCP tools through its use_tool dispatcher (found with search_tool).
+    // Grok Build offers MCP tools through its use_tool dispatcher (found with search_tool), named
+    // <server>__<tool>: the proofs' server "app", or MOCK_MCP_SERVER.
     const use = tools.find((x) => x.name === "use_tool");
     if (use) {
-      log("CALL use_tool app__lookup_customer");
-      return { call: { name: "use_tool", args: { tool_name: "app__lookup_customer", tool_input: { id: "42" } } } };
+      const tool = `${process.env.MOCK_MCP_SERVER || "app"}__lookup_customer`;
+      log(`CALL use_tool ${tool}`);
+      return { call: { name: "use_tool", args: { tool_name: tool, tool_input: { id: "42" } } } };
     }
     log("NO MCP TOOL in " + tools.map((x) => x.name).join(","));
   }

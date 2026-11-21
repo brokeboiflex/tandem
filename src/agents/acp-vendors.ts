@@ -328,6 +328,10 @@ export function openrouterAgent(o: VendorOptions) {
         (e.data as any)?.reason === "credits_exhausted"
           ? fail.usageLimit("openrouter", null, e.message)
           : null,
+      // After session/load goose first finishes a run the previous process left (an interrupted
+      // tool call): "session already has active run `resume_…`; use …/session/steer".
+      busy: (e: RpcError) =>
+        e.code === -32602 && /already has active run/i.test(rpcText(e)),
       verifyApiKey: (sb, key, apiKey) =>
         checkKey(sb, key, apiKey, {
           header: "Authorization: Bearer %s",

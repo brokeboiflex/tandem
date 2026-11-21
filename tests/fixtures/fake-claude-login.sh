@@ -4,7 +4,7 @@
 #   good…     signs in (writes ~/.claude/.credentials.json) and exits 0
 #   refused…  Claude refuses the code for good: the attempt ends (exit 1)
 #   crash…    fails for another reason (exit 1)
-#   anything else is a malformed code: "Invalid code", and it keeps waiting
+#   anything else is a malformed code: Claude Code 2.1.330's own refusal, and it keeps waiting
 set -u
 dir="$HOME/.claude"
 case "${1:-} ${2:-}" in
@@ -23,7 +23,7 @@ while IFS= read -r code; do
     good*) echo '{"claudeAiOauth":{}}' > "$dir/.credentials.json"; echo "Login successful."; exit 0 ;;
     refused*) echo "Login failed: That code wasn't accepted. It may be incomplete, expired, already used, or from an earlier sign-in attempt. Sign in again to get a new code."; exit 1 ;;
     crash*) echo "Login failed: connect ECONNREFUSED 160.79.104.10:443"; exit 1 ;;
-    *) echo "Invalid code. Please make sure the full code was copied."; printf "Paste code here if prompted > " ;;
+    *) echo "That doesn't look like the full code. Copy all of it, including the # in the middle."; printf "Paste code here if prompted > " ;;
   esac
 done
 exit 1

@@ -710,9 +710,11 @@ describe("MCP servers and instructions", () => {
     const files = written
       .filter((w) => w.key === keyOf("ins"))
       .map((w) => `${w.dir}/${w.name}`);
+    // Grok Build reads a workspace's AGENTS.md only in a trusted folder: its global rules too.
     expect(files).toEqual([
       "/home/agent/projects/chats/AGENTS.md",
       "/home/agent/projects/chats/CLAUDE.md",
+      "/home/agent/.grok/AGENTS.md",
     ]);
     await call("ins", "PUT", "/v1/instructions", { text: "" });
     expect(execs.at(-1)).toEqual([
@@ -720,6 +722,7 @@ describe("MCP servers and instructions", () => {
       "-f",
       "/home/agent/projects/chats/AGENTS.md",
       "/home/agent/projects/chats/CLAUDE.md",
+      "/home/agent/.grok/AGENTS.md",
     ]);
   });
 });
@@ -736,4 +739,94 @@ test("a model without a default effort leaves the effort to the vendor unless on
   } finally {
     (MODELS.claude[1] as any).defaultEffort = saved;
   }
+});
+
+describe("a gateway of its own", () => {
+  /** A second gateway on its own store, driven through its fetch handler. */
+  function second(agent: FakeAgent) {
+    // Short: the person's MCP socket lives below it (Unix socket paths are short).
+    const d = mkdtempSync(join(tmpdir(), "gw-"));
+    const st = new Store(join(d, "tandem.db"));
+    const gw = createGateway(
+      { ...cfg, dataDir: d } as Config,
+      {
+        runtime: fakeRuntime(d),
+        agents: [agent, new FakeAgent(["codex"]), new FakeAgent(["grok", "openrouter", "gemini"])],
+        signIns: [],
+        store: st,
+        log: () => {},
+      },
+    );
+    const req = async (subject: string, method: string, path: string, body?: unknown) => {
+      const res = await gw.fetch(
+        new Request(`http://gw${path}`, {
+          method,
+          headers: {
+            authorization: `Bearer ${await token(subject)}`,
+            ...(body ? { "content-type": "application/json" } : {}),
+          },
+          body: body ? JSON.stringify(body) : undefined,
+        }),
+      );
+      return { status: res.status, body: await res.json().catch(() => null) };
+    };
+    return { gw, st, req };
+  }
+
+  test("a restart mid-run fails the run: the person did not abort it", async () => {
+    const agent = new FakeAgent(["claude"]);
+    const { gw, req } = second(agent);
+    let started!: () => void;
+    const running = new Promise<void>((r) => (started = r));
+    agent.script = (_i, _sink, signal) =>
+      new Promise((resolve) => {
+        started();
+        signal.addEventListener("abort", () => resolve({ status: "aborted" }));
+      });
+    await req("rs", "POST", "/v1/providers/claude/connect", { method: "api_key", apiKey: "good-key-0000000000000000" });
+    for (let i = 0; i < 50 && (await req("rs", "GET", "/v1/providers")).body.providers[0].status !== "connected"; i++)
+      await Bun.sleep(20);
+    const c = (await req("rs", "POST", "/v1/conversations", { provider: "claude", model: "claude-code/default" })).body.conversation;
+    await req("rs", "POST", `/v1/conversations/${c.id}/messages`, { text: "go" });
+    await running;
+    await gw.shutdown();
+    await Bun.sleep(20);
+    const m = (await req("rs", "GET", `/v1/conversations/${c.id}/messages`)).body;
+    expect(m.runs.at(-1)).toMatchObject({ status: "failed", failure: { code: "failed" } });
+    expect(m.messages.at(-1)).toMatchObject({ role: "error", failure: { code: "failed" } });
+  });
+
+  test("after an account change the account is read once the old program is released", async () => {
+    // A release ends every process of the agent: a read already running then fails.
+    const agent = new FakeAgent(["claude"]);
+    let releasing = 0;
+    let readsKilled = 0;
+    const read = agent.read.bind(agent);
+    agent.release = async (key: string) => {
+      agent.released.push(key);
+      releasing++;
+      await Bun.sleep(30);
+      releasing--;
+    };
+    agent.read = async (key, provider) => {
+      if (releasing) {
+        readsKilled++;
+        throw new Error("Claude Code process exited with code 143");
+      }
+      return read(key, provider);
+    };
+    const { req } = second(agent);
+    const r = await req("ac", "POST", "/v1/providers/claude/connect", { method: "api_key", apiKey: "good-key-0000000000000000" });
+    expect(r.body.connection.status).toBe("connected");
+    let view: any;
+    for (let i = 0; i < 50; i++) {
+      view = (await req("ac", "GET", "/v1/providers")).body.providers[0];
+      if (view.status === "connected") break;
+      await Bun.sleep(20);
+    }
+    expect(agent.released).toEqual([keyOf("ac")]);
+    expect(readsKilled).toBe(0);
+    expect(view).toMatchObject({ status: "connected", method: "api_key" });
+    expect(view.models.length).toBeGreaterThan(0);
+  });
 });

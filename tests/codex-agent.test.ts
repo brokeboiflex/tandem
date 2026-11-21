@@ -141,7 +141,8 @@ describe("a turn", () => {
     // Tandem's settings on argv, as `-c` overrides; the app-server is the person's own process.
     const argv: string[] = received().find((e) => e.argv).argv;
     for (const c of CODEX_SETTINGS) expect(argv).toContain(c);
-    expect(boxes.spawned[0]).toMatchObject({ key, label: "codex" });
+    // In the chat workspace, which the sandbox makes: Codex runs every command in the thread's cwd.
+    expect(boxes.spawned[0]).toMatchObject({ key, label: "codex", cwd: "/home/agent/projects/chats" });
     expect(boxes.spawned[0]!.args.slice(0, 2)).toEqual(["codex", "app-server"]);
     expect(received().find((e) => e.env).env.TZ).toBe("UTC");
     const [init] = requests("initialize");
@@ -366,6 +367,13 @@ describe("abort, failures, resume, MCP, lifetime", () => {
     expect(requests("turn/interrupt")).toEqual([
       { threadId: sink.sessions[0], turnId: expect.any(String) },
     ]);
+    // Codex keeps an interrupted command running as a background terminal: it is ended too.
+    for (let i = 0; i < 50 && !requests("thread/backgroundTerminals/clean").length; i++)
+      await Bun.sleep(20);
+    expect(requests("thread/backgroundTerminals/clean")).toEqual([
+      { threadId: sink.sessions[0] },
+    ]);
+    expect(requests("initialize")[0].capabilities.experimentalApi).toBe(true);
     // An already aborted signal starts nothing.
     expect(
       await agent.turn(

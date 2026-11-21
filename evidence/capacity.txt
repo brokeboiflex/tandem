@@ -1,0 +1,92 @@
+# Tandem capacity on the production-like VM (Lima `hetzner-like`: 2 vCPU arm64, 4 GiB, no swap, no
+# KVM, Ubuntu 24.04, kernel 6.8, Docker 28.5.1), produced by `bun scripts/e2e.ts capacity` (run as
+# root on the VM from a copy of this branch; scripts/e2e/run.sh capacity does the same).
+#
+# Same stack as evidence/e2e.txt (the real gateway process, the real vendor programs in crun sandboxes,
+# the scripted vendor APIs reached through the egress proxy), with PERMISSION_MODE=workspace_write so
+# that every Claude turn runs its Bash call (under auto, Claude Code asks Anthropic's server, which the
+# mock cannot stand in for); each shell question is answered "Allow once" through /v1. Memory comes from
+# the host's cgroup files (the container's scope and each person's /sandboxes/tandem-<key> below it),
+# sampled every 100 ms, plus memory.peak; the container is restarted before each burst so its
+# memory.peak counts from that start. compose.yaml sets no container memory limit; each person has
+# memory.max 1024 MiB (RUNTIME_MEMORY_MB). OOM: memory.events oom_kill of the container and of each
+# person, and the kernel log line count (20 lines left from earlier runs on this VM; unchanged).
+#
+# Summary:
+#  - Image 1.80 GB (runtime filesystem 1.53 GB) vs the Happy Agent build tandem:0.3.0 2.11 GB (1.88 GB).
+#  - Gateway at rest: container memory.current 47 MiB (bun RSS 85 MiB, Smokescreen 11 MiB).
+#  - A connected person with no turn holds no process: 15 people connected (5 providers × 3), 0
+#    sandboxes, 0 cgroups once the processes connecting started ended (Codex, Grok and Gemini keep the
+#    read's process for IDLE_MINUTES: up to 121 s here; Claude and goose none).
+#  - First turn (the vendor program starts) median: claude 216 ms, codex 143 ms, grok 91 ms, openrouter
+#    (goose) 178 ms, gemini (agy) 192 ms; warm turns 10-30 ms (scripted API, so this is Tandem plus the
+#    vendor program, not model time). Person's cgroup peak: claude 143-176 MiB, gemini 112-138, goose
+#    68-70, codex 21-31, grok 12-14 (the first person of each provider also pays the program's page cache).
+#  - 5 people start their first Claude turn (with a Bash call) at the same moment: all completed in
+#    798-867 ms (wall 912 ms); container peak 845 MiB from 55 MiB (each person 154-156 MiB); host
+#    MemAvailable never below 2408 MiB; nothing OOM-killed. (Happy Agent: ~770 MiB per daemon start,
+#    1.26 GiB peak per person.) The five Claude Code processes then stay ~770 MiB together for
+#    IDLE_MINUTES (2 min) before they are released.
+#  - 5 people, one per provider, at the same moment: all completed in 337-535 ms; container peak 442 MiB
+#    from 48 MiB (claude 155, gemini 120, goose 69, codex 26, grok 13 MiB); nothing OOM-killed.
+
+# Tandem capacity, 2026-11-21T16:29:37.687Z: image tandem:agents-e2e, container 3c51951fa8eb, run mwqmig3l
+# host: Linux 6.8.0-134-generic aarch64, 2 vCPU, Mem: 3904 744 558 1 2793 3160 ; Docker 28.5.1
+# gateway: security: sandbox=namespaces egress=allowlist limits=1024MiB/512pids per person data=/var/lib/tandem (e2e: vendors at mock.tandem.test) | tandem gateway on 0.0.0.0:8787 (auth dev, idle 2 min, permission mode auto)
+# container memory limit: none (compose.yaml sets no mem_limit); per person: memory.max = RUNTIME_MEMORY_MB (default 1024 MiB); no swap on the host
+   5.9s PASS  the container runs with PERMISSION_MODE=workspace_write  (tandem gateway on 0.0.0.0:8787 (auth dev, idle 2 min, permission mode workspace_write))
+
+   5.9s == image
+   5.9s   tandem:agents-e2e: 1.80 GB (1804044268 bytes); runtime filesystem layer 1.53GB
+   5.9s   tandem:0.3.0: 2.11 GB (2106801004 bytes); runtime filesystem layer 1.88GB (the Happy Agent build)
+
+   5.9s == gateway at rest
+   6.3s PASS  a fresh container  (441 ms)
+  27.9s   idle, nobody connected: container memory.current 47 MiB (anon 46 MiB, file 0 MiB), memory.peak since its start 59 MiB; gateway (bun) RSS 85 MiB, smokescreen RSS 11 MiB, 3 processes; docker stats 47.41MiB / 3.813GiB
+
+  27.9s == connected people without a turn
+ 155.4s PASS  15 people connected with a conversation each and no turn: no process, no cgroup  (the processes their connecting started (sign-in CLIs, reads) ended within 121 s)
+ 156.9s   15 people connected, no turn: container memory.current 81 MiB (anon 59 MiB, file 18 MiB), memory.peak since its start 449 MiB; gateway (bun) RSS 99 MiB, smokescreen RSS 14 MiB, 3 processes; docker stats 63.07MiB / 3.813GiB
+
+ 156.9s == first turn (cold: the vendor program starts) and warm turns, per provider
+
+| provider | cold first turn, 3 people (ms) | warm turns (ms) | warm turn with a shell tool call | each person's cgroup memory.peak |
+| --- | --- | --- | --- | --- |
+| claude | 317, 216, 212 (median 216 ms) | 21, 18, 20 (median 20 ms) | 111 ms (completed, 1 question answered) | 176 MiB, 143 MiB, 144 MiB |
+| codex | 168, 143, 141 (median 143 ms) | 30, 30, 32 (median 30 ms) | 82 ms (completed, 0 question answered) | 31 MiB, 22 MiB, 21 MiB |
+| grok | 110, 91, 81 (median 91 ms) | 15, 19, 19 (median 19 ms) | 70 ms (completed, 1 question answered) | 14 MiB, 12 MiB, 12 MiB |
+| openrouter | 193, 178, 168 (median 178 ms) | 9, 11, 10 (median 10 ms) | 68 ms (completed, 1 question answered) | 70 MiB, 69 MiB, 68 MiB |
+| gemini | 230, 177, 192 (median 192 ms) | 24, 28, 20 (median 24 ms) | 73 ms (completed, 1 question answered) | 138 MiB, 112 MiB, 112 MiB |
+ 163.0s PASS  5 people connected with a conversation each and no turn: no process, no cgroup  (the processes their connecting started (sign-in CLIs, reads) ended within 0 s)
+
+ 163.0s == 5 people start their first Claude turn at the same moment (a shell tool call each)
+ 163.9s PASS  a fresh container (memory.peak counts from its start)  (884 ms)
+ 180.9s PASS  before: none of these people has a process (their streams are open)
+ 182.5s   before: container memory.current 55 MiB (anon 49 MiB, file 5 MiB), memory.peak since its start 64 MiB; gateway (bun) RSS 88 MiB, smokescreen RSS 11 MiB, 3 processes; docker stats 49.79MiB / 3.813GiB
+ 183.9s   burst-claude-claude-0: completed in 804 ms, tools Bash:completed, person peak 155 MiB
+ 183.9s   burst-claude-claude-1: completed in 863 ms, tools Bash:completed, person peak 156 MiB
+ 183.9s   burst-claude-claude-2: completed in 798 ms, tools Bash:completed, person peak 155 MiB
+ 183.9s   burst-claude-claude-3: completed in 867 ms, tools Bash:completed, person peak 155 MiB
+ 183.9s   burst-claude-claude-4: completed in 853 ms, tools Bash:completed, person peak 154 MiB
+ 183.9s PASS  all 5 first turns completed, each with its shell tool call  (wall 912 ms)
+ 183.9s   container: before 55 MiB, highest sampled memory.current 844 MiB (+789 MiB), memory.peak since start 845 MiB; people's peaks 155 MiB, 156 MiB, 155 MiB, 155 MiB, 154 MiB (sum 775 MiB); host MemAvailable lowest 2408 MiB
+ 183.9s PASS  nothing was OOM-killed (memory.events oom_kill of the container and each person; kernel log)  (oom_kill 0, kernel OOM lines 20 → 20)
+ 185.5s   after: container memory.current 789 MiB (anon 771 MiB, file 7 MiB), memory.peak since its start 845 MiB; gateway (bun) RSS 99 MiB, smokescreen RSS 13 MiB, 33 processes; docker stats 738.2MiB / 3.813GiB
+ 308.2s PASS  5 people connected with a conversation each and no turn: no process, no cgroup  (the processes their connecting started (sign-in CLIs, reads) ended within 121 s)
+
+ 308.2s == 5 people, one per provider, start their first turn at the same moment (a shell tool call each)
+ 308.7s PASS  a fresh container (memory.peak counts from its start)  (422 ms)
+ 325.7s PASS  before: none of these people has a process (their streams are open)
+ 327.3s   before: container memory.current 48 MiB (anon 46 MiB, file 0 MiB), memory.peak since its start 59 MiB; gateway (bun) RSS 87 MiB, smokescreen RSS 11 MiB, 3 processes; docker stats 47.77MiB / 3.813GiB
+ 328.3s   burst-mixed-claude-0: completed in 535 ms, tools Bash:completed, person peak 155 MiB
+ 328.3s   burst-mixed-codex-1: completed in 415 ms, tools exec_command:completed, person peak 26 MiB
+ 328.3s   burst-mixed-grok-2: completed in 337 ms, tools run_terminal_command:completed, person peak 13 MiB
+ 328.3s   burst-mixed-openrouter-3: completed in 475 ms, tools shell:completed, person peak 69 MiB
+ 328.3s   burst-mixed-gemini-4: completed in 351 ms, tools run_command:completed, person peak 120 MiB
+ 328.3s PASS  all 5 first turns completed, each with its shell tool call  (wall 551 ms)
+ 328.3s   container: before 48 MiB, highest sampled memory.current 441 MiB (+393 MiB), memory.peak since start 442 MiB; people's peaks 155 MiB, 26 MiB, 13 MiB, 69 MiB, 120 MiB (sum 384 MiB); host MemAvailable lowest 2841 MiB
+ 328.4s PASS  nothing was OOM-killed (memory.events oom_kill of the container and each person; kernel log)  (oom_kill 0, kernel OOM lines 20 → 20)
+ 329.9s   after: container memory.current 441 MiB (anon 423 MiB, file 5 MiB), memory.peak since its start 442 MiB; gateway (bun) RSS 98 MiB, smokescreen RSS 14 MiB, 35 processes; docker stats 417.2MiB / 3.813GiB
+ 335.9s PASS  the container recreated with the deployed PERMISSION_MODE again  (tandem gateway on 0.0.0.0:8787 (auth dev, idle 2 min, permission mode auto))
+
+CAPACITY RUN PASSED

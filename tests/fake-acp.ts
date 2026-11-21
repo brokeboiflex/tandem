@@ -490,6 +490,8 @@ function serve() {
     }
   }
 
+  /** Prompts refused as busy, by session. */
+  const busy = new Map<string, number>();
   async function prompt(m: any, p: any) {
     const reply = (result: unknown) => send({ id: m.id, result });
     const s = open.get(p.sessionId) ?? loadFile(p.sessionId);
@@ -501,6 +503,18 @@ function serve() {
     const text: string = (p.prompt ?? [])
       .map((b: any) => b.text ?? "")
       .join("");
+    // goose after session/load: a run of its own is still finishing; twice "busy", then the prompt.
+    if (text.includes("BUSY") && (busy.get(s.id) ?? 0) < 2) {
+      busy.set(s.id, (busy.get(s.id) ?? 0) + 1);
+      return send({
+        id: m.id,
+        error: {
+          code: -32602,
+          message: "Invalid params",
+          data: `session already has active run \`resume_${s.id}\`; use _goose/unstable/session/steer`,
+        },
+      });
+    }
     const turn = s.history.filter((h) => h.role === "user").length + 1;
     const say = (t: string, messageId?: string) => {
       update(s.id, {

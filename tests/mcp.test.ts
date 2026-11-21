@@ -918,6 +918,7 @@ describe("standing instructions", () => {
     ).toEqual([
       [WORKSPACE, "AGENTS.md", text],
       [WORKSPACE, "CLAUDE.md", text],
+      ["/home/agent/.grok", "AGENTS.md", text],
     ]);
     expect((await call(alice.token, "GET", "/v1/instructions")).body.text).toBe(
       text,
@@ -934,6 +935,7 @@ describe("standing instructions", () => {
       "-f",
       `${WORKSPACE}/AGENTS.md`,
       `${WORKSPACE}/CLAUDE.md`,
+      "/home/agent/.grok/AGENTS.md",
     ]);
     expect((await call(alice.token, "GET", "/v1/instructions")).body.text).toBe(
       "",

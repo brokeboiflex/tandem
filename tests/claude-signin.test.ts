@@ -24,6 +24,11 @@ describe("Claude Code's words", () => {
     "If the browser didn't open, visit: https://claude.com/cai/oauth/authorize?<redacted>",
   ];
   const invalid = "Invalid code. Please make sure the full code was copied.";
+  // Claude Code 2.1.330 (the pinned one), after its prompt on the same line.
+  const incomplete =
+    "Paste code here if prompted > That doesn't look like the full code. Copy all of it, including the # in the middle.";
+  const verification =
+    "That looks like a verification code. Enter it in your browser, on the page that asks for it. If a page then shows a longer code, paste it here.";
   const refused =
     "Login failed: That code wasn't accepted. It may be incomplete, expired, already used, or from an earlier sign-in attempt. Sign in again to get a new code.";
 
@@ -34,6 +39,9 @@ describe("Claude Code's words", () => {
 
   test("a malformed code is retryable; a refused code ends the attempt; a network error is neither", () => {
     expect(codeRejection([invalid])).toBe("retry");
+    expect(codeRejection([incomplete])).toBe("retry");
+    expect(codeRejection([verification])).toBe("retry");
+    expect(codeRejection(["Couldn't log in: proxy refused the connection"])).toBeNull();
     expect(codeRejection([invalid, refused, "Paste code here if prompted >"])).toBe("restart");
     expect(codeRejection(["Login failed: connect ECONNREFUSED 160.79.104.10:443"])).toBeNull();
     expect(codeRejection(["invalid_grant"])).toBe("restart");
