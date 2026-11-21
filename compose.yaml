@@ -6,7 +6,7 @@
 services:
   tandem:
     build: .
-    image: ${TANDEM_IMAGE:-tandem:0.3.0}
+    image: ${TANDEM_IMAGE:-tandem:0.4.0}
     env_file: .env
     # What creating the sandboxes needs, and nothing more: namespaces, mounts and each person's cgroup
     # (SYS_ADMIN), each sandbox's loopback (NET_ADMIN), and no AppArmor profile, whose Docker default

@@ -7,51 +7,56 @@ Gemini or OpenRouter API key, inside **their own** sandbox. Your application tal
 never sees passwords and never shares an account between people.
 
 Tandem is **one container** that runs on any Docker host: deploy it once (Docker Compose, Dokploy)
-and talk to it over HTTP. Inside it, the gateway runs every person's workspace as a sandboxed process
-tree through [crun](https://github.com/containers/crun) (their own uid and Linux namespaces over a
-read-only system), started on demand in about a second and stopped when idle. No KVM, no Docker
-socket, no container per person.
+and talk to it over HTTP. Inside it, the gateway runs every vendor program a person uses as a
+sandboxed process through [crun](https://github.com/containers/crun) (their own uid and Linux
+namespaces over a read-only system), started for a turn in well under a second and ended when idle.
+No KVM, no Docker socket, no container per person, and nothing running for a person who is not using
+it.
 
-Each workspace runs one unmodified [Happy Agent](https://github.com/slopus/happy-agent) daemon with the
-official Claude Code, Codex, Grok and Google Antigravity CLIs. Tandem adds the parts a multi-user
-service needs: authentication, one sandbox per person, start-on-demand and idle stop, a narrow façade
-over Happy's owner-level API, and a friendlier sign-in flow.
+The agents are the vendors' own, unmodified: Claude Code through the
+[Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview), Codex through
+[`codex app-server`](https://developers.openai.com/codex/app-server), and Google's Antigravity CLI,
+xAI's [Grok Build](https://github.com/xai-org/grok-build) and [goose](https://github.com/block/goose)
+(for OpenRouter models) through the [Agent Client Protocol](https://agentclientprotocol.com). Tandem
+adds the parts a multi-user service needs: authentication, a sandbox per process and limits per
+person, its own conversation store, sign-in flows, and one API over all five.
 
 ## How it is isolated
 
-- **One sandbox, one uid and one home per person.** The sandbox is `<prefix>-<id>`, its home
-  `DATA_DIR/homes/<id>` (owner-only), where `<id>` is an HMAC of the person's id (`sub` of the service
-  JWT) under `SERVICE_SECRET`; each person gets their own uid, recorded in `DATA_DIR/uids.json`. The
-  gateway derives the runtime only from the verified token, so one person can never address another's.
-- **What a sandbox sees.** Its own PID, network, IPC, UTS, cgroup and mount namespaces; the runtime
-  system read-only; only the person's home and temporary directory writable; no capabilities,
+- **One uid and one home per person.** Each person's home is `DATA_DIR/homes/<id>` (owner-only),
+  where `<id>` is an HMAC of the person's id (`sub` of the service JWT) under `SERVICE_SECRET`; each
+  person gets their own uid, recorded in `DATA_DIR/uids.json`. The gateway derives the person only from
+  the verified token, so one person can never address another's.
+- **A sandbox per process.** Every vendor program, sign-in and helper command runs in a sandbox of its
+  own (`<prefix>-<id>-<label>-<n>`): its own PID, network, IPC, UTS, cgroup and mount namespaces; the
+  runtime system read-only; only the person's home and temporary directory writable; no capabilities,
   `no_new_privs` and Docker's seccomp filter for unprivileged containers. Other people's files and
   processes do not exist inside it.
-- **Its own limits.** Each person has a cgroup holding their memory and process limits for all of
-  their processes together (`RUNTIME_MEMORY_MB`, `RUNTIME_PIDS`), and every vendor process runs in a
-  child of it: a runaway tool ends only its own process tree, never the person's other processes, other
-  people, the gateway or the server. CPU is shared equally between the people who need it, and the
-  gateway gets more than all sandboxes together.
-- **Vendor credentials stay in the person's home.** `claude auth login`, `codex login` and
-  `grok login --device-auth` run inside the sandbox and store their sign-in there, and the gateway
-  writes a person's own API key there (through standard input, never a command line). Tandem does not
-  read, copy or log them.
-- **The daemon token never leaves the gateway.** Happy's owner token (shutdown, drain, debug, config,
-  bots, remote connections) is read once per start inside the sandbox and kept in memory. The gateway
-  can send only an allowlisted set of daemon requests (`src/happy.ts`), over the daemon's own Unix
-  socket in the home.
+- **Limits per person.** Each person has a cgroup holding their memory and process limits for all of
+  their processes together (`RUNTIME_MEMORY_MB`, `RUNTIME_PIDS`), and every process runs in a child of
+  it: a runaway tool ends only its own process tree, never the person's other processes, other people,
+  the gateway or the server. CPU is shared equally between the people who need it, and the gateway gets
+  more than all sandboxes together.
+- **The gateway keeps its own state outside every home.** Conversations, messages, the people's API
+  keys and MCP registrations live in the gateway's own database (`DATA_DIR/tandem.db`, owner-only),
+  which no sandbox can see. A home is writable from that person's sandboxes, so the gateway never reads
+  a secret or a setting back from it.
+- **Vendor sign-ins stay in the person's home.** `claude auth login`, `codex login` and
+  `grok login --device-auth` run in the person's sandbox and keep their sign-in there; Tandem does not
+  read, copy or log it. A person's API key goes only into the environment of their own vendor process.
 - **No network but two sockets.** A sandbox has loopback only. Its ways out are two Unix sockets of the
   gateway: the egress proxy ([Smokescreen](https://github.com/stripe/smokescreen), an allowlist of
-  vendor hosts) and its own MCP proxy socket. It cannot reach other people, the gateway's API, the
-  host, private networks or cloud metadata (see [Security](#security)).
+  vendor hosts) and the person's own MCP proxy socket. It cannot reach other people, the gateway's API,
+  the host, private networks or cloud metadata (see [Security](#security)).
 - **Application credentials stay in gateway memory.** The token your app sends for its own MCP server
-  (`mcpAuth`) is held in the gateway's memory for that person only, never written to the sandbox, a
-  file or a log. The runtime reaches your MCP server only through the gateway's MCP proxy, on a socket
-  that exists for that person's sandbox only, and the proxy adds the person's latest credential on the
-  way out (see [Connecting your app's MCP server](#connecting-your-apps-mcp-server)).
-- **Hardened defaults.** Built-in admin bot archived on every start, Happy relay/mobile/Tailcat off,
-  sub-agents limited to their own harness (a Claude chat cannot start Codex work) and none at all on
-  Grok and OpenRouter (see [Happy's own agent loop](#happys-own-agent-loop-grok-and-openrouter)).
+  (`mcpAuth`) is held in the gateway's memory for that person only, never written to a sandbox, a file
+  or a log. Agents reach your MCP server only through the gateway's MCP proxy, on a socket that exists
+  for that person's sandboxes only, and the proxy adds the person's latest credential on the way out
+  (see [Connecting your app's MCP server](#connecting-your-apps-mcp-server)).
+- **Quiet vendor programs.** Telemetry, error reporting, auto-updates, plugin marketplaces and the
+  vendors' own sandboxes (which cannot run inside Tandem's) are turned off in the runtime system:
+  Claude Code's managed settings, Codex's system `requirements.toml`, and the Grok, Antigravity and
+  goose settings their agents start with.
 
 ## Quick start (local)
 
@@ -69,8 +74,8 @@ open http://127.0.0.1:8787/connect                              # demo sign-in p
 Checks:
 
 ```sh
-bun run typecheck && bun test       # unit tests (fixtures from the pinned daemon, a fake crun, a stub MCP
-                                    # server)
+bun run typecheck && bun test       # unit tests (fake vendor programs and crun, real claude/codex when
+                                    # installed, scripted vendor APIs, a stub MCP server)
 bun scripts/e2e.ts                  # against the running container (restarts it once): sign-ins, isolation
                                     # probes from inside the sandboxes, the MCP proxy; its stub MCP server
                                     # needs MCP_ALLOWED_ORIGINS=http://host.docker.internal:8791 and, on
@@ -99,7 +104,7 @@ Tandem deploys as one Compose service on an ordinary Dokploy server (no KVM or o
 3. In **Domains**, add your Tandem hostname for service `tandem`, port `8787`, with HTTPS. Dokploy's
    proxy reaches the container over its own network; the `127.0.0.1` port binding in `compose.yaml` is
    for local use (set `GATEWAY_PORT` if 8787 is taken on the server).
-4. Deploy. The build compiles the runtime system into the Tandem image (about 2 GB; build time is
+4. Deploy. The build compiles the runtime system into the Tandem image (about 1.7 GB; build time is
    mostly the vendor downloads). Health: `GET /healthz`. At startup the gateway creates a test sandbox
    and refuses to start, naming what is missing, if the container lacks the rights `compose.yaml` gives
    it.
@@ -114,37 +119,36 @@ Every `/v1` request needs `Authorization: Bearer <service JWT>`; `sub` is the pe
 `404`. Errors are `{ "error": "<code>", "message": "<English fallback>", "params": { … } }`: clients
 translate by code (see [Error codes](#error-codes)).
 
-**When a runtime runs.** Reads (`GET`) never start a person's runtime, so an app may prefetch with them
-when the person signs in to it. Opening `GET /v1/events` starts it: open the stream when your assistant
-UI opens, not before. Any change (`POST`, `PUT`, `PATCH`, `DELETE`), such as sending a message, starts it
-too. While the runtime is stopped, `GET /v1/providers` answers at once from memory; every other read
-answers `409 runtime_stopped`, and a read that arrives while the runtime is starting waits for it. A
-runtime stops after `IDLE_MINUTES` without requests, but never while one of the person's event streams is
-open, a run is in progress or a sign-in is waiting; the idle time counts from the last stream closing.
-While a stream is open, a runtime that stops on its own (a crash, `docker stop`) is restarted at once.
+**When something runs.** Reads (`GET`) answer from the gateway's own store and never start anything,
+so an app may prefetch with them when the person signs in to it. A person's vendor programs run only
+while they are needed: a turn starts the conversation's agent (Claude Code, `codex app-server`, or the
+ACP agent) in a sandbox and keeps it for `IDLE_MINUTES` after the turn (default 2: starting again takes
+well under a second), a sign-in keeps its CLI until it ends, and opening `GET /v1/events` reads the
+accounts of the person's connected providers when they were not read in the last 15 minutes (each
+read starts that vendor's program for a moment). Nothing runs for a person between uses.
 
 | Method and path | Purpose |
 | --- | --- |
-| `GET /v1/providers` | `{ providers: [{ id: "claude"\|"codex"\|"grok"\|"openrouter"\|"gemini", status: "connected"\|"not_connected"\|"connecting"\|"unknown", method: "subscription"\|"api_key"\|null, account: { email, plan }\|null, models: [{ id, name, default, efforts, defaultEffort }], checkedAt }] }`. Models come from the account's live catalog and are empty until connected. A model's `name` is what the vendor calls it, without a harness prefix ("Opus 5.5", "GPT-6-Luna"); Claude's are read from the person's own Claude Code shortly after it connects and arrive as `provider.updated`, until then Claude's aliases ("Opus"); OpenRouter's are OpenRouter's own ("DeepSeek: DeepSeek V4.1 Flash 1017"); Gemini's are those Google's agent reports for the key ("Gemini 4 Carbon", IDs such as `antigravity/gemini-4-carbon`). `default: true` marks the vendor's default (Claude's `claude-code/default`; the other vendors have none): its `name` is the model it currently resolves to ("Sonnet 5.5"), or `null` until known, and the client labels it as the default in its own language. `checkedAt` (ISO time) is when this was read from the person's runtime. Never starts the runtime. While it is stopped or starting, the answer comes at once from the gateway's memory, with that older `checkedAt`; open `/v1/events` to start it and receive the live state as `provider.updated` once it is up. A provider not read since the gateway started (after a gateway restart, until the person's runtime has run) is `status: "unknown"` with `checkedAt: null`, `method: null`, `account: null` and no models: show it as loading, not as signed out. A provider whose turn failed with `signin_required` reports `not_connected` until the person signs in again. |
+| `GET /v1/providers` | `{ providers: [{ id: "claude"\|"codex"\|"grok"\|"openrouter"\|"gemini", status: "connected"\|"not_connected"\|"connecting"\|"unknown", method: "subscription"\|"api_key"\|null, account: { email, plan }\|null, models: [{ id, name, default, efforts, defaultEffort }], checkedAt }] }`. Models come from the account's live catalog, read from the vendor's own program, and are empty until connected. A model's `name` is what the vendor calls it, without a harness prefix ("Opus 5.5", "GPT-6-Luna"); Claude's are read from the person's own Claude Code; OpenRouter's are OpenRouter's own ("DeepSeek: DeepSeek V4.1 Flash 1017"); Gemini's are those Google's agent reports for the key ("Gemini 4 Carbon", IDs such as `antigravity/gemini-4-carbon`). `default: true` marks the vendor's default (Claude's `claude-code/default`; the other vendors have none): its `name` is the model it currently resolves to ("Sonnet 5.5"), or `null` until known, and the client labels it as the default in its own language. `checkedAt` (ISO time) is when this was read from the vendor. Never starts anything: the answer is what the gateway can see itself (a sign-in or key in place, a sign-in in progress) and what it last read from the vendor, kept in its store across restarts, with that read's `checkedAt`. A provider that is set up but whose account has not been read yet (just connected, or never read since the person's last sign-in) is `status: "unknown"` with `checkedAt: null`, `method: null`, `account: null` and no models: show it as loading, not as signed out; open `/v1/events` and the live state follows as `provider.updated`. A provider whose turn failed with `signin_required` reports `not_connected` until the person signs in again. |
 | `POST /v1/providers/:id/connect` | Starts the vendor sign-in, answers `{ connection }` once the vendor page is ready. Claude also accepts `{ "method": "api_key", "apiKey": "sk-ant-…" }`; OpenRouter and Gemini accept only `{ "method": "api_key", "apiKey": "sk-or-…" }` and `{ "method": "api_key", "apiKey": "AIza…" }`. |
 | `GET /v1/providers/:id/connect` | Current `{ connection }` (or `null`). |
 | `POST /v1/providers/:id/connect/code` | `{ code }` from the Claude page. A rejected code answers `status: "waiting"` with `error.code` `wrong_code` (paste the whole code again) or `wrong_code_reissued` (Claude refused it for good: `url` is a new sign-in page to open again). |
 | `DELETE /v1/providers/:id/connect` | Cancels the sign-in. |
 | `DELETE /v1/providers/:id` | Signs out with the vendor CLI and removes its credentials from the home (for OpenRouter and Gemini: the key). |
-| `GET /v1/events` | Server-Sent Events for this person only: `provider.updated`, `conversation.run`, `conversation.message`, `conversation.delta`, `conversation.question`, `conversation.context` (`{ conversationId, context }`, the same `context` as above after each measurement, `null` after compaction). Opening it starts the person's runtime, and it keeps the runtime from stopping while it is open. Its first `provider.updated` for each provider is the live state, sent once the runtime is up. The stream closes when the token expires; reconnect with a fresh one. |
+| `GET /v1/events` | Server-Sent Events for this person only: `provider.updated`, `conversation.run`, `conversation.message`, `conversation.delta`, `conversation.question`, `conversation.context` (`{ conversationId, context }`, the same `context` as above after each measurement, `null` after compaction). Its first `provider.updated` for each provider comes at once, from what the gateway knows; a provider whose account was not read in the last 15 minutes is read from the vendor, and its live state follows. The stream closes when the token expires; reconnect with a fresh one. |
 | `POST /v1/conversations` | `{ provider, model, effort?, title? }` → `201 { conversation }`. |
 | `GET /v1/conversations` | `{ conversations, nextCursor }`, newest activity first. `?limit=` (1-200, default 50), `?cursor=<nextCursor>` for the next page, `?query=` to search titles (case-insensitive). |
 | `PATCH /v1/conversations/:id` | `{ title }` (1-200 characters, or `null` for the generated title) → `{ conversation }`. |
-| `DELETE /v1/conversations/:id` | Archives the conversation → `204`. It leaves every list and takes no messages; Happy keeps its history. |
+| `DELETE /v1/conversations/:id` | Archives the conversation → `204`. It leaves every list and takes no messages; Tandem keeps its history. |
 | `GET /v1/conversations/:id/messages` | `{ conversation, messages, runs, hasMore, question, context, usage }`; `?before=<runId>&limit=` pages back. `context` is `{ usedTokens, limitTokens, approximate }`: the latest measured conversation size against the point where the agent compacts it automatically (so 100% is when compaction happens), or `null` before the first measurement and right after compaction. `usage` is the conversation's lifetime `{ input, output, cacheRead, cacheWrite }` tokens on that measured model, or `null`. |
-| `POST /v1/conversations/:id/messages` | `{ text, model?, effort?, mcpAuth?, context? }` → `202 { message, conversation }`. `text` is at most 100 000 characters. `mcpAuth` is `{ "<server name>": "<Authorization header value>" \| null }` for registered MCP servers: held in gateway memory only, latest wins, `null` forgets it, and all are cleared when the runtime stops or the gateway restarts. `context` (at most 16 000 characters) is a hidden preamble for this message only: the agent receives it, but it is never returned as user text by `GET …/messages` or in events. |
+| `POST /v1/conversations/:id/messages` | `{ text, model?, effort?, mcpAuth?, context? }` → `202 { message, conversation }`. `text` is at most 100 000 characters. `mcpAuth` is `{ "<server name>": "<Authorization header value>" \| null }` for registered MCP servers: held in gateway memory only, latest wins, `null` forgets it, and all are cleared after `IDLE_MINUTES` without use or when the gateway restarts. `context` (at most 16 000 characters) is a hidden preamble for this message only: the agent receives it, but it is never returned as user text by `GET …/messages` or in events. A message sent while a run is in progress waits for it and runs next. |
 | `POST /v1/conversations/:id/abort` | Stops the current run. |
 | `POST /v1/conversations/:id/questions/:questionId` | `{ answer }`: an option label, a list of labels, or `{ "<promptId>": [...] }`. Used for permission questions, including those an MCP server asks. |
 | `GET /v1/mcp-servers` | `{ servers: [{ name, url, enabledTools, description, hasCredential }] }`. |
 | `PUT /v1/mcp-servers/:name` | `{ url, enabledTools?, description? }` → `201` (new) or `200 { server }`. Registers a Streamable HTTP MCP server for this person; no credentials here. `name`: a lowercase letter, then up to 31 lowercase letters, digits or `_`. `url`: `http` or `https`, an origin allowed by `MCP_ALLOWED_ORIGINS`. `enabledTools`: only these tools are offered and callable. At most 20 servers. |
 | `DELETE /v1/mcp-servers/:name` | Removes the server and forgets its credential → `204`. |
 | `GET /v1/instructions` | `{ text }`: the person's standing instructions (empty when none). |
-| `PUT /v1/instructions` | `{ text }` (at most 64 000 characters; empty clears them) → `{ text }`. Written into the chat workspace as `AGENTS.md` (Codex, Gemini's Antigravity CLI, and Happy's own loop for Grok and OpenRouter) and `CLAUDE.md` (Claude Code), so every agent loads them in new conversations. |
+| `PUT /v1/instructions` | `{ text }` (at most 64 000 characters; empty clears them) → `{ text }`. Kept by the gateway and written into the chat workspace as `AGENTS.md` (Codex, Antigravity, Grok Build, goose) and `CLAUDE.md` (Claude Code), so every agent loads them in new conversations. |
 
 `connection` is `{ status: "waiting"|"connected"|"failed"|"cancelled"|"expired", flow: "paste_code"|"device_code"|"api_key", url, userCode, expiresAt, error: { code, message, params }|null, account }`.
 
@@ -164,6 +168,9 @@ wording is not part of the contract and may change, and for the provider's own f
 `rate_limited`, `provider_unavailable`, `network`, `context_too_long`) it is the provider's text. A
 code keeps its meaning; new codes may be added, so word a code you do not know like the generic one of
 its kind (`failed`, `sign_in_failed`, or a generic error).
+
+Tandem 0.4 no longer sends `runtime_stopped` (reads always answer), `conflict` or
+`conversation_has_no_model`.
 
 Codes arrive in three places:
 
@@ -192,16 +199,13 @@ are ISO 8601.
 | `invalid_api_key_format` | HTTP 400 | The pasted API key cannot be one: too short, too long or with other characters. | `provider` |
 | `invalid_code` | HTTP 400 | The pasted sign-in code is empty, too long or contains control characters. | |
 | `invalid_answer` | HTTP 400 | The answer names no option, or leaves a prompt unanswered. | |
-| `runtime_stopped` | HTTP 409 | A read while the person's runtime is stopped; opening `/v1/events` starts it. | |
 | `not_waiting_for_code` | HTTP 409 | A code was sent, but no sign-in of this provider is waiting for one. | |
 | `signin_required` | HTTP 409 | A new conversation on a provider that isn't connected. | `provider` |
 | `question_not_pending` | HTTP 409 | The question isn't waiting for an answer (any more): answered meanwhile, ended with its run, or unknown. | |
-| `conversation_has_no_model` | HTTP 409 | The conversation has no model to continue with; start a new conversation. | |
 | `too_many_servers` | HTTP 409 | The person already has as many MCP servers as allowed. | `maxServers` |
-| `conflict` | HTTP 409 | Something in the workspace changed meanwhile; try again. | |
 | `model_unavailable` | HTTP 422 | The connected account doesn't offer this model (any more); pick another. | |
 | `invalid_effort` | HTTP 422 | The model doesn't offer this effort. | `efforts`: the ones it offers |
-| `runtime_unavailable` | HTTP 503 | The person's workspace didn't answer (restarting, or failing); try again shortly. | |
+| `runtime_unavailable` | HTTP 503 | Tandem couldn't do this right now (a sandbox or a vendor program failed); try again shortly. | |
 | `wrong_code` | connection error, status `waiting` | The pasted code wasn't accepted; the same sign-in still waits for the whole code. | |
 | `wrong_code_reissued` | connection error, status `waiting` | Claude refused the code for good, so Tandem started a new sign-in: the person opens the new `url` and pastes the code it shows. | |
 | `expired` | connection error, status `expired` | The sign-in timed out; start again. | |
@@ -221,10 +225,9 @@ are ISO 8601.
 ## The connect flow
 
 1. Open `/v1/events` when the person opens your settings screen, and call `GET /v1/providers` for the
-   first view. The stream starts their runtime (about 2 s for a new person, about 1 s for a stopped
-   one), so the sign-in itself starts in well under a second. The providers answer comes at once from
-   what the gateway last read (`checkedAt`, or `unknown` after a gateway restart), so show it and apply
-   the `provider.updated` that follows.
+   first view. Both answer at once from what the gateway knows; apply the `provider.updated` events that
+   follow. A sign-in starts the vendor's own CLI in the person's sandbox and answers once its page is
+   known.
 2. **Claude** (`flow: "paste_code"`): open `url` in a new tab. After approving, Claude's page shows a code;
    the person pastes it and you send it to `/connect/code`. A code Claude refuses comes back as
    `wrong_code` with the sign-in still waiting. When Anthropic itself refuses the code, Tandem starts a
@@ -232,18 +235,17 @@ are ISO 8601.
    the sign-in page again and pastes the new code.
 3. **Codex** and **Grok** (`flow: "device_code"`): show `userCode` large, with a copy button and a link to
    `url`, and a countdown to `expiresAt`. The connection turns `connected` on its own; listen for
-   `provider.updated`. Grok runs the Grok CLI's own `grok login --device-auth`; the person confirms the
-   code on xAI's page.
+   `provider.updated`. They run the vendors' own `codex login --device-auth` and
+   `grok login --device-auth`; the person confirms the code on OpenAI's or xAI's page. Codex forgets an
+   earlier sign-in as soon as a new one starts.
 4. **Claude, OpenRouter or Gemini with an API key**: `POST /connect` with `method: "api_key"`
-   (OpenRouter and Gemini have no other way). The key is written to the person's home, becomes Happy's
-   documented `api_key` setting for that account, and is verified; a refused key is removed again. Happy's
-   own provider check verifies Claude and OpenRouter keys (for OpenRouter one minimal request to the first
-   model in `runtime/happy.toml`, billed to that key; an account without credits is refused too). A
-   Gemini key is checked by asking Google for its model list from inside the runtime, which costs
-   nothing (Happy's check cannot vouch for it). Create one in Google AI Studio.
-5. After any successful sign-in Tandem restarts that runtime once it is idle, so the vendor harnesses
-   load the new account and its real model list. This is invisible apart from a few seconds of
-   `connecting`.
+   (OpenRouter and Gemini have no other way). The key is checked first with one request that costs
+   nothing, sent from the person's sandbox (Anthropic's model list, OpenRouter's key endpoint, Google's
+   model list); only a key the provider accepts is kept, in the gateway's own store. A refused key leaves
+   an earlier one in place. Create a Gemini key in Google AI Studio.
+5. After a successful sign-in or a new key, Tandem reads the account and its models from the vendor
+   (a moment of `connecting`, then `provider.updated`), and a vendor program still running on the old
+   account is restarted once its turn ends.
 
 `public/connect.html` is a framework-free reference implementation of these screens.
 
@@ -262,10 +264,9 @@ own credentials**, so the server enforces exactly what the person may see and do
      -d '{"url":"https://app.example.com/mcp","description":"Our app","enabledTools":["lookup_customer"]}'
    ```
 
-   The registration is stored in the person's home, signed by the gateway (a copy edited inside the
-   runtime is ignored), and survives restarts. A change to the servers or `enabledTools` restarts the
-   person's runtime once it is idle, because Happy reads its MCP configuration when it starts. Optionally
-   `PUT /v1/instructions` with standing instructions about your app.
+   The registration is kept in the gateway's store and survives restarts; every turn from then on
+   gets the person's current servers. Optionally `PUT /v1/instructions` with standing instructions
+   about your app.
 3. **Send the person's current credential with every message**, exactly the `Authorization` header your
    MCP server expects, plus any per-message context:
 
@@ -276,66 +277,79 @@ own credentials**, so the server enforces exactly what the person may see and do
      "context": "The person is on the calendar page, viewing 2026-11-17." }
    ```
 
-   Send a fresh credential each time: the latest one wins, and Tandem forgets them all when the runtime
-   stops. The agent sees the context in front of the message; the person never sees it in history or
+   Send a fresh credential each time: the latest one wins, and Tandem forgets them all once the person
+   has been idle for `IDLE_MINUTES`. The agent sees the context in front of the message; the person never sees it in history or
    events.
 
-The agent calls your tools as `mcp__app__<tool>`. How a call travels:
+The agent sees your tools under the server's name (Claude Code: `mcp__app__<tool>`). How a call travels:
 
-- Each runtime's `mcp.toml` lists your server as `http://127.0.0.1:8790/mcp/<runtime id>/app`: inside the
-  sandbox that port is relayed to a Unix socket of the gateway that is mounted into this runtime's
-  sandbox only. Calls are authenticated with a per-runtime proxy token from the daemon's environment
-  (`MCP_PROXY_TOKEN`). Your URL and the person's credential never enter the runtime.
-- The proxy accepts a request only with the right token **and** on that runtime's own socket, looks up
-  the person's registration, and forwards the request to your `url` with the
-  person's latest `mcpAuth` value as `Authorization`. JSON responses and SSE streams pass through
-  unchanged, including questions your server asks mid-call (MCP elicitation), which reach the person as
-  permission questions on `GET /v1/events` and are answered through `/v1/.../questions`.
-- Before the first credential arrives, the proxy holds the runtime's MCP handshake (up to about ten
+- Every agent gets your server as `http://127.0.0.1:8790/mcp/<person id>/app` with a per-person proxy
+  token as its `Authorization` header (in Claude Code's initialize request, an environment variable of
+  `codex app-server`, or the ACP session; never a command line). Inside the sandbox that port is relayed
+  to a Unix socket of the gateway that is mounted into this person's sandboxes only. Your URL and the
+  person's credential never enter a sandbox.
+- The proxy accepts a request only with the right token **and** on that person's own socket, looks up
+  the person's registration, and forwards the request to your `url` with the person's latest `mcpAuth`
+  value as `Authorization`. JSON responses and SSE streams pass through unchanged, including questions
+  your server asks mid-call (MCP elicitation), which Claude Code and Codex turn into questions for the
+  person on `GET /v1/events`, answered through `/v1/.../questions`.
+- Before the first credential arrives, the proxy holds the agent's MCP handshake (up to about ten
   minutes) instead of failing it, and a message that brings the credential waits briefly until the tools
   are listed.
 - With no credential, or when your server answers `401`, the agent's tool call returns the error
   `Sign-in for <name> expired or is missing. Send a new message to continue.`, which the agent relays; the
   spent credential is dropped. Your server's `403` becomes `<name> refused this request (access denied).`
-  The proxy never answers `401` to the runtime, so the connection stays usable for the next credential.
-- `enabledTools` is written to Happy's `enabled_tools` and enforced by the proxy as well.
+  The proxy never answers `401` to an agent, so the connection stays usable for the next credential.
+- `enabledTools` is enforced by the proxy for every agent, and also given to the agents that take a tool
+  list (Claude Code, Codex, goose).
 
-MCP tools need `PERMISSION_MODE=auto` (the default): on Happy Agent 2026.11.6-preview.7 every MCP tool is
-refused in `read_only` and `workspace_write`, even when the person allows the call. In `auto` the harness's
-own reviewer (Claude Code's auto classifier, Codex's Guardian, and for Grok and OpenRouter Happy's own
-Auto review, which runs on the conversation's own model and account) decides each call; what it hands
-off becomes a permission question. Gemini is the exception: Antigravity's agent never asks before an MCP
-call, so its MCP calls run without any review (Happy Agent's harness documentation), and it registers
-only small MCP tools directly; larger ones it may fail to load.
+**Who decides a call.** Each agent applies its own permission rules to MCP calls, as it does to its own
+tools; what it asks becomes a permission question. Claude Code runs the tools in `enabledTools` without
+asking (they are pre-approved) and refuses the server's others. Codex asks before tools your server does
+not mark read-only. Antigravity and goose ask before calls they consider sensitive; Grok Build calls MCP
+tools through its own tool search. Your MCP server's own authorization, with the person's own
+credential, remains what limits what a call can do.
 
 ## Configuration
 
 All settings are environment variables, documented with defaults in `.env.example`. The important ones:
 `AUTH_MODE` (`oidc` with `OIDC_ISSUER`/`OIDC_AUDIENCE`/`OIDC_JWKS_URL`, or `dev`), `SERVICE_SECRET`,
-`IDLE_MINUTES` (default 2; a vendor process never stops while a run, a question or a sign-in is open),
-`PERMISSION_MODE` (default `auto`, the safest mode in which MCP tools run; never use `full_access` for
-people's chats), `MCP_ALLOWED_ORIGINS` for application MCP servers, the limits per person
-(`RUNTIME_MEMORY_MB`, `RUNTIME_PIDS`; defaults 1024 MiB and 512 processes, for all of a person's
-processes together), and
-the egress settings under [Security](#security). `RUNTIME_PREFIX` names
-every sandbox of one instance.
+`IDLE_MINUTES` (default 2: how long a vendor program stays after its last turn; never while a run, a
+question or a sign-in is open), `PERMISSION_MODE`, `MCP_ALLOWED_ORIGINS` for application MCP servers,
+the limits per person (`RUNTIME_MEMORY_MB`, `RUNTIME_PIDS`; defaults 1024 MiB and 512 processes, for all
+of a person's processes together), and the egress settings under [Security](#security).
+`RUNTIME_PREFIX` names every sandbox of one instance.
 
-Each runtime keeps all its state in its home (`DATA_DIR/homes/<id>`, on the `tandem-data` volume):
-Happy's database, the conversations, the vendor sign-ins and the agents' working folder. Tandem has no
-database of its own.
+`PERMISSION_MODE` (default `auto`) is how much an agent may do without asking, in each vendor's own
+terms; never use `full_access` for people's chats:
+
+| Mode | Claude Code | Codex | Antigravity, Grok Build, goose |
+| --- | --- | --- | --- |
+| `read_only` | `plan` | asks before every command and edit (`untrusted`) | read and search only; everything else asks |
+| `workspace_write` | `acceptEdits` | asks before what it considers dangerous (`on-request`) | the agent's asking mode |
+| `auto` | `auto` (Claude Code's own classifier) | `on-request` | the agent's asking mode (goose: `smart_approve`) |
+| `full_access` | `bypassPermissions` | never asks (`never`) | never asks |
+
+Codex always runs with `sandboxPolicy: externalSandbox`: Tandem's sandbox is the boundary, because
+Codex's own (bubblewrap) cannot run inside it.
+
+**Where state lives.** The gateway's own store, `DATA_DIR/tandem.db` (SQLite, owner-only): conversations,
+their messages and runs, titles, the last-read provider state, API keys, MCP registrations and standing
+instructions. Each person's home, `DATA_DIR/homes/<id>`: the vendor sign-ins, the vendors' own session
+files (what lets a later turn resume a conversation) and the agents' working folder. Both are on the
+`tandem-data` volume; back it up as a whole.
 
 ### Capacity
 
-- **A stopped runtime** costs only its home on disk: Happy's database, the conversations and the
-  sign-ins, a few MiB. The 341 MiB Claude Code copy that Happy unpacks for each person lives in their
-  temporary directory, which exists only while their runtime runs.
-- **A running runtime** is a few processes: in the tests (`evidence/e2e-sandbox.txt`) a started daemon
-  held about 115 MiB of its own memory, plus about 340 MiB of page cache from Happy's freshly unpacked
-  Claude Code that the kernel reclaims first under pressure; the 424 MiB Happy Agent binary is shared
-  by every sandbox, so it counts once. The gateway and the egress proxy together held about 20 MiB. A
-  turn adds whatever the agent's tools use, up to `RUNTIME_MEMORY_MB`.
-- **Start-up:** a person's live state arrives about 1.2-1.7 seconds after their event stream opens,
-  the first time included (2 vCPUs, no KVM).
+Measured on a 2-vCPU, no-KVM VM like the target servers (`evidence/`):
+
+- **A person between uses** costs no process and no memory: only their home and their rows in the store.
+- **During a turn** the person runs one vendor program, plus what its tools start. Each person's peak in
+  the per-vendor proofs: Claude Code 229-313 MiB, Codex 85 MiB, Antigravity 137 MiB, goose 70 MiB, Grok
+  Build 19 MiB (`evidence/claude-agent.txt`, `codex-agent.txt`, `acp-agents.txt`). A turn with one
+  shell command took 70-370 ms against a scripted vendor API, so the vendor's own response time is what
+  a person notices.
+- **The gateway** and the egress proxy hold a few tens of MiB.
 - **Limits:** each person's cgroup caps the memory and processes of all of their sandboxes
   together; at `RUNTIME_MEMORY_MB` the kernel first reclaims their caches, then ends one process tree
   (the one using the most), not the person's others. There is deliberately no `memory.high`: without
@@ -350,39 +364,37 @@ database of its own.
 
 ## Operations and upgrades
 
-**Restarting or redeploying.** On `SIGTERM` the gateway stops every running sandbox gracefully, then
-exits (`stop_grace_period: 60s` in `compose.yaml`; `init: true` reaps processes). After a restart
-nothing runs until it is used again: reads answer from memory (`unknown` after a restart, see Other
-notes), and opening `/v1/events` starts the person's sandbox. What a restart interrupts:
+**Restarting or redeploying.** On `SIGTERM` the gateway ends every sandbox, then exits
+(`stop_grace_period: 60s` in `compose.yaml`; `init: true` reaps processes). After a restart nothing runs
+until it is used again; reads answer from the store as before. What a restart interrupts:
 
-- Runs in progress stop; their conversations stay in the person's home.
-- Open `/v1/events` streams close. Reconnect them (as `EventSource` does); the first
-  `provider.updated` per provider after reconnecting is the live state.
+- Runs in progress end as `failed` (recorded when the gateway starts again); the next message continues
+  the same conversation, with the vendor's own session.
+- Open `/v1/events` streams close. Reconnect them (as `EventSource` does).
 - `mcpAuth` credentials live in the gateway's memory only. Until the next message brings them again,
   MCP tool calls answer `Sign-in for <name> expired or is missing`.
-
-**A sandbox stopped or crashed outside the gateway** is started again as soon as the person's event
-stream is open, or on their next request.
+- Sandboxes a killed gateway left behind are removed when it starts again.
 
 **Upgrading.** Rebuild and recreate the container (`docker compose up -d --build`, or redeploy in
-Dokploy). The runtime system is part of the image, so every sandbox started afterwards runs the new
-version; homes are kept.
+Dokploy). The runtime system is part of the image, so every vendor program started afterwards runs the
+new version; homes and the store are kept.
 
-**Upgrading from an older Tandem (0.1, Docker volumes).** Copy each `tandem-home-<id>` volume's
-contents to `DATA_DIR/homes/<id>` in the new data volume (same `<id>`, same `SERVICE_SECRET`); the
-gateway hands each home to the person's new uid on their first start. Then remove the old
-`tandem-rt-*` containers, `tandem-net-*` networks, the egress proxy container and, if used, the socket
-proxy.
+**Upgrading from Tandem 0.3 (Happy Agent).** Homes, sign-ins and uids carry over; people stay signed in
+to Claude, Codex and Grok. Not carried over: conversations made under Happy Agent (its database stays in
+each home, unused), API keys (they were files in the homes; people enter them again, and the old files
+can be deleted: `bun src/cli.ts exec <id> -- rm -f /home/agent/.agent-runtime/*-api-key`), MCP
+registrations (your app registers them again, as it does when a person opens its chat) and standing
+instructions (`PUT /v1/instructions` again).
 
 ## Security
 
-The threat Tandem is built against: an agent with a shell inside its runtime (possibly steered by
-prompt injection) tries to reach other people's runtimes or the host, or what it should not over the
-network. The gateway logs one `security:` line at startup; `GET /healthz` reports the egress mode.
+The threat Tandem is built against: an agent with a shell inside its sandbox (possibly steered by
+prompt injection) tries to reach other people's files, processes or secrets, the gateway or the host,
+or what it should not over the network. The gateway logs one `security:` line at startup; `GET /healthz` reports the egress mode.
 
-### 1. A sandbox per person
+### 1. A sandbox per process
 
-Every runtime runs under crun with the OCI spec in `src/security.ts`: the person's own uid, no
+Every process Tandem starts for a person runs under crun with the OCI spec in `src/security.ts`: the person's own uid, no
 capabilities (all five sets empty), `no_new_privs`, its own PID, network, IPC, UTS, cgroup and mount
 namespaces, the runtime system read-only, `/proc` and `/sys` restricted the way Docker restricts them,
 a `noexec` `/tmp`, and exactly these host paths: the person's home and temporary directory (writable),
@@ -402,102 +414,78 @@ each sandbox's cgroup, and bringing up each sandbox's loopback) and `security_op
 AppArmor profile forbids mounts). The gateway runs as root inside the container to do that; the agents
 never do. Without those rights the gateway refuses to start and names them.
 
-Codex's own bubblewrap sandbox and Happy's own sandbox (used by Grok and OpenRouter shell commands)
-need user namespaces inside the sandbox, which this design does not grant: Codex's cannot create its
-namespaces (Tandem's sandbox remains the boundary), and Grok and OpenRouter shell commands fail
-(`create user namespace: Operation not permitted`) while chat, file tools and MCP tools work.
+The vendors' own sandboxes need user namespaces, which Tandem's sandbox does not grant, so they are
+off: Codex runs with `externalSandbox`, and Claude Code's managed settings turn its sandbox off.
+Tandem's sandbox is the boundary for every agent.
 
 ### 2. What a sandbox can reach
 
 A sandbox's network namespace has loopback only. Its two ways out are Unix sockets of the gateway,
-mounted into it and relayed to loopback ports by its entrypoint:
+mounted into it and relayed to loopback ports by `agent-run`, the first program in every sandbox:
 
-- **The Internet, through the egress proxy** (`HTTPS_PROXY`/`HTTP_PROXY`, honoured by Claude Code,
-  Codex, the Grok CLI, Happy, git and curl): Stripe's [Smokescreen](https://github.com/stripe/smokescreen),
+- **The Internet, through the egress proxy** (`HTTPS_PROXY`/`HTTP_PROXY`, honoured by every vendor
+  program, git and curl): Stripe's [Smokescreen](https://github.com/stripe/smokescreen),
   run by the gateway on the container's loopback. It allows only the hostnames in
   `runtime/egress-allowlist.txt` (Anthropic, OpenAI/ChatGPT, xAI's sign-in `auth.x.ai` and Grok
   endpoint `cli-chat-proxy.grok.com`, `openrouter.ai`, the Gemini API
   `generativelanguage.googleapis.com`, GitHub) plus `EGRESS_ALLOW_DOMAINS`, and refuses private,
   loopback, link-local and CGNAT addresses in every mode. Vendor telemetry outside the list is refused.
   `EGRESS_MODE=open` allows any public host.
-- **The gateway's MCP proxy**, through a socket that is mounted into this person's sandbox only
-  (`DATA_DIR/run/<id>/mcp.sock`): a request on it can only come from that person's runtime.
+- **The gateway's MCP proxy**, through a socket that is mounted into this person's sandboxes only
+  (`DATA_DIR/run/<id>/mcp.sock`): a request on it can only come from that person's own processes.
 
 Other people's sandboxes, the gateway's API and every other address are unreachable. People open the
-vendors' sign-in pages (`accounts.x.ai` for Grok) in their own browser, not in the runtime. The
-gateway itself (not the runtimes) calls your app's MCP servers, only at `MCP_ALLOWED_ORIGINS`.
+vendors' sign-in pages (`accounts.x.ai` for Grok) in their own browser, not in a sandbox. The
+gateway itself (not the sandboxes) calls your app's MCP servers, only at `MCP_ALLOWED_ORIGINS`.
 
 | Setting | Default | Effect |
 | --- | --- | --- |
 | `EGRESS_MODE` | `allowlist` | `allowlist`: the hosts above; `open`: any public host |
 | `EGRESS_ALLOW_DOMAINS` | empty | extra hostnames, e.g. `registry.npmjs.org,pypi.org,files.pythonhosted.org,git.example.com`; `*.example.com` covers subdomains only |
-| `EGRESS_ALLOW_RANGES` | empty | private IPv4 CIDRs runtimes may reach anyway, e.g. an internal registry |
+| `EGRESS_ALLOW_RANGES` | empty | private IPv4 CIDRs sandboxes may reach anyway, e.g. an internal registry |
 
-### Happy's own agent loop (Grok and OpenRouter)
+### 3. The agents
 
-Claude and Codex conversations run on the vendors' unmodified agents (Claude Code, Codex), as before.
-Grok and OpenRouter have no agent of their own that Happy can run, so `runtime/happy.toml` turns on
-Happy's own agent loop (`[harnesses.happy]`) for exactly those two accounts: their turns use Happy's
-prompt, tools, sandbox and compaction with the vendor's model. Consequences:
+- **Claude Code** runs through the Claude Agent SDK inside the gateway, which starts the image's
+  official `claude` in the person's sandbox for each conversation in use (`spawnClaudeCodeProcess`), with
+  only Claude Code's own variables; never the SDK's bundled copy (its optional packages are not
+  installed).
+- **Codex** runs as one `codex app-server` per person in use, a conversation per thread.
+- **Gemini** runs on Google's own agent, the Antigravity CLI (`agy acp`), on the person's own Gemini API
+  key, which goes into that process's environment as `GEMINI_API_KEY`; `agy` is pointed at the Gemini
+  API (`modelProvider` in `~/.gemini/antigravity-cli/settings.json`), so its own Google sign-in is never
+  used. Google's terms forbid that sign-in for third-party software: "Using third-party software, tools,
+  or services to access Antigravity is a violation of our Terms of Service … To use a third-party coding
+  agent with Gemini, we recommend using a Gemini Enterprise or Google AI Studio API key."
+  (<https://antigravity.google/docs/faq>). Antigravity makes extra "safety rater" model calls per
+  command, billed to the person's key.
+- **Grok** runs on xAI's own Grok Build agent (`grok agent stdio`) on the person's own
+  `grok login --device-auth`.
+- **OpenRouter** runs on goose (`goose acp`, provider `openrouter`) on the person's own OpenRouter key,
+  in that process's environment as `OPENROUTER_API_KEY`. Its models are a fixed list in
+  `src/agents/acp-vendors.ts` (`OPENROUTER_MODELS`), with names and efforts from OpenRouter's public
+  model list.
 
-- **Reviews.** In `auto`, Happy's own Auto review decides each shell command and MCP call that needs
-  one, on the conversation's own model and account (it uses the person's quota or credits).
-- **No sub-agents.** Happy chooses sub-agent routes per account, not per conversation, so a Grok
-  conversation could otherwise start OpenRouter work and the reverse. Both accounts therefore offer no
-  models for sub-agents (`include_subagent_models = []`), and Happy's loop reaches no other harness.
-- **OpenRouter models** are a fixed list in `runtime/happy.toml` (`[providers.openrouter] models`), each
-  of which must support tool calling and must not need reasoning signatures passed back between tool
-  calls: Happy's Chat Completions client keeps none, which rules out Gemini (Google requires them) and
-  Claude (OpenRouter's reasoning guide asks for them) there. Happy reads
-  their names, context windows and efforts from OpenRouter. Edit the list and rebuild the image to
-  change it.
-- **The OpenRouter key** is the person's own: written by the gateway to the person's home and put into
-  the generated `happy.toml` as Happy's `api_key` at each start, like the Anthropic key, never into a
-  process environment. The person's own agent can read it, as it can every file in the home.
-
-### Gemini: Google's agent on the person's own API key
-
-Gemini conversations run on Google's own agent, the Antigravity CLI (`agy acp`, Happy's `antigravity`
-harness), on the person's own Gemini API key; their models are the ones it reports for that key. The
-entrypoint gives the key to the harness as `api_key`, which Happy hands to `agy` as `GEMINI_API_KEY`
-(so it is in that agent's process environment, readable by the commands it runs), and points `agy` at
-the Gemini API (`modelProvider` in `~/.gemini/antigravity-cli/settings.json`), so Antigravity's own
-Google sign-in is never used. Without a key the harness is off. Its sub-agents stay on it. Why not the
-other routes:
-
-- **Antigravity's own sign-in.** It could be driven (`agy acp --login` prints a Google page and takes a
-  pasted code even without a terminal; `agy -p`, which Happy runs, needs one), but Google's terms
-  forbid it: "Using third-party software, tools, or services to access Antigravity is a violation of our
-  Terms of Service … To use a third-party coding agent with Gemini, we recommend using a Gemini
-  Enterprise or Google AI Studio API key." (<https://antigravity.google/docs/faq>)
-- **Google's OpenAI-compatible endpoint on Happy's own loop.** Gemini 3 and 4 models refuse a tool call's
-  follow-up unless their thought signatures come back with it, and Happy's Chat Completions client
-  (this and the latest release) drops them, so every turn that uses a tool would fail.
-
-A key Google refuses after it was connected shows up as the agent's reply ("API key not valid"), not as
-a typed failure: Antigravity reports it as text and ends the turn normally.
+A person's own agent can read its own process environment, and so its own API key; it cannot reach
+anyone else's.
 
 ### Other notes
 
 - **Tokens.** Service JWTs are verified on every request; event streams close when the token expires. In
   production use `AUTH_MODE=oidc`. Development tokens (`AUTH_MODE=dev`) are for local use only;
-  runtimes cannot reach `POST /dev/token` (or any gateway route) at all.
+  sandboxes cannot reach `POST /dev/token` (or any gateway route) at all.
 - **Secrets in transit.** Login codes and API keys pass through the gateway in memory only: they are not
-  logged, stored or echoed (unit-tested). Error responses never include request or daemon bodies.
-- **Last-known provider state.** For a stopped runtime the gateway answers `GET /v1/providers` from the
-  views it last read (status, method, account e-mail and plan, models, `checkedAt`), kept in memory per
-  person: no tokens, keys or codes. It is not persisted. After a restart the answer is `unknown` until
-  the runtime has run. Answering a read is never a reason to start a runtime: an app that prefetches at
-  sign-in must not start every person's sandbox.
+  logged or echoed (unit-tested); an accepted API key is kept in the store, owner-only, and checked from
+  the person's sandbox through standard input, never a command line. Error responses never include
+  request bodies or vendor output.
 - **Application credentials.** `mcpAuth` values live only in the gateway's memory, keyed by person, and go
-  only to that person's registered URL on an allowed origin (no redirects followed). The runtime's proxy
-  token is in its daemon's environment, so the person's agent can read it; it is useless elsewhere,
-  because the proxy accepts it only on that person's own socket. With it the agent can do what its
-  MCP tools already can. Keep `MCP_ALLOWED_ORIGINS` to your own app: the gateway can reach networks the
-  runtimes cannot.
+  only to that person's registered URL on an allowed origin (no redirects followed). The per-person
+  proxy token is given to that person's agents, so the person's agent can read it; it is useless
+  elsewhere, because the proxy accepts it only on that person's own socket. With it the agent can do
+  what its MCP tools already can. Keep `MCP_ALLOWED_ORIGINS` to your own app: the gateway can reach
+  networks the sandboxes cannot.
 - **Images.** Every download in the `Dockerfile` is pinned and checksum-verified, and the npm
-  dependencies are locked in `bun.lock`. Do not publish Tandem images (see
-  Vendor terms).
+  dependencies are locked in `bun.lock`. Do not publish Tandem images (see Vendor terms).
 
 ## Vendor terms
 
@@ -509,12 +497,14 @@ deployment, including which accounts and plans may be used this way:
 - Claude Code: <https://code.claude.com/docs/en/legal-and-compliance>
 - Codex: <https://learn.chatgpt.com/docs/app-server#auth-endpoints>
 - Grok: <https://x.ai/legal/terms-of-service> (the Grok CLI's source: <https://github.com/xai-org/grok-build>)
+- goose: <https://github.com/block/goose> (Apache-2.0)
 - Gemini: <https://ai.google.dev/gemini-api/terms> (API keys) and Antigravity's terms for its CLI
   (<https://antigravity.google/docs/faq>; Tandem never uses an Antigravity sign-in)
 - OpenRouter: <https://openrouter.ai/terms>
 
-Claude Code is proprietary to Anthropic. The runtime image downloads it from Anthropic's official npm
-package at build time; prebuilt images containing it must not be published. See `THIRD_PARTY.md`.
+Claude Code and the Claude Agent SDK are proprietary to Anthropic. The image downloads Claude Code from
+Anthropic's official npm package at build time and installs the SDK from npm; prebuilt images
+containing them must not be published. See `THIRD_PARTY.md`.
 
 ## Limitations
 
@@ -522,25 +512,18 @@ package at build time; prebuilt images containing it must not be published. See 
   Linux namespaces, a uid per person, no capabilities and seccomp (see Security).
 - One Tandem container serves one server's capacity. Several Tandem containers on several servers need
   your app to send each person to the same one.
-- Pinned to Happy Agent 2026.11.6-preview.7, Codex 0.160.1, Claude Code 2.1.321, the Grok CLI 1.0.89,
-  the Antigravity CLI 1.5.11 and Smokescreen 0.1.0, for linux/arm64 and linux/amd64; crun comes from
-  Debian trixie.
-- Happy's `claude_code` harness always starts the Claude Code copy embedded in Happy Agent (byte-identical
-  to the official 2.1.321 build) and ignores the `executable` setting in this version.
-- Grok and OpenRouter were verified without real accounts: Grok's device sign-in up to the code,
-  OpenRouter's key check against OpenRouter, and Happy's own loop (Auto review, file and MCP tools)
-  against a stand-in OpenRouter API. Gemini was verified up to Google's key check; no Gemini turn, tool
-  call or MCP call has run with a real key.
-- Gemini earlier read "not offered" here, because Antigravity's own sign-in fails under Happy (it needs a
-  terminal) and Google's terms forbid it for third-party software. It is offered on the person's own
-  Gemini API key instead (see Security, Gemini).
-- Happy generates a conversation's title from its first messages, which include that message's
-  `context`; set a `title` (or `PATCH` it) when the context must not show up there. Happy has no rename,
-  so `PATCH` titles are kept by the gateway in the person's home.
-- MCP server and `enabledTools` changes apply after the automatic idle restart; standing instructions
-  apply to new conversations.
-- The signed registration file can be rolled back by the person's own agent to an earlier version the
-  app registered for that same person; it cannot point anywhere the app did not.
+- Pinned to the Claude Agent SDK 0.3.330, Claude Code 2.1.330, Codex 0.160.1, Grok Build 1.0.89, the
+  Antigravity CLI 1.5.11, goose 1.60.2 and Smokescreen 0.1.0, for linux/arm64 and linux/amd64; crun
+  comes from Debian trixie. Only linux/arm64 has been run.
+- Verified against scripted vendor APIs in real sandboxes, not yet with real accounts: Claude's sign-in
+  page and plan names, Claude Code's `auto` classifier, real usage-limit texts, the Codex, Grok and
+  Gemini model catalogs, and every vendor's account e-mail and plan.
+- A conversation's title is its first message's first line (or the `title` given at creation); set a
+  `title` (or `PATCH` it) when that line must not show up in lists.
+- Antigravity and Grok Build cannot be limited to `enabledTools` themselves; the MCP proxy still refuses
+  every other tool of the server.
+- If a vendor's own session files are removed from a home, the conversation cannot continue; start a
+  new one.
 
 ## License
 
