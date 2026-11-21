@@ -166,7 +166,10 @@ export class CodexSignIn implements SignIn {
       };
       child.stdout?.on("data", read);
       child.stderr?.on("data", read);
+      let ended = false;
       const end = (code: number | null) => {
+        if (ended) return; // `error` and `exit` can both come
+        ended = true;
         clearTimeout(startTimer);
         if (expiry) clearTimeout(expiry);
         if (a.cancelled) return set({ state: "cancelled" });

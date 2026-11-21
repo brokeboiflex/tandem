@@ -1,0 +1,53 @@
+# CodexAgent + CodexSignIn with the real Codex in real Tandem sandboxes (crun), 2026-11-21
+# VM hetzner-like: 2 vCPU, 4 GiB, no KVM, Ubuntu 24.04, kernel 6.8, Docker 28.5; inside the running Tandem container.
+# Run: bun evidence/poc/codex-agent-vm.ts 75e7ff381b35ad7757e8bd45 100002   (from /tmp/codex-agent, files copied from this branch)
+# Scripted vendor: scripts/mock-vendor/mock-openai.ts (model API + sign-in issuer); scripts/stub-mcp.ts; every other request -> refusing proxy.
+
+    13 ms  person 75e7ff381b35ad7757e8bd45 uid 100002; codex codex-cli 0.160.1
+    13 ms  == device sign-in: the real `codex login --device-auth` against the scripted issuer
+    49 ms    start -> {"state":"waiting","url":"http://127.0.0.1:4799/codex/device","userCode":"TEST-12345","expiresAt":1795271385056,"codeError":null}
+    49 ms  PASS waiting with the CLI's page and one-time code
+  1127 ms    then -> [{"state":"succeeded"}]
+  1128 ms  PASS succeeded: the CLI exited 0 and wrote ~/.codex/auth.json
+  1128 ms  == read
+  1291 ms    {"signedIn":true,"account":null,"models":[{"id":"codex-cli/gpt-6.1-sol","name":"GPT-6.1-Sol","efforts":["low","medium","high","xhigh","max","ultra"],"defaultEffort":"low","contextLimit":null},{"id":"codex-cli/gpt-6-astra","name":"GPT-6-Astra","efforts":["low","medium","high","xhigh","max","ultra"],"defaultEffort":"low","contextLimit":null}]} (+6 more)
+  1291 ms  PASS signed in, Codex's models as codex-cli/<id>
+  1291 ms  == a shell command writes a file in the workspace (full_access)
+  1384 ms    turn "RUN_TOOL please" (full_access) -> {"status":"completed"} in 92 ms
+  1384 ms    text: "TOOL_RESULT_SEEN Chunk ID: 6b9b0a\nWall time: 0.0000 seconds\nProcess exited with code 0\nOriginal token count: 20\nOutput:\n100002\nCapEff:\t0000000000000000\nNoNewPrivs:\t1\nSeccomp:\t2\nTMP=/var/tmp/agent\nhi\n"
+  1384 ms  PASS completed; probe.txt written in the workspace
+  1384 ms  PASS the command ran as the person's uid, CapEff 0, NoNewPrivs 1, Seccomp 2
+  1384 ms    tools [{"id":"call_1795270486343","name":"exec_command","status":"running"},{"id":"call_1795270486343","name":"exec_command","status":"completed"}]; context {"usedTokens":1020,"limitTokens":244800,"approximate":false}; usage {"input":1800,"output":40,"cacheRead":200,"cacheWrite":0}
+  1384 ms    app-server argv: codex app-server -c cli_auth_credentials_store="file" -c features.plugins=false -c features.apps=false -c analytics.enabled=false -c feedback.enabled=false -c model_provider="mock" -c model_providers.mock.name="mock" -c model_providers.mock.base_url="http://127.0.0.1:4799/v1" -c model_providers.mock.wire_api="responses" -c model_providers.mock.env_key="MOCK_API_KEY" -c model_providers.mock.request_max_retries=0 -c model_providers.mock.stream_max_retries=0 -c chatgpt_base_url="http://127.0.0.1:4799/backend-api/"
+  1384 ms  == on-request asks before a dangerous command: allowed
+  1477 ms    turn "RUN_DANGEROUS now" (auto) -> {"status":"completed"} in 93 ms
+  1477 ms    ask: {"kind":"permission","askedBy":"Codex","context":null,"prompts":[{"id":"permission","header":"exec_command","question":"Allow running `rm -f doomed.txt && echo removed > removed.txt && cat removed.txt`?","multiSelect":false,"options":[{"label":"Allow once","description":null},{"label":"Allow always","description":null},{"label":"Deny","description":null}]}]}
+  1477 ms  PASS asked once (exec_command); allowed, it ran
+  1477 ms  == on-request asks before a dangerous command: denied
+  1524 ms    turn "RUN_DANGEROUS now" (auto) -> {"status":"completed"} in 47 ms
+  1524 ms  PASS denied: it did not run, Codex was told it was rejected
+  1524 ms  == abort mid-turn
+  1727 ms    turn "RUN_SLOW please" (full_access) -> {"status":"aborted"} in 204 ms
+  1728 ms  PASS aborted while `sleep 60` ran
+  1728 ms  == release, then a second turn resumes the same thread
+  1871 ms    turn "RECALL it" (full_access) -> {"status":"completed"} in 127 ms
+  1871 ms    text: "RECALLED [\"RUN_TOOL please\"]"
+  1871 ms  PASS same thread id; the earlier message reached the model
+  1871 ms  == MCP through the relay, the proxy token only in the environment
+  2022 ms    turn "RUN_MCP please" (full_access) -> {"status":"completed"} in 151 ms
+  2022 ms  PASS mcp__app__lookup_customer answered
+  2022 ms  PASS the stub saw the token; argv never had it
+  2121 ms    turn "RUN_CONFIRM please" (auto) -> {"status":"completed"} in 99 ms
+  2121 ms    asks: [["permission","Codex","mcp__app__confirm_action","Allow the app MCP server to run tool \"confirm_action\"?"],["permission","app","mcp__app__confirm_action","Allow the action \"send the invoice\"?"]]
+  2121 ms  PASS Codex's approval, then the server's own question, both answered
+  2121 ms  == failures
+  2271 ms    turn "FAIL_401 now" (full_access) -> {"status":"failed","failure":{"code":"signin_required","message":"Your ChatGPT account isn't connected or its sign-in expired. Connect it again, then retry.","params":{"provider":"codex"}}} in 150 ms
+  2271 ms  PASS 401 -> signin_required
+  2303 ms    turn "FAIL_USAGE now" (full_access) -> {"status":"failed","failure":{"code":"usage_limit","message":"You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Jan 1st, 2030 12:00 AM.","params":{"provider":"codex","resetsAt":"2030-01-01T00:00:00.000Z"}}} in 32 ms
+  2303 ms  PASS usage limit -> usage_limit with its reset time
+  2303 ms  == person's cgroup peak 85 MiB; the refusing proxy saw []
+  2303 ms  PASS nothing but the scripted services was asked for
+  2322 ms  PASS released: no app-server left
+  2322 ms  == sign-out
+  2339 ms  PASS codex logout; no auth.json left
+  2340 ms  ALL PASSED

@@ -245,9 +245,18 @@ export function resetFromText(text: string, now = Date.now()): Date | null {
 type Windows = { primary: any; secondary: any };
 
 /** The latest reset among the exhausted rate-limit windows, from `account/rateLimits/updated`. */
-export function resetFromLimits(limits: Windows | null): Date | null {
+export function resetFromLimits(
+  limits: Windows | null,
+  now = Date.now(),
+): Date | null {
   const resets = [limits?.primary, limits?.secondary]
-    .filter((w) => w && w.usedPercent >= 100 && typeof w.resetsAt === "number")
+    .filter(
+      (w) =>
+        w &&
+        w.usedPercent >= 100 &&
+        typeof w.resetsAt === "number" &&
+        w.resetsAt * 1000 > now, // a window that has reset since says nothing about this limit
+    )
     .map((w) => w.resetsAt as number);
   return resets.length ? new Date(Math.max(...resets) * 1000) : null;
 }
@@ -726,6 +735,16 @@ export class CodexAgent implements Agent {
   }
 
   async read(key: string, _provider: ProviderId): Promise<ProviderLive> {
+    try {
+      return await this.#read(key);
+    } catch (e) {
+      // A turn with other MCP servers restarted the app-server under this read: read again.
+      if (e instanceof ProcessEnded) return this.#read(key);
+      throw e;
+    }
+  }
+
+  async #read(key: string): Promise<ProviderLive> {
     if (!this.signedInFile(key))
       return { signedIn: false, account: null, models: [] };
     const s = await this.#acquire(key, null);
@@ -876,7 +895,7 @@ export class CodexAgent implements Agent {
         // A thread Codex no longer has (its home was reset): the conversation goes on in a new one.
         if (
           !(e instanceof RpcError) ||
-          !/no rollout|not found|no thread|does not exist/i.test(e.message)
+          !/no rollout|not found|no thread|does not exist|invalid thread id/i.test(e.message)
         )
           throw e;
         this.#log(

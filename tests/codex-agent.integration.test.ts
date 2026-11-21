@@ -1,6 +1,6 @@
 // The real `codex` (CODEX_BIN, else on PATH or ~/.local/bin) through CodexAgent and CodexSignIn,
 // against the scripted OpenAI API and sign-in issuer in scripts/mock-vendor/mock-openai.ts and the
-// stub MCP server. Hermetic: every process gets a temporary HOME (so its own ~/.codex), a dead
+// stub MCP server. Hermetic: every process gets a temporary HOME (so its own ~/.codex), a refusing
 // HTTPS proxy for anything that is not the local mock, and no variable of the test runner's.
 // Skipped when there is no codex. The same scenarios run in real sandboxes in
 // evidence/poc/codex-agent-vm.ts.
@@ -25,6 +25,7 @@ import {
 import { CodexSignIn } from "../src/signin/codex";
 import { STUB_CUSTOMER, startStubMcp } from "../scripts/stub-mcp";
 import { DirectSandboxes } from "./support/direct-sandboxes";
+import { startRefusingProxy } from "./support/refusing-proxy";
 import { RecordingSink, choose } from "./support/sink";
 
 const CODEX =
@@ -48,9 +49,12 @@ const stub = startStubMcp();
 afterAll(() => {
   api.stop(true);
   stub.stop();
+  proxy.stop();
   if (!process.env.CODEX_IT_KEEP) rmSync(root, { recursive: true, force: true });
 });
-const dead = "http://127.0.0.1:9"; // nothing listens: a request for a real vendor fails here
+// Every request that is not for the local mock goes here, is refused and is remembered.
+const proxy = startRefusingProxy();
+const dead = proxy.url!;
 const boxes = new DirectSandboxes(
   root,
   { codex: [CODEX!] },
@@ -359,6 +363,8 @@ describe.skipIf(!CODEX)("the real Codex", () => {
   });
 
   test("nothing but the local mock was asked for", () => {
+    // Codex tried to reach nothing else (analytics, plugins, apps and updates are off).
+    expect(proxy.attempts).toEqual([]);
     const log = readFileSync(process.env.MOCK_LOG!, "utf8");
     const lines = log.split("\n").filter((l) => /^(GET|POST|AUTH)/.test(l));
     expect(lines.length).toBeGreaterThan(0);
