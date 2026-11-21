@@ -26,10 +26,11 @@ ARG CODEX_SHA256_AMD64=9226581be592d18f7e7f740a352fdb63aa61e45e39f7eb9b09d3888c8
 ARG CODEX_CODE_MODE_HOST_SHA256_ARM64=e5e027e6689efda2e3570aa600179f0ebb18632803350e152ed6c9b97dcf9741
 ARG CODEX_CODE_MODE_HOST_SHA256_AMD64=8a69207d97545ac753b6585974e1e67a4c51ae5deacf06517db512bb25e0e3c2
 # Claude Code as a real program, so the daemon's provider-CLI sign-in can run `claude auth login`
-# (npm registry dist.integrity, hex).
-ARG CLAUDE_CODE_VERSION=2.1.321
-ARG CLAUDE_CODE_SHA512_ARM64=137efddf76d743f9171814aba4a8eb5dd91a49b3c431b00ba77238c9c4b47d13190aa9ed907368cfa517c048894a619b3f4b0152a5823024c69959d29c430952
-ARG CLAUDE_CODE_SHA512_AMD64=956f8c8544e19d4da1afa42743dc600fc73a3960096d836988ccc843838968bc5c0724ece77bfbc15ff62331aca416dc3219f1168c75befa25b6e5b29bf87abb
+# (npm registry dist.integrity, hex). The gateway's Claude Agent SDK needs at least the Claude Code
+# it bundles (0.3.330: 2.1.330): an older one cannot read MCP servers from the initialize request.
+ARG CLAUDE_CODE_VERSION=2.1.330
+ARG CLAUDE_CODE_SHA512_ARM64=578c9a9c0639100e54a70c113ed8d27ea0db36a0255097959f7358670d808264478dda52b0bb470336f14577e40276e3c135f3134b9e763431518d360113dcb0
+ARG CLAUDE_CODE_SHA512_AMD64=f469fe57b0ed27c3359f3b4ff42783565f60dd1b6b7a923bace153c8f4519d97bc0facde6c81ca982ecebc16aeb9cb803f45f493ce520cdfcb3d56728ec19ecd
 # Grok CLI, so the daemon's provider-CLI sign-in can run `grok login --device-auth`; Happy's grok
 # provider then reads its sign-in file. xAI publishes no checksum files: these are of the release
 # files as downloaded, which match the MD5 that xAI's storage reports for them.

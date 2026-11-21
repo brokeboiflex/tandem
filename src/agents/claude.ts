@@ -857,6 +857,8 @@ export class ClaudeAgent implements Agent, VerifiesApiKeys {
   }
 
   async #close(c: Conversation) {
+    // A turn we stop (release, an interrupt that did not end) is aborted, not failed.
+    if (c.turn) c.turn.aborted = true;
     if (this.#conversations.get(c.id) === c) this.#conversations.delete(c.id);
     if (c.idle) clearTimeout(c.idle);
     c.idle = null;

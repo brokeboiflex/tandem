@@ -1,0 +1,71 @@
+# ClaudeAgent (src/agents/claude.ts) on the VM: 2 vCPU arm64, no KVM, like production. Real sandboxes
+# (`crun run` per process: the person's uid 100001 and home, read-only rootfs, no capabilities,
+# no_new_privs, Docker's seccomp filter, own PID/network/IPC/UTS/mount namespaces) inside the running
+# tandem container, against scripts/mock-vendor/mock-anthropic.ts and scripts/stub-mcp.ts, reached from
+# the sandbox through socat relays on 127.0.0.1 (as the egress and MCP proxies are). The scenarios are
+# tests/claude-scenarios.ts, the same ones `bun test tests/claude-agent.test.ts` runs locally.
+#
+#   ssh lima-hetzner-like; C=$(cd ~/tandem-e2e && sudo docker compose ps -q tandem)
+#   sudo docker exec -w /tmp/claude-agent $C sh -c 'CLAUDE_EXE=<exe> bun evidence/poc/claude-agent-vm.ts \
+#     07581a1ca6822e80d3247b8d 100001 /var/lib/tandem/bundles/tandem-9a05180e08ef315bf682183e/config.json'
+#
+# Run 1: Claude Code 2.1.330 (npm @anthropic-ai/claude-code-linux-arm64@2.1.330, sha512 checked, the
+# version the Dockerfile now pins), placed in the person's home because the stack is not rebuilt here.
+# Run 2: the rootfs's current Claude Code 2.1.321. Only the MCP scenario fails: the SDK refuses it with
+#   "This Claude Code (version 2.1.321) is too old to read MCP servers from the initialize request, so it
+#    started without them. The session was ended ..."
+# (reproduced directly with the SDK in the container), hence the Dockerfile bump to 2.1.330.
+# The person's cgroup memory peak is memory.peak of one cgroup reused by both runs.
+
+# ClaudeAgent in real sandboxes (crun), 2026-11-21T14:13:01.087Z
+# person 07581a1ca6822e80d3247b8d uid 100001, Claude Code 2.1.330 (Claude Code) at /home/agent/.local/claude-2.1.330/claude, SDK 0.3.330, nproc 2
+PASS a turn with a shell tool call (full access: no question) (497 ms): completed in 485 ms, Bash running→completed, context 14530/967000, usage {"input":2400,"output":40,"cacheRead":0,"cacheWrite":0}; TOOL_RESULT_SEEN 100001 CapEff: 0000000000000000 NoNewPrivs: 1 Seccomp: 2 TMP=/var/tmp/agent curl: (56) CONNECT tunnel failed, response 407 net=000net=blocked
+PASS permission asked → Allow once (446 ms): asked "Allow running `id -u; grep -E 'CapEff|No…" [Allow once / Deny], allowed → tool completed
+PASS permission asked → Deny (422 ms): denied → tool failed; Claude was told: The person denied this.
+PASS AskUserQuestion answered (420 ms): question "Which color?" [Red / Blue] → Blue; tool result: Your questions have been answered: "Which color?"="Blue". You c
+PASS abort mid-turn (1462 ms): aborted 27 ms after the request (streamed "tick 1 tick 2…"); the next turn completed
+PASS a second turn after release resumes the same session (831 ms): session 0cab9c7a… resumed in a new process; the mock got 4 messages incl. the first turn → "RECALLED mango"
+PASS MCP server through initialize (headers never on argv) (437 ms): mcp__stub__lookup_customer completed with the proxy token as its header; {"id":"42","name":"Wilhelmina Quarrington","plan":"Gold","visits":7}
+PASS signed out: no process to read, and a turn says signin_required (387 ms): read → signed out without a process; turn → {"code":"signin_required","message":"Your Claude account isn't connected or its sign-in expired. Connect it again, then retry.","params":{"provider":"claude"}}
+PASS a refused key (401) → signin_required (2177 ms): failed after 2157 ms (Claude Code would retry for minutes): signin_required
+PASS a spent subscription window → usage_limit with resetsAt (426 ms): {"code":"usage_limit","message":"You've hit your 5-hour limit · resets 4:13pm (UTC)","params":{"provider":"claude","resetsAt":"2026-11-21T16:13:01.000Z"}}
+PASS read: account and models from Claude Code (345 ms): {"email":null,"plan":"API key"}; claude-code/default=Opus (default), claude-code/opus=Opus, claude-code/fable=Fable, claude-code/sonnet=Sonnet, claude-code/haiku=Haiku
+PASS verifyApiKey from a one-shot sandbox (688 ms): good → ok, bad → refused, no answer → unreachable
+# tool output inside the sandbox: 100001 | CapEff:	0000000000000000 | NoNewPrivs:	1 | Seccomp:	2 | TMP=/var/tmp/agent | net=000net=blocked
+# person's cgroup memory peak 313 MiB; Anthropic requests 21; MCP requests 6
+# 12/12 passed; sandboxes left running: 0
+# exit 0
+
+# ClaudeAgent in real sandboxes (crun), 2026-11-21T14:13:09.726Z
+# person 07581a1ca6822e80d3247b8d uid 100001, Claude Code 2.1.321 (Claude Code) at /usr/local/bin/claude, SDK 0.3.330, nproc 2
+PASS a turn with a shell tool call (full access: no question) (425 ms): completed in 410 ms, Bash running→completed, context 13604/967000, usage {"input":2400,"output":40,"cacheRead":0,"cacheWrite":0}; TOOL_RESULT_SEEN 100001 CapEff: 0000000000000000 NoNewPrivs: 1 Seccomp: 2 TMP=/var/tmp/agent curl: (56) CONNECT tunnel failed, response 407 net=000net=blocked
+PASS permission asked → Allow once (428 ms): asked "Allow running `id -u; grep -E 'CapEff|No…" [Allow once / Deny], allowed → tool completed
+PASS permission asked → Deny (394 ms): denied → tool failed; Claude was told: The person denied this.
+PASS AskUserQuestion answered (401 ms): question "Which color?" [Red / Blue] → Blue; tool result: Your questions have been answered: "Which color?"="Blue". You c
+PASS abort mid-turn (1422 ms): aborted 30 ms after the request (streamed "tick 1 tick 2…"); the next turn completed
+PASS a second turn after release resumes the same session (776 ms): session a1013ff2… resumed in a new process; the mock got 4 messages incl. the first turn → "RECALLED mango"
+FAIL MCP server through initialize (headers never on argv) (344 ms): AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
++ actual - expected
+
+  {
++   failure: {
++     code: 'failed',
++     message: "The assistant couldn't finish this reply. Please try again.",
++     params: {}
++   },
++   status: 'failed'
+-   status: 'completed'
+  }
+
+    at run (/tmp/claude-agent/tests/claude-scenarios.ts:306:14)
+    at processTicksAndRejections (native:7:39)
+PASS signed out: no process to read, and a turn says signin_required (396 ms): read → signed out without a process; turn → {"code":"signin_required","message":"Your Claude account isn't connected or its sign-in expired. Connect it again, then retry.","params":{"provider":"claude"}}
+PASS a refused key (401) → signin_required (2245 ms): failed after 2211 ms (Claude Code would retry for minutes): signin_required
+PASS a spent subscription window → usage_limit with resetsAt (403 ms): {"code":"usage_limit","message":"You've hit your 5-hour limit · resets 4:13pm (UTC)","params":{"provider":"claude","resetsAt":"2026-11-21T16:13:09.000Z"}}
+PASS read: account and models from Claude Code (343 ms): {"email":null,"plan":"API key"}; claude-code/default=Opus (default), claude-code/opus=Opus, claude-code/fable=Fable, claude-code/sonnet=Sonnet, claude-code/haiku=Haiku
+PASS verifyApiKey from a one-shot sandbox (685 ms): good → ok, bad → refused, no answer → unreachable
+# tool output inside the sandbox: 100001 | CapEff:	0000000000000000 | NoNewPrivs:	1 | Seccomp:	2 | TMP=/var/tmp/agent | net=000net=blocked
+# person's cgroup memory peak 313 MiB; Anthropic requests 18; MCP requests 0
+# 11/12 passed; sandboxes left running: 0
+# exit 1
+

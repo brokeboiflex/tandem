@@ -76,6 +76,17 @@ describe.skipIf(!CLAUDE)("ClaudeAgent with Claude Code", () => {
     }
   }, 90_000);
 
+  test("release ends a running turn as aborted and stops its process", async () => {
+    const h = harness();
+    const agent = agentFor(h);
+    const { r, sink } = recorder();
+    const turn = agent.turn(h.key, input("SLOW please"), sink, new AbortController().signal);
+    for (const until = Date.now() + 30_000; !r.deltas.size && Date.now() < until; ) await Bun.sleep(50);
+    await agent.release(h.key);
+    expect(await turn).toEqual({ status: "aborted" });
+    expect(agent.busy(h.key)).toBe(false);
+  }, 90_000);
+
   test("a conversation's process ends idleMs after its last turn; busy follows it", async () => {
     const h = harness();
     const agent = agentFor(h, { idleMs: 300 });
