@@ -391,6 +391,11 @@ can be deleted: `bun src/cli.ts exec <id> -- rm -f /home/agent/.agent-runtime/*-
 registrations (your app registers them again, as it does when a person opens its chat) and standing
 instructions (`PUT /v1/instructions` again).
 
+**Upgrading from Tandem 0.1 (Docker volumes).** Copy each `tandem-home-<id>` volume's contents to
+`DATA_DIR/homes/<id>` in the new data volume (same `<id>`, same `SERVICE_SECRET`); the gateway hands
+each home to the person's new uid on first use. Then remove the old `tandem-rt-*` containers,
+`tandem-net-*` networks, the egress proxy container and, if used, the socket proxy.
+
 ## Security
 
 The threat Tandem is built against: an agent with a shell inside its sandbox (possibly steered by
