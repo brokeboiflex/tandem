@@ -56,5 +56,5 @@ test("runs left running by a stopped gateway fail; keys and settings stay per pe
   s.setApiKey("p", "openrouter", null);
   expect(s.apiKey("p", "openrouter")).toBeNull();
   s.setSetting("p", "instructions", "hi");
-  expect(s.setting("p", "instructions")).toBe("hi");
+  expect(s.setting<string>("p", "instructions")).toBe("hi");
 });
