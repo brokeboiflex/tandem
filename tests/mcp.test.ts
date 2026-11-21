@@ -1,21 +1,36 @@
-// Application MCP servers through the real gateway handlers and the real per-runtime proxy sockets,
-// with a fake runtime, fake per-person daemons and a real Streamable HTTP MCP server
-// (scripts/stub-mcp.ts).
-import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+// Application MCP servers through the gateway's real HTTP handler and its real per-person proxy
+// sockets, with fake agents and sign-ins (./fakes.ts), a store on a temp dir and a real Streamable
+// HTTP MCP server upstream (scripts/stub-mcp.ts).
+import {
+  afterAll,
+  beforeEach,
+  describe,
+  expect,
+  setDefaultTimeout,
+  test,
+} from "bun:test";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { devToken } from "../src/auth";
 import type { Config } from "../src/config";
 import { createGateway } from "../src/gateway";
-import * as H from "../src/happy";
 import * as M from "../src/mcp";
+import {
+  CONTEXT_CLOSE,
+  CONTEXT_OPEN,
+  MAX_CONTEXT,
+  withContext,
+} from "../src/providers";
 import { runtimeKey } from "../src/runtime";
 import { sseFrames } from "../src/sse";
+import { Store } from "../src/store";
+import { WORKSPACE } from "../src/agents/types";
 import { STUB_CUSTOMER, startStubMcp } from "../scripts/stub-mcp";
-import { FakeRuntime, GOOD_CODE_PREFIX } from "./fake-daemon";
+import { FakeAgent, FakeSignIn, execs, fakeRuntime, written } from "./fakes";
 
 setDefaultTimeout(30_000);
 const stub = startStubMcp();
+const dir = mkdtempSync("/tmp/tandem-mcp-"); // short: Unix socket paths are limited
 const cfg = {
   port: 0,
   host: "127.0.0.1",
@@ -26,54 +41,75 @@ const cfg = {
   oidcAudience: "",
   oidcJwksUrl: "",
   serviceSecret: "test-service-secret-at-least-32-characters",
-  dataDir: "/tmp/tandem-test",
-  runtimeRootfs: "/nonexistent/rootfs",
+  dataDir: dir,
+  runtimeRootfs: "/nonexistent",
   runtimePrefix: "test",
-  runtimeMemoryMb: 2048,
-  runtimeCpus: 2,
+  runtimeMemoryMb: 1024,
   runtimePids: 512,
   idleMs: 60_000,
   permissionMode: "auto",
-  restartAfterSignIn: false,
   egressMode: "allowlist",
   egressAllowDomains: [],
   egressAllowRanges: [],
   mcpAllowedOrigins: [new URL(stub.url).origin],
-} as Config;
+} as unknown as Config;
 
+const runtime = fakeRuntime(dir);
+const claude = new FakeAgent(["claude"]);
+/** The agent of a second gateway process on the same store (the restart test). */
+const restarted = new FakeAgent(["claude"]);
+const claudeSignIn = new FakeSignIn("claude", "paste_code");
+const dbPath = join(dir, "tandem.db");
+const store = new Store(dbPath);
 const logs: string[] = [];
 const log = (...a: unknown[]) => logs.push(a.map(String).join(" "));
-const runtime = new FakeRuntime();
-const gateway = createGateway(cfg, runtime, { log });
-const api = Bun.serve({ port: 0, fetch: gateway.fetch, idleTimeout: 60 });
-afterAll(() => {
-  api.stop(true);
+const gateway = createGateway(cfg, {
+  runtime,
+  agents: [claude],
+  signIns: [claudeSignIn],
+  store,
+  log,
+});
+const server = Bun.serve({ port: 0, fetch: gateway.fetch, idleTimeout: 60 });
+const base = `http://127.0.0.1:${server.port}`;
+afterAll(async () => {
+  await gateway.shutdown();
+  server.stop(true);
   stub.stop();
-  runtime.stopAll();
+  store.close();
+  rmSync(dir, { recursive: true, force: true });
+});
+beforeEach(() => {
+  claude.script = new FakeAgent([]).script;
 });
 
 const key = (subject: string) => runtimeKey(cfg.serviceSecret, subject);
+type Handler = (req: Request) => Response | Promise<Response>;
+/** Every /v1 response body, to check that nothing secret or hidden is ever returned. */
 const responses: string[] = [];
 async function call(
   token: string,
   method: string,
   path: string,
   body?: unknown,
+  handler: Handler = fetch,
 ) {
-  const res = await fetch(`http://127.0.0.1:${api.port}${path}`, {
-    method,
-    headers: {
-      authorization: `Bearer ${token}`,
-      ...(body ? { "content-type": "application/json" } : {}),
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  const res = await handler(
+    new Request(base + path, {
+      method,
+      headers: {
+        authorization: `Bearer ${token}`,
+        ...(body ? { "content-type": "application/json" } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    }),
+  );
   const text = await res.text();
   responses.push(text);
   return { status: res.status, body: text ? JSON.parse(text) : null };
 }
 
-/** A request as the person's runtime would send it to the proxy. */
+/** A request as the person's agent sends it to the proxy, through the person's MCP socket. */
 function rpc(
   subject: string,
   name: string,
@@ -82,25 +118,24 @@ function rpc(
     token?: string | null;
     method?: string;
     session?: string;
-    signal?: AbortSignal;
+    /** The socket it arrives on; the person's own by default. */
+    socket?: string;
   } = {},
 ) {
+  const k = key(subject);
   const token =
-    opts.token === undefined
-      ? M.proxyToken(cfg.serviceSecret, key(subject))
-      : opts.token;
-  // Through the socket the gateway listens on for this person's runtime (mounted into its sandbox).
-  return fetch(`http://runtime/mcp/${key(subject)}/${name}`, {
-    unix: runtime.mcpSocket(key(subject)),
-    method: opts.method ?? "POST",
+    opts.token === undefined ? M.proxyToken(cfg.serviceSecret, k) : opts.token;
+  const method = opts.method ?? "POST";
+  return fetch(`http://runtime/mcp/${k}/${name}`, {
+    unix: opts.socket ?? runtime.mcpSocket(k),
+    method,
     headers: {
       ...(token ? { authorization: `Bearer ${token}` } : {}),
       "content-type": "application/json",
       accept: "application/json, text/event-stream",
       ...(opts.session ? { "mcp-session-id": opts.session } : {}),
     },
-    body: (opts.method ?? "POST") === "POST" ? JSON.stringify(body) : undefined,
-    signal: opts.signal,
+    body: method === "POST" ? JSON.stringify(body) : undefined,
   });
 }
 const initialize = {
@@ -120,31 +155,92 @@ const lookup = (id = "42") => ({
   method: "tools/call",
   params: { name: "lookup_customer", arguments: { id } },
 });
+const since = (mark: number) => stub.requests.slice(mark);
 
-async function connectedPerson(subject: string) {
+async function until(pred: () => boolean, ms = 5000) {
+  for (const end = Date.now() + ms; !pred(); await Bun.sleep(20))
+    if (Date.now() > end) throw new Error("timed out");
+}
+
+type Who = { token: string; conversation: string };
+async function connectedPerson(subject: string): Promise<Who> {
   const token = await devToken(cfg.devSecret, subject);
   await call(token, "POST", "/v1/providers/claude/connect", {});
-  await call(token, "POST", "/v1/providers/claude/connect/code", {
-    code: `${GOOD_CODE_PREFIX}#s`,
+  const code = await call(token, "POST", "/v1/providers/claude/connect/code", {
+    code: "good-code",
   });
+  expect(code.body.connection.status).toBe("connected");
   const created = await call(token, "POST", "/v1/conversations", {
     provider: "claude",
-    model: "claude-code/haiku",
+    model: "claude-code/default",
     title: `${subject} chat`,
   });
+  expect(created.status).toBe(201);
   return { token, conversation: created.body.conversation.id as string };
+}
+
+const send = (
+  who: Who,
+  extra: Record<string, unknown> = {},
+  handler?: Handler,
+) =>
+  call(
+    who.token,
+    "POST",
+    `/v1/conversations/${who.conversation}/messages`,
+    { text: "Look up customer 42", ...extra },
+    handler,
+  );
+
+/** Waits until the conversation's turns have ended. */
+async function settled(who: Who, conversation = who.conversation) {
+  for (let i = 0; i < 400; i++) {
+    const r = await call(
+      who.token,
+      "GET",
+      `/v1/conversations/${conversation}/messages`,
+    );
+    if (
+      r.body.conversation.status === "idle" &&
+      r.body.runs.every((x: any) => x.status !== "running")
+    )
+      return r.body;
+    await Bun.sleep(20);
+  }
+  throw new Error("turn did not settle");
+}
+
+/** One message and its whole turn. The gateway listens on the person's MCP socket from then on. */
+async function turn(who: Who, extra: Record<string, unknown> = {}) {
+  const sent = await send(who, extra);
+  expect(sent.status).toBe(202);
+  await settled(who);
+}
+
+/** Opens the person's event stream and collects its events. */
+async function listen(who: Who) {
+  const ctrl = new AbortController();
+  const res = await fetch(`${base}/v1/events`, {
+    headers: { authorization: `Bearer ${who.token}` },
+    signal: ctrl.signal,
+  });
+  const events: { event: string; data: any }[] = [];
+  void (async () => {
+    try {
+      for await (const f of sseFrames(res.body!))
+        events.push({ event: f.event, data: JSON.parse(f.data) });
+    } catch {}
+  })();
+  return {
+    events,
+    until: (pred: (e: { event: string; data: any }) => boolean) =>
+      until(() => events.some(pred)),
+    close: () => ctrl.abort(),
+  };
 }
 
 const alice = await connectedPerson("alice");
 const bob = await connectedPerson("bob");
-const send = (
-  who: { token: string; conversation: string },
-  extra: Record<string, unknown> = {},
-) =>
-  call(who.token, "POST", `/v1/conversations/${who.conversation}/messages`, {
-    text: "Look up customer 42",
-    ...extra,
-  });
 
 describe("registering MCP servers", () => {
   test("PUT registers, GET lists, invalid input is refused with a readable message", async () => {
@@ -218,81 +314,89 @@ describe("registering MCP servers", () => {
     ).toBe(200);
   });
 
-  test("the runtime gets a sealed registry and a template naming only the proxy, then restarts", async () => {
-    const k = key("alice");
-    const template = runtime.volume.get(
-      `${k}:${M.MCP_DIR}/${M.TEMPLATE_FILE}`,
-    )!;
-    expect(template).toContain("[mcp_servers.stub]");
-    expect(template).toContain(`url = "${M.PROXY_URL_PLACEHOLDER}/stub"`);
-    expect(template).toContain(`bearer_token_env_var = "${M.PROXY_TOKEN_ENV}"`);
-    expect(template).not.toContain(stub.url); // the upstream address stays with the gateway
-    const sealed = runtime.volume.get(`${k}:${M.MCP_DIR}/${M.REGISTRY_FILE}`)!;
-    expect(
-      M.openRegistry(cfg.serviceSecret, k, sealed)?.map((s) => s.url),
-    ).toEqual([stub.url]);
-    for (let i = 0; i < 50 && !runtime.calls.includes(`restart ${k}`); i++)
-      await Bun.sleep(50);
-    expect(runtime.calls).toContain(`restart ${k}`); // Happy reads mcp.toml when it starts
-    // A change that leaves Happy's config alone (only the description) needs no restart.
-    runtime.calls.length = 0;
-    await call(alice.token, "PUT", "/v1/mcp-servers/stub", {
-      url: stub.url,
-      description: "Renamed",
+  test("registrations live in the gateway's store, not the person's home, and survive a restart", async () => {
+    // Nothing written into the person's home names the upstream.
+    expect(JSON.stringify(written)).not.toContain(stub.url);
+    // A second gateway process on the same store, listening on MCP sockets of its own: the first
+    // keeps serving the proxy for the tests below.
+    const sockets = mkdtempSync("/tmp/tmcp-");
+    const socketOf = (k: string) => join(sockets, `${k}.sock`);
+    const again = createGateway(cfg, {
+      runtime: { ...runtime, mcpSocket: socketOf },
+      agents: [restarted],
+      signIns: [claudeSignIn],
+      store,
+      log,
     });
-    await Bun.sleep(300);
-    expect(runtime.calls).not.toContain(`restart ${k}`);
-  });
-
-  test("registrations survive a gateway restart; a file edited inside the runtime is ignored", async () => {
-    // The same runtimes and homes, but these gateways listen on their own MCP sockets: the main
-    // gateway keeps serving the proxy for the tests below.
-    const sockets = mkdtempSync("/tmp/tmcp-"); // short: Unix socket paths are limited
-    const restarted = Object.assign(Object.create(runtime), {
-      mcpSocket: (k: string) => join(sockets, `${k}.sock`),
-    }) as FakeRuntime;
-    const again = createGateway(cfg, restarted, { log });
-    const headers = { authorization: `Bearer ${alice.token}` };
-    // Reads never start a runtime: the app's event stream does, and reads wait for that start.
-    expect(
-      (await again.fetch(new Request("http://x/v1/mcp-servers", { headers })))
-        .status,
-    ).toBe(409);
-    const stream = await again.fetch(
-      new Request("http://x/v1/events", { headers }),
-    );
-    const res = await again.fetch(
-      new Request("http://x/v1/mcp-servers", { headers }),
-    );
-    await stream.body!.cancel();
-    expect((await res.json()).servers.map((s: any) => s.url)).toEqual([
-      stub.url,
-    ]);
-    const k = key("alice");
-    const path = `${k}:${M.MCP_DIR}/${M.REGISTRY_FILE}`;
-    const sealed = runtime.volume.get(path)!;
-    runtime.volume.set(
-      path,
-      sealed.replace(stub.url, "https://attacker.example/mcp"),
-    );
-    const third = createGateway(cfg, restarted, { log });
-    const stream3 = await third.fetch(
-      new Request("http://x/v1/events", { headers }),
-    );
-    const r3 = await third.fetch(
-      new Request("http://x/v1/mcp-servers", { headers }),
-    );
-    await stream3.body!.cancel();
-    expect((await r3.json()).servers).toEqual([]);
-    expect(logs.some((l) => l.startsWith("mcp registrations ignored"))).toBe(
-      true,
-    );
-    runtime.volume.set(path, sealed);
+    try {
+      expect(
+        (
+          await call(
+            alice.token,
+            "GET",
+            "/v1/mcp-servers",
+            undefined,
+            again.fetch,
+          )
+        ).body.servers,
+      ).toEqual([
+        {
+          name: "stub",
+          url: stub.url,
+          enabledTools: null,
+          description: "Test app",
+          hasCredential: false,
+        },
+      ]);
+      // Its proxy forwards to the stored registration.
+      const mark = stub.requests.length;
+      expect(
+        (
+          await send(
+            alice,
+            { mcpAuth: { stub: "Bearer valid-alice-restart" } },
+            again.fetch,
+          )
+        ).status,
+      ).toBe(202);
+      await until(() => restarted.inputs.length > 0);
+      const init = await rpc("alice", "stub", initialize, {
+        socket: socketOf(key("alice")),
+      });
+      expect(init.status).toBe(200);
+      expect((await init.json()).result.serverInfo.name).toBe("stub-mcp");
+      expect(since(mark).map((r) => r.authorization)).toEqual([
+        "Bearer valid-alice-restart",
+      ]);
+      // A credential belongs to one gateway process's memory, never to the store they share.
+      expect(
+        (
+          await call(
+            alice.token,
+            "GET",
+            "/v1/mcp-servers",
+            undefined,
+            again.fetch,
+          )
+        ).body.servers[0].hasCredential,
+      ).toBe(true);
+      expect(
+        (await call(alice.token, "GET", "/v1/mcp-servers")).body.servers[0]
+          .hasCredential,
+      ).toBe(false);
+    } finally {
+      await again.shutdown();
+      rmSync(sockets, { recursive: true, force: true });
+    }
   });
 });
 
 describe("the proxy refuses anyone but the person's own runtime", () => {
-  test("absent or wrong runtime token, another person's token, a neighbour's address", async () => {
+  test("absent or wrong runtime token, another person's token, another person's socket", async () => {
+    // The agents reach the proxy during their turns: each person's socket exists from the first.
+    await turn(alice);
+    await turn(bob);
+    const mark = stub.requests.length;
     expect((await rpc("alice", "stub", lookup(), { token: null })).status).toBe(
       401,
     );
@@ -306,38 +410,38 @@ describe("the proxy refuses anyone but the person's own runtime", () => {
         })
       ).status,
     ).toBe(401);
-    // The token leaked to another person's runtime: it arrives on that runtime's socket.
-    const leaked = await gateway.mcpProxy(
-      new Request(`http://runtime/mcp/${key("alice")}/stub`, {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${M.proxyToken(cfg.serviceSecret, key("alice"))}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify(lookup()),
-      }),
-      { timeout() {} },
-      key("bob"),
-    );
-    expect(leaked.status).toBe(403);
+    // Alice's token leaked to Bob's runtime: it arrives on Bob's socket.
+    expect(
+      (
+        await rpc("alice", "stub", lookup(), {
+          socket: runtime.mcpSocket(key("bob")),
+        })
+      ).status,
+    ).toBe(403);
     const res = await fetch("http://runtime/mcp/zz/stub", {
       unix: runtime.mcpSocket(key("alice")),
       method: "POST",
       body: "{}",
     });
     expect(res.status).toBe(404);
-    expect(stub.requests.length).toBe(0); // nothing reached the upstream
+    expect(stub.requests.length).toBe(mark); // nothing reached the upstream
   });
 });
 
 describe("credentials: per message, per person, memory only", () => {
   let session = "";
 
-  test("a waiting connection gets the first credential; the upstream sees it, the runtime does not", async () => {
-    // Happy connects at startup, before any message: the proxy holds the handshake.
+  test("a waiting connection gets the first credential, and that message's turn waits for its tools", async () => {
+    // An agent's MCP connection set up before any credential: the proxy holds the handshake.
+    const mark = stub.requests.length;
     const held = rpc("alice", "stub", initialize);
     await Bun.sleep(200);
-    expect(stub.requests.length).toBe(0);
+    expect(stub.requests.length).toBe(mark);
+    const starts: number[] = [];
+    claude.script = async () => {
+      starts.push(performance.now());
+      return { status: "completed" };
+    };
     const t0 = performance.now();
     const sending = send(alice, { mcpAuth: { stub: "Bearer valid-alice-1" } });
     const init = await held;
@@ -345,15 +449,20 @@ describe("credentials: per message, per person, memory only", () => {
     session = init.headers.get("mcp-session-id")!;
     expect(session).toMatch(/^[0-9a-f-]{36}$/);
     expect((await init.json()).result.serverInfo.name).toBe("stub-mcp");
-    const list = await rpc("alice", "stub", toolsList, { session }); // as Happy does right after
+    expect((await sending).status).toBe(202);
+    // The turn starts once that connection has listed its tools, so the agent's catalog has them.
+    await Bun.sleep(300);
+    expect(starts).toEqual([]);
+    const list = await rpc("alice", "stub", toolsList, { session });
     expect((await list.json()).result.tools.map((t: any) => t.name)).toContain(
       "lookup_customer",
     );
-    expect((await sending).status).toBe(202);
-    expect(performance.now() - t0).toBeLessThan(4000); // waited for the listing, not the 5 s bound
+    await until(() => starts.length > 0);
+    expect(starts[0]! - t0).toBeLessThan(4000); // waited for the listing, not the 5 s bound
     expect(
-      stub.requests.find((r) => r.rpcMethod === "initialize")?.authorization,
+      since(mark).find((r) => r.rpcMethod === "initialize")?.authorization,
     ).toBe("Bearer valid-alice-1");
+    await settled(alice);
   });
 
   test("tool calls stream through as SSE with the person's latest credential", async () => {
@@ -365,7 +474,7 @@ describe("credentials: per message, per person, memory only", () => {
       id: "42",
       ...STUB_CUSTOMER,
     });
-    await send(alice, { mcpAuth: { stub: "Bearer valid-alice-2" } }); // latest wins
+    await turn(alice, { mcpAuth: { stub: "Bearer valid-alice-2" } }); // latest wins
     await (await rpc("alice", "stub", lookup(), { session })).text();
     expect(stub.requests.at(-1)?.authorization).toBe("Bearer valid-alice-2");
   });
@@ -401,9 +510,10 @@ describe("credentials: per message, per person, memory only", () => {
 
   test("person A's credential is never used for person B", async () => {
     await call(bob.token, "PUT", "/v1/mcp-servers/stub", { url: stub.url });
-    await send(bob, { mcpAuth: { stub: "Bearer valid-bob-1" } });
+    await turn(bob, { mcpAuth: { stub: "Bearer valid-bob-1" } });
     const init = await rpc("bob", "stub", initialize);
     const bobSession = init.headers.get("mcp-session-id")!;
+    await init.text();
     await (
       await rpc("bob", "stub", lookup("7"), { session: bobSession })
     ).text();
@@ -415,19 +525,18 @@ describe("credentials: per message, per person, memory only", () => {
       token: M.proxyToken(cfg.serviceSecret, key("bob")),
     });
     expect(cross.status).toBe(401);
-    const bobSeen = stub.requests.filter((r) =>
-      r.authorization?.includes("bob"),
-    ).length;
-    const aliceSeen = stub.requests.filter((r) =>
-      r.authorization?.includes("alice"),
-    ).length;
-    expect(bobSeen + aliceSeen).toBe(
-      stub.requests.filter((r) => r.authorization).length,
-    );
+    // Every request in one person's session carried that person's credential.
+    const bySession = (id: string) =>
+      stub.requests
+        .filter((r) => r.sessionId === id)
+        .map((r) => r.authorization);
+    expect(bySession(bobSession)).toEqual(["Bearer valid-bob-1"]);
+    expect(bySession(session).length).toBeGreaterThan(0);
+    expect(bySession(session).every((a) => a?.includes("alice"))).toBe(true);
   });
 
   test("an expired credential becomes a tool error the agent can relay, never a 401", async () => {
-    await send(alice, { mcpAuth: { stub: "Bearer expired-alice" } });
+    await turn(alice, { mcpAuth: { stub: "Bearer expired-alice" } });
     const res = await rpc("alice", "stub", lookup(), { session });
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -454,57 +563,81 @@ describe("credentials: per message, per person, memory only", () => {
   });
 
   test("a handshake refused for an expired credential waits for the next one", async () => {
-    await send(alice, { mcpAuth: { stub: "Bearer expired-alice-hs" } });
+    await turn(alice, { mcpAuth: { stub: "Bearer expired-alice-hs" } });
+    const mark = stub.requests.length;
     const held = rpc("alice", "stub", initialize);
     await Bun.sleep(300);
-    expect(stub.requests.at(-1)?.status).toBe(401); // tried once, then holds
+    // Tried once, refused, and now held.
+    expect(since(mark).map((r) => [r.authorization, r.status])).toEqual([
+      ["Bearer expired-alice-hs", 401],
+    ]);
     const sending = send(alice, { mcpAuth: { stub: "Bearer valid-alice-hs" } });
     const res = await held;
     expect(res.status).toBe(200);
     expect(stub.requests.at(-1)?.authorization).toBe("Bearer valid-alice-hs");
     session = res.headers.get("mcp-session-id")!;
-    await (await rpc("alice", "stub", toolsList, { session })).text(); // as Happy does next
+    await res.text();
     expect((await sending).status).toBe(202);
+    await (await rpc("alice", "stub", toolsList, { session })).text(); // as the agent does next
+    await settled(alice);
   });
 
-  test("credentials are forgotten when the runtime stops", async () => {
-    await send(alice, { mcpAuth: { stub: "Bearer valid-alice-3" } });
+  test("credentials are forgotten once the person is idle", async () => {
+    await turn(alice, { mcpAuth: { stub: "Bearer valid-alice-3" } });
     expect(
       (await call(alice.token, "GET", "/v1/mcp-servers")).body.servers[0]
         .hasCredential,
     ).toBe(true);
-    for (const p of gateway.people.values()) p.lastUsed = 0;
-    await gateway.idleSweep();
-    expect(runtime.calls).toContain(`stop ${key("alice")}`);
+    const k = key("alice");
+    const p = gateway.people.get(k)!;
+    await until(() => p.queues.size === 0);
+    p.lastUsed = 0;
+    gateway.idleSweep();
+    expect(gateway.people.has(k)).toBe(false);
+    expect(gateway.people.has(key("bob"))).toBe(true); // only the idle person
     // Its socket is closed with it, and nothing is held for it any more.
-    expect(rpc("alice", "stub", lookup(), { session })).rejects.toThrow();
+    await expect(rpc("alice", "stub", lookup(), { session })).rejects.toThrow();
     const res = await gateway.mcpProxy(
-      new Request(`http://runtime/mcp/${key("alice")}/stub`, {
+      new Request(`http://runtime/mcp/${k}/stub`, {
         method: "POST",
         headers: {
-          authorization: `Bearer ${M.proxyToken(cfg.serviceSecret, key("alice"))}`,
+          authorization: `Bearer ${M.proxyToken(cfg.serviceSecret, k)}`,
           "content-type": "application/json",
           "mcp-session-id": session,
         },
         body: JSON.stringify(lookup()),
       }),
       { timeout() {} },
-      key("alice"),
+      k,
     );
     expect((await res.json()).result.content[0].text).toBe(
       M.COPY.expired("stub"),
     );
+    expect(
+      (await call(alice.token, "GET", "/v1/mcp-servers")).body.servers[0]
+        .hasCredential,
+    ).toBe(false);
   });
 
-  test("enabledTools reaches Happy's config and is enforced by the proxy too", async () => {
+  test("enabledTools reaches the agent and is enforced by the proxy too", async () => {
     await call(alice.token, "PUT", "/v1/mcp-servers/stub", {
       url: stub.url,
       enabledTools: ["lookup_customer"],
     });
-    expect(
-      runtime.volume.get(`${key("alice")}:${M.MCP_DIR}/${M.TEMPLATE_FILE}`),
-    ).toContain('enabled_tools = ["lookup_customer"]');
-    await send(alice, { mcpAuth: { stub: "Bearer valid-alice-4" } });
+    await turn(alice, { mcpAuth: { stub: "Bearer valid-alice-4" } }); // listens on the socket again
+    // The agent gets the proxy and its own token: never the upstream address or the credential.
+    const k = key("alice");
+    expect(claude.inputs.at(-1)!.mcpServers).toEqual([
+      {
+        name: "stub",
+        url: `http://127.0.0.1:8790/mcp/${k}/stub`,
+        headers: {
+          Authorization: `Bearer ${M.proxyToken(cfg.serviceSecret, k)}`,
+        },
+        enabledTools: ["lookup_customer"],
+      },
+    ]);
+    const mark = stub.requests.length;
     const res = await rpc(
       "alice",
       "stub",
@@ -522,6 +655,14 @@ describe("credentials: per message, per person, memory only", () => {
       ],
       isError: true,
     });
+    expect(stub.requests.length).toBe(mark); // refused at the proxy
+    const allowed = await rpc("alice", "stub", lookup(), { session });
+    const frames = [];
+    for await (const f of sseFrames(allowed.body!))
+      frames.push(JSON.parse(f.data));
+    expect(JSON.parse(frames[0].result.content[0].text)).toMatchObject(
+      STUB_CUSTOMER,
+    );
   });
 
   test("mcpAuth is validated without echoing it; DELETE forgets the server and its credential", async () => {
@@ -535,6 +676,10 @@ describe("credentials: per message, per person, memory only", () => {
       expect(JSON.stringify(r.body)).not.toContain("SECRETX");
     }
     expect(
+      (await call(bob.token, "GET", "/v1/mcp-servers")).body.servers[0]
+        .hasCredential,
+    ).toBe(true);
+    expect(
       (await call(bob.token, "DELETE", "/v1/mcp-servers/stub")).status,
     ).toBe(204);
     expect(
@@ -544,110 +689,125 @@ describe("credentials: per message, per person, memory only", () => {
     expect((await res.json()).result.content[0].text).toBe(
       M.COPY.removed("stub"),
     );
+    // Registered again, it starts without the old credential.
+    expect(
+      (await call(bob.token, "PUT", "/v1/mcp-servers/stub", { url: stub.url }))
+        .body.server.hasCredential,
+    ).toBe(false);
   });
 
-  test("credentials never reach the runtime, its files, the daemon, responses or logs", () => {
+  test("credentials never reach the agents, the person's home, the store, responses or logs", () => {
     const secrets = ["valid-alice", "valid-bob", "expired-alice", "SECRETX"];
-    const runtimeSide = JSON.stringify([
-      ...runtime.volume.values(),
-      ...runtime.files.map((f) => f.content),
-    ]);
-    const daemonSide = JSON.stringify(
-      [...runtime.daemons.values()].map((d) => d.requests),
-    );
+    const agentSide = JSON.stringify([claude.inputs, restarted.inputs]);
+    const homeSide = JSON.stringify([written, execs]);
     const state = JSON.stringify([...gateway.people.values()], (_k, v) =>
       v instanceof Map || v instanceof Set ? [...v] : v,
     );
+    // The SQLite file itself, with its write-ahead log.
+    const db = Buffer.concat(
+      [dbPath, `${dbPath}-wal`].filter(existsSync).map((f) => readFileSync(f)),
+    );
+    expect(db.includes("Look up customer 42")).toBe(true); // the files hold the messages
     for (const s of secrets) {
-      expect(runtimeSide).not.toContain(s);
-      expect(daemonSide).not.toContain(s);
+      expect(agentSide).not.toContain(s);
+      expect(homeSide).not.toContain(s);
+      expect(state).not.toContain(s);
+      expect(db.includes(s)).toBe(false);
       expect(responses.join("\n")).not.toContain(s);
       expect(logs.join("\n")).not.toContain(s);
-      expect(state).not.toContain(s);
     }
-    expect(
-      stub.requests.some((r) => r.authorization === "Bearer valid-alice-4"),
-    ).toBe(false); // never called after
   });
 });
 
 describe("hidden per-message context", () => {
-  test("the agent receives it; the person never sees it in replies, history or events", async () => {
+  test("the agent receives it; the person never sees it in replies, history, titles or events", async () => {
     const carol = await connectedPerson("carol");
-    const ac = new AbortController();
-    const events: { event: string; data: any }[] = [];
-    const stream = await fetch(`http://127.0.0.1:${api.port}/v1/events`, {
-      headers: { authorization: `Bearer ${carol.token}` },
-      signal: ac.signal,
+    // Untitled, so the generated title shows what it is made of.
+    const created = await call(carol.token, "POST", "/v1/conversations", {
+      provider: "claude",
+      model: "claude-code/default",
     });
-    void (async () => {
-      try {
-        for await (const f of sseFrames(stream.body!))
-          events.push({ event: f.event, data: JSON.parse(f.data) });
-      } catch {}
-    })();
+    const conversation = created.body.conversation.id as string;
+    const s = await listen(carol);
     const context = "Viewing record HIDDENCTX-77 in the app";
-    const sent = await send(carol, { text: "What am I looking at?", context });
+    const sent = await call(
+      carol.token,
+      "POST",
+      `/v1/conversations/${conversation}/messages`,
+      { text: "What am I looking at?", context },
+    );
     expect(sent.status).toBe(202);
     expect(sent.body.message.text).toBe("What am I looking at?");
-    const daemon = runtime.daemons.get(key("carol"))!;
-    const delivered = JSON.parse(
-      daemon.requests.filter((r) => r.path.endsWith("/send")).at(-1)!.body,
-    ).text;
-    expect(delivered.startsWith(H.CONTEXT_OPEN)).toBe(true);
+    await s.until(
+      (e) =>
+        e.event === "conversation.run" && e.data.run.status === "completed",
+    );
+    s.close();
+    const delivered = claude.inputs
+      .filter((i) => i.conversationId === conversation)
+      .at(-1)!.text;
+    expect(delivered.startsWith(CONTEXT_OPEN)).toBe(true);
     expect(delivered).toContain(context);
     expect(delivered.endsWith("\n\nWhat am I looking at?")).toBe(true);
     const page = await call(
       carol.token,
       "GET",
-      `/v1/conversations/${carol.conversation}/messages`,
+      `/v1/conversations/${conversation}/messages`,
     );
     expect(page.body.messages[0]).toMatchObject({
       role: "user",
       text: "What am I looking at?",
     });
-    // The daemon's own event for that message carries the full text.
-    const stored = daemon.agents.get(carol.conversation).runs.at(-1)
-      .messages[0];
-    daemon.push("message.created", {
-      agentId: carol.conversation,
-      runId: stored.id,
-      message: stored,
-    });
-    await Bun.sleep(300);
-    ac.abort();
-    const echoed = events.find((e) => e.event === "conversation.message");
+    expect(page.body.conversation.title).toBe("What am I looking at?");
+    await call(carol.token, "GET", "/v1/conversations");
+    const echoed = s.events.find(
+      (e) =>
+        e.event === "conversation.message" && e.data.message.role === "user",
+    );
     expect(echoed?.data.message.text).toBe("What am I looking at?");
-    expect(JSON.stringify(events)).not.toContain("HIDDENCTX");
-    expect(JSON.stringify(page.body)).not.toContain("HIDDENCTX");
-    for (const bad of [
-      `x ${H.CONTEXT_CLOSE} y`,
-      "x".repeat(H.MAX_CONTEXT + 1),
-      42,
-    ])
-      expect((await send(carol, { context: bad })).status).toBe(400);
+    expect(JSON.stringify(s.events)).not.toContain("HIDDENCTX");
+    expect(responses.join("\n")).not.toContain("HIDDENCTX");
+    for (const bad of [`x ${CONTEXT_CLOSE} y`, "x".repeat(MAX_CONTEXT + 1), 42])
+      expect(
+        (
+          await call(
+            carol.token,
+            "POST",
+            `/v1/conversations/${conversation}/messages`,
+            { text: "hi", context: bad },
+          )
+        ).status,
+      ).toBe(400);
   });
 
-  test("text without context is untouched, even if it looks like a marker", () => {
-    expect(H.stripContext("plain text")).toBe("plain text");
-    expect(H.stripContext(H.withContext("hi", ""))).toBe("hi");
-    expect(H.stripContext(H.withContext("hi\n\nthere", "ctx"))).toBe(
-      "hi\n\nthere",
-    );
+  test("text without context reaches the agent and the history untouched", async () => {
+    expect(withContext("hi", "")).toBe("hi");
+    for (const body of [
+      { text: "plain text" },
+      { text: "hi\n\nthere", context: "" },
+      { text: `${CONTEXT_OPEN}\nnot from the app\n${CONTEXT_CLOSE}\n\nhi` },
+    ]) {
+      await turn(alice, body);
+      expect(claude.inputs.at(-1)!.text).toBe(body.text);
+      const page = await settled(alice);
+      expect(
+        page.messages.filter((m: any) => m.role === "user").at(-1).text,
+      ).toBe(body.text);
+    }
   });
 });
 
 describe("conversations: paging, search, rename, archive", () => {
   test("pages newest first, searches titles, renames and archives", async () => {
     const dave = await connectedPerson("dave");
-    const more = [];
+    const more: string[] = [];
     for (const title of ["Invoice follow-up", "Weekly plan"]) {
       await Bun.sleep(5);
       more.push(
         (
           await call(dave.token, "POST", "/v1/conversations", {
             provider: "claude",
-            model: "claude-code/haiku",
+            model: "claude-code/default",
             title,
           })
         ).body.conversation.id,
@@ -699,13 +859,22 @@ describe("conversations: paging, search, rename, archive", () => {
         })
       ).status,
     ).toBe(400);
+    // The person's own title wins over the one generated from the first message; null goes back to it.
+    await turn(
+      { token: dave.token, conversation: more[1]! },
+      { text: "Weekly plan for the team\nwith the details" },
+    );
+    expect(
+      (await call(dave.token, "GET", `/v1/conversations/${more[1]}/messages`))
+        .body.conversation.title,
+    ).toBe("Plan for Monday");
     expect(
       (
         await call(dave.token, "PATCH", `/v1/conversations/${more[1]}`, {
           title: null,
         })
       ).body.conversation.title,
-    ).toBe("Weekly plan");
+    ).toBe("Weekly plan for the team");
     expect(
       (
         await call(bob.token, "PATCH", `/v1/conversations/${more[1]}`, {
@@ -733,18 +902,22 @@ describe("conversations: paging, search, rename, archive", () => {
 });
 
 describe("standing instructions", () => {
-  test("written as AGENTS.md and CLAUDE.md in the chat workspace, read back, and cleared", async () => {
+  test("kept by the gateway, written as AGENTS.md and CLAUDE.md in the chat workspace, and cleared", async () => {
     const k = key("alice");
     const text = "Always answer in one sentence.\n";
+    const mark = written.length;
     expect(
       (await call(alice.token, "PUT", "/v1/instructions", { text })).body.text,
     ).toBe(text);
-    for (const path of [
-      `${H.RUNTIME_DIR}/${H.INSTRUCTIONS_FILE}`,
-      `${H.PROJECT_PATH}/AGENTS.md`,
-      `${H.PROJECT_PATH}/CLAUDE.md`,
-    ])
-      expect(runtime.volume.get(`${k}:${path}`)).toBe(text);
+    expect(
+      written
+        .slice(mark)
+        .filter((w) => w.key === k)
+        .map((w) => [w.dir, w.name, w.content]),
+    ).toEqual([
+      [WORKSPACE, "AGENTS.md", text],
+      [WORKSPACE, "CLAUDE.md", text],
+    ]);
     expect((await call(alice.token, "GET", "/v1/instructions")).body.text).toBe(
       text,
     );
@@ -755,60 +928,14 @@ describe("standing instructions", () => {
       (await call(alice.token, "PUT", "/v1/instructions", { text: "" })).body
         .text,
     ).toBe("");
-    expect(runtime.volume.has(`${k}:${H.PROJECT_PATH}/CLAUDE.md`)).toBe(false);
+    expect(execs.at(-1)).toEqual([
+      "rm",
+      "-f",
+      `${WORKSPACE}/AGENTS.md`,
+      `${WORKSPACE}/CLAUDE.md`,
+    ]);
     expect((await call(alice.token, "GET", "/v1/instructions")).body.text).toBe(
       "",
     );
   });
 });
-
-describe("files read from the person's volume", () => {
-  test("a read cut off by a runtime restart is an error, never an empty file", async () => {
-    const grace = await devToken(cfg.devSecret, "grace");
-    const k = key("grace");
-    expect((await call(grace, "PUT", "/v1/instructions", { text: "" })).status).toBe(200);
-    const registered = [
-      { name: "app", url: stub.url, enabledTools: null, description: null },
-    ];
-    runtime.volume.set(
-      `${k}:${M.MCP_DIR}/${M.REGISTRY_FILE}`,
-      M.sealRegistry(cfg.serviceSecret, k, registered),
-    );
-    runtime.volume.set(`${k}:${H.RUNTIME_DIR}/${H.INSTRUCTIONS_FILE}`, "Be brief.\n");
-    runtime.failReads = 137;
-    try {
-      expect((await call(grace, "GET", "/v1/instructions")).status).toBe(503);
-      expect((await call(grace, "GET", "/v1/mcp-servers")).status).toBe(503);
-    } finally {
-      runtime.failReads = undefined;
-    }
-    // Nothing was cached from the failed reads.
-    expect((await call(grace, "GET", "/v1/instructions")).body.text).toBe("Be brief.\n");
-    expect(
-      (await call(grace, "GET", "/v1/mcp-servers")).body.servers.map((s: any) => s.name),
-    ).toEqual(["app"]);
-  });
-});
-
-describe("Happy's MCP configuration", () => {
-  test("the template is valid TOML with the proxy, the token variable and the long startup timeout", () => {
-    const toml = M.renderMcpToml([
-      {
-        name: "app",
-        url: "https://app.example.com/mcp",
-        enabledTools: ["a", "b.c"],
-        description: null,
-      },
-    ]);
-    const parsed = Bun.TOML.parse(
-      toml.replaceAll(M.PROXY_URL_PLACEHOLDER, "http://gw:8790/mcp/k"),
-    ) as any;
-    expect(parsed.mcp_servers.app).toEqual({
-      url: "http://gw:8790/mcp/k/app",
-      bearer_token_env_var: "MCP_PROXY_TOKEN",
-      startup_timeout_sec: 600,
-      enabled_tools: ["a", "b.c"],
-    });
-  });
-});
-

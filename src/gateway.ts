@@ -871,10 +871,13 @@ export function createGateway(cfg: Config, deps: GatewayDeps) {
       provider,
       model: chosen.model,
       effort: chosen.effort,
-      title: clean || null,
+      title: null,
       createdAt: Date.now(),
     });
-    return json({ conversation: conversationView(p, c) }, 201);
+    // A title given at creation is the conversation's generated title: renaming it to null
+    // brings it back, and the first message does not replace it.
+    if (clean) store.updateConversation(p.key, c.id, { autoTitle: clean });
+    return json({ conversation: conversationView(p, conversationOf(p, c.id)) }, 201);
   }
 
   function listConversations({ p, url }: Ctx) {
