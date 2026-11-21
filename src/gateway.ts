@@ -480,6 +480,11 @@ export function createGateway(cfg: Config, deps: GatewayDeps) {
   ) {
     const c = store.conversation(p.key, conversationId);
     if (!c) return;
+    // Archived while this message waited behind another turn: it never runs.
+    if (c.archivedAt) {
+      store.endRun(p.key, runId, "aborted", fail.aborted(), Date.now());
+      return;
+    }
     const turn: Turn = { runId, abort: new AbortController(), question: null };
     p.turns.set(c.id, turn);
     p.lastUsed = Date.now();
