@@ -1,0 +1,182 @@
+# Tandem's ACP agents (src/agents/acp.ts, acp-vendors.ts, src/signin/grok.ts) with the real programs
+# in real crun sandboxes, against the scripted vendor API (scripts/mock-vendor). No real vendor was
+# contacted: every program's API base and xAI's sign-in issuer pointed at the mock, and the keys are
+# fake. Produced 2026-11-21 by evidence/poc/acp-agents.ts inside the Tandem container of the Lima VM
+# `hetzner-like` (2 vCPU arm64, no KVM, Ubuntu 24.04, kernel 6.8, Docker 28.5), person uid 100003:
+#
+#   MOCK_LOG=/tmp/acp-agent/mock.log bun evidence/poc/acp-agents.ts
+#
+# Programs: agy 1.5.11 (Antigravity CLI), grok 1.0.89 (Grok Build), goose 1.60.2. Permission mode
+# `auto`. "agent's error" lines show the agent's JSON-RPC error before Tandem classified it. agy's
+# FAIL_429 and FAIL_QUOTA turns take about 140 s each: agy's own retries with backoff.
+#
+   0.00s person 6c2a5ef8332a30e31842f17a (uid 100003); crun crun version 1.21; Linux 6.8.0-134-generic aarch64; nproc 2
+   0.00s == grok sign-in: grok login --device-auth
+   0.00s   signedIn before: false
+   0.07s   start -> {"state":"waiting","url":"https://device.mock.invalid/activate?user_code=MOCK-1001","userCode":"MOCK-1001","expiresAt":null,"codeError":null} in 64 ms
+   0.07s   (the person confirms MOCK-1001 on the page)
+   1.09s   then -> {"state":"succeeded"}; signedIn after: true
+   1.18s   second start -> waiting; cancel:
+   1.18s   second sign-in -> {"state":"cancelled"}
+   1.19s == gemini: agy acp --disable-telemetry
+   1.37s   read in 178 ms: signedIn=true account={"email":null,"plan":"API key"}
+   1.37s     model antigravity/gemini-4-carbon "Gemini 4 Carbon" efforts=[low,medium,high] default=medium context=null
+   1.37s     model antigravity/gemini-4-hydrogen "Gemini 4 Hydrogen" efforts=[low,medium,high,xhigh] default=medium context=null
+   1.37s     model antigravity/gemini-4-argon "Gemini 4 Argon" efforts=[low,medium,high] default=medium context=null
+   1.37s     model antigravity/gemini-3.8-flash "Gemini 3.8 Flash" efforts=[low,medium,high] default=high context=null
+   1.37s     model antigravity/gemini-3.7-flash "Gemini 3.7 Flash" efforts=[low,medium,high] default=medium context=null
+   1.37s     model antigravity/gemini-3.6-flash "Gemini 3.6 Flash" efforts=[low,medium,high] default=medium context=null
+   1.37s     model antigravity/gemini-3.1-pro "Gemini 3.1 Pro" efforts=[low,high] default=low context=null
+   1.37s   tool turn, allowed once: "REMEMBER kiwi-42. Then RUN_TOOL please." (antigravity/gemini-4-carbon high, auto)
+   1.40s     ask: {"askedBy":"Antigravity","header":"run_command","question":"Allow id -u; grep -E 'CapEff|NoNewPrivs|Seccomp:' /proc/self/status; echo TMP=$TMPDIR; ech","options":["Allow once","Deny"]}
+   1.40s     end: {"status":"completed"} in 38 ms
+   1.40s     tool 64899ebd-d0ad-4082-9eb0-e7cc4ca7d9db: run_command:running -> run_command:completed
+   1.40s     text: TOOL_RESULT_SEEN {"output":"Created At: 2026-11-21T14:39:27Z\nCompleted At: 2026-11-21T14:39:27Z\nCommand exited with code 0.\n\nCommand output:\n100003\r\nCapE
+   1.40s     context: {"usedTokens":1020,"limitTokens":1048576,"approximate":false}
+   1.40s     usage: {"input":2000,"output":40,"cacheRead":0,"cacheWrite":0}
+   1.40s   tool turn, denied: "RUN_TOOL once more" (antigravity/gemini-4-carbon high, auto, session 842d6e91-01a9-4ce1-9276-69f0eed1ae0f)
+   1.42s     ask: {"askedBy":"Antigravity","header":"run_command","question":"Allow id -u; grep -E 'CapEff|NoNewPrivs|Seccomp:' /proc/self/status; echo TMP=$TMPDIR; ech","options":["Allow once","Deny"]}
+   1.43s     end: {"status":"completed"} in 20 ms
+   1.43s     tool 22d4da33-b27d-43b2-b915-2fd3f9f5be94: run_command:running -> run_command:failed
+   1.43s     usage: {"input":3000,"output":60,"cacheRead":0,"cacheWrite":0}
+   1.43s   abort mid-command: "RUN_SLOW now" (antigravity/gemini-4-carbon high, auto)
+   1.45s     ask: {"askedBy":"Antigravity","header":"run_command","question":"Allow echo started; sleep 300; echo late?","options":["Allow once","Deny"]}
+   3.98s     command running before abort: true
+   3.98s     end: {"status":"aborted"} in 2553 ms
+   3.98s     tool 5e5efae9-9a84-4a44-a043-d697374357bc: run_command:running -> run_command:failed
+   3.98s     context: {"usedTokens":1020,"limitTokens":1048576,"approximate":false}
+   4.10s     after abort: agent holds a process=false, command still running=false, sandboxes of this proof 1 -> 0
+   4.10s   released: agent holds a process=false
+   4.10s   second turn in a new process, same session: "RECALL what I asked you to remember" (antigravity/gemini-4-carbon high, auto, session 842d6e91-01a9-4ce1-9276-69f0eed1ae0f)
+   4.28s     end: {"status":"completed"} in 188 ms
+   4.28s     text: RECALLED kiwi-42
+   4.28s     context: {"usedTokens":1020,"limitTokens":1048576,"approximate":false}
+   4.28s     usage: {"input":1000,"output":20,"cacheRead":0,"cacheWrite":0}
+   4.28s     new process started: true
+   4.28s   MCP tool call: "RUN_MCP for customer 42" (antigravity/gemini-4-carbon high, auto)
+   4.32s     ask: {"askedBy":"Antigravity","header":"mcp_app_lookup_customer","question":"Allow Run mcp_app_lookup_customer?","options":["Allow once","Deny"]}
+   4.32s     end: {"status":"completed"} in 40 ms
+   4.32s     tool 530006f2-59b0-40e8-8fb0-90e57c12ab53: mcp_app_lookup_customer:running -> mcp_app_lookup_customer:completed
+   4.32s     text: TOOL_RESULT_SEEN {"output":"Created At: 2026-11-21T14:39:30Z\nCompleted At: 2026-11-21T14:39:30Z\n{\"id\":\"42\",\"name\":\"Wilhelmina Quarrington\",\"plan\":\"
+   4.32s     context: {"usedTokens":1020,"limitTokens":1048576,"approximate":false}
+   4.32s     usage: {"input":2000,"output":40,"cacheRead":0,"cacheWrite":0}
+   4.32s     MCP server saw: ["server/discover 404","initialize 200","notifications/initialized 202","null 404","null 404","tools/list 200","notifications/roots/list_changed 202","tools/call(lookup_customer) 200"]
+   4.32s   failure FAIL_401: "FAIL_401" (antigravity/gemini-4-carbon high, auto)
+   4.34s     end: {"status":"failed","code":"signin_required","message":"Your Gemini account isn't connected or its sign-in expired. Connect it again, then retry."} in 21 ms
+   4.34s   failure FAIL_429: "FAIL_429" (antigravity/gemini-4-carbon high, auto)
+ 145.85s     end: {"status":"failed","code":"rate_limited","message":"The provider is getting too many requests right now. Wait a moment, then try again."} in 141502 ms
+ 145.85s   failure FAIL_QUOTA: "FAIL_QUOTA" (antigravity/gemini-4-carbon high, auto)
+ 281.27s     end: {"status":"failed","code":"usage_limit","message":"You've reached your plan's usage limit. Try again once it resets."} in 135426 ms
+ 281.32s == grok: grok agent --no-leader stdio
+ 281.45s   read in 131 ms: signedIn=true account={"email":"person@mock.invalid","plan":null}
+ 281.45s     model xai/grok-4.6 "Grok 4.6" efforts=[low,medium,high] default=high context=500000
+ 281.45s     model xai/grok-build "Grok Build" efforts=[] default=null context=256000
+ 281.45s   tool turn, allowed once: "REMEMBER kiwi-42. Then RUN_TOOL please." (xai/grok-4.6 medium, auto)
+ 281.49s     ask: {"askedBy":"Grok Build","header":"run_terminal_command","question":"Allow id -u; grep -E 'CapEff|NoNewPrivs|Seccomp:' /proc/self/status; echo TMP=$TMPDIR; ech","options":["Allow once","Allow always","Deny"]}
+ 281.50s     end: {"status":"completed"} in 57 ms
+ 281.50s     tool call_3: run_terminal_command:running -> run_terminal_command:completed
+ 281.50s     text: TOOL_RESULT_SEEN exit: 0 100003 CapEff: 0000000000000000 NoNewPrivs: 1 Seccomp: 2 TMP=/var/tmp/agent hi 
+ 281.50s     context: {"usedTokens":1020,"limitTokens":500000,"approximate":false}
+ 281.50s     usage: {"input":2000,"output":40,"cacheRead":0,"cacheWrite":0}
+ 281.50s   tool turn, denied: "RUN_TOOL once more" (xai/grok-4.6 medium, auto, session 01a1fe90-889c-7673-aa34-a691438e68ab)
+ 281.51s     ask: {"askedBy":"Grok Build","header":"run_terminal_command","question":"Allow id -u; grep -E 'CapEff|NoNewPrivs|Seccomp:' /proc/self/status; echo TMP=$TMPDIR; ech","options":["Allow once","Allow always","Deny"]}
+ 281.53s     end: {"status":"completed"} in 23 ms
+ 281.53s     tool call_9: run_terminal_command:running -> run_terminal_command:failed
+ 281.53s     context: {"usedTokens":1020,"limitTokens":500000,"approximate":false}
+ 281.53s     usage: {"input":3000,"output":60,"cacheRead":0,"cacheWrite":0}
+ 281.53s   abort mid-command: "RUN_SLOW now" (xai/grok-4.6 medium, auto)
+ 284.10s     command running before abort: true
+ 284.10s     end: {"status":"aborted"} in 2573 ms
+ 284.10s     tool call_13: run_terminal_command:running -> run_terminal_command:failed
+ 284.34s     after abort: agent holds a process=false, command still running=false, sandboxes of this proof 1 -> 0
+ 284.34s   released: agent holds a process=false
+ 284.34s   second turn in a new process, same session: "RECALL what I asked you to remember" (xai/grok-4.6 medium, auto, session 01a1fe90-889c-7673-aa34-a691438e68ab)
+ 284.48s     end: {"status":"completed"} in 142 ms
+ 284.48s     text: RECALLED kiwi-42
+ 284.48s     context: {"usedTokens":1020,"limitTokens":500000,"approximate":false}
+ 284.48s     usage: {"input":1000,"output":20,"cacheRead":0,"cacheWrite":0}
+ 284.48s     new process started: true
+ 284.48s   MCP tool call: "RUN_MCP for customer 42" (xai/grok-4.6 medium, auto)
+ 284.52s     ask: {"askedBy":"Grok Build","header":"use_tool","question":"Allow app__lookup_customer?","options":["Allow once","Allow always","Deny"]}
+ 284.53s     end: {"status":"completed"} in 52 ms
+ 284.53s     tool call_23: use_tool:running -> use_tool:completed
+ 284.53s     text: TOOL_RESULT_SEEN {"id":"42","name":"Wilhelmina Quarrington","plan":"Gold","visits":7}
+ 284.53s     context: {"usedTokens":1020,"limitTokens":500000,"approximate":false}
+ 284.53s     usage: {"input":2000,"output":40,"cacheRead":0,"cacheWrite":0}
+ 284.53s     MCP server saw: ["server/discover 404","initialize 200","notifications/initialized 202","null 405","tools/list 200","tools/call(lookup_customer) 200"]
+ 284.53s   failure FAIL_401: "FAIL_401" (xai/grok-4.6 medium, auto)
+ 290.37s     agent's error: -32603 Internal error Unauthorized (401) from http://127.0.0.1:4799/responses: Unauthorized: token expired Model: grok-4.6 Auth: Oidc Version: 1.0.89 Available: grok-4.6, grok-build Authentication is temporarily unavailable (often a network blip right after wake). Your session is still signed in and will r
+ 290.37s     end: {"status":"failed","code":"signin_required","message":"Your Grok account isn't connected or its sign-in expired. Connect it again, then retry."} in 5840 ms
+ 290.38s   failure FAIL_429: "FAIL_429" (xai/grok-4.6 medium, auto)
+ 292.37s     agent's error: -32003 Rate limited API error (status 429 Too Many Requests): rate_limited: Too many requests
+ 292.37s     end: {"status":"failed","code":"rate_limited","message":"The provider is getting too many requests right now. Wait a moment, then try again."} in 1991 ms
+ 292.37s   failure FAIL_QUOTA: "FAIL_QUOTA" (xai/grok-4.6 medium, auto)
+ 292.43s     agent's error: -32003 Rate limited API error (status 429 Too Many Requests): subscription:free-usage-exhausted: You have used up your free usage for this period.
+ 292.43s     end: {"status":"failed","code":"usage_limit","message":"You've reached your plan's usage limit. Try again once it resets."} in 61 ms
+ 292.54s == openrouter: goose acp
+ 292.54s   read in 1 ms: signedIn=true account={"email":null,"plan":"API key"}
+ 292.54s     model deepseek/deepseek-v4.1-flash-1017 "DeepSeek: DeepSeek V4.1 Flash 1017" efforts=[off,low,medium,high,max] default=medium context=1048576
+ 292.54s     model openai/gpt-6.2-sol "OpenAI: GPT-6.2 Sol" efforts=[off,low,medium,high,max] default=medium context=1050000
+ 292.54s     model x-ai/grok-4.7 "SpaceXAI: Grok 4.7" efforts=[off,low,medium,high,max] default=medium context=500000
+ 292.54s     model qwen/qwen4-max "Qwen: Qwen4 Max" efforts=[off,low,medium,high,max] default=medium context=1000000
+ 292.54s     model moonshotai/kimi-k3.1-pro "MoonshotAI: Kimi K3.1 Pro" efforts=[] default=null context=1048576
+ 292.54s     model z-ai/glm-5.3-prime "Z.ai: GLM 5.3 Prime" efforts=[off,low,medium,high,max] default=medium context=1000000
+ 292.54s   tool turn, allowed once: "REMEMBER kiwi-42. Then RUN_TOOL please." (deepseek/deepseek-v4.1-flash-1017 high, auto)
+ 292.75s     ask: {"askedBy":"goose","header":"shell","question":"Allow id -u; grep -E 'CapEff|NoNewPrivs|Seccomp:' /proc/self/status; echo TMP=$TMPDIR; ech","options":["Allow once","Allow always","Deny"]}
+ 292.76s     end: {"status":"completed"} in 224 ms
+ 292.76s     tool call_1795272258752: shell:running -> shell:completed
+ 292.76s     text: TOOL_RESULT_SEEN 100003 CapEff: 0000000000000000 NoNewPrivs: 1 Seccomp: 2 TMP=/var/tmp/agent hi
+ 292.76s     context: {"usedTokens":1020,"limitTokens":1048576,"approximate":false}
+ 292.76s     usage: {"input":2000,"output":40,"cacheRead":0,"cacheWrite":0}
+ 292.76s   tool turn, denied: "RUN_TOOL once more" (deepseek/deepseek-v4.1-flash-1017 high, auto, session 20261121_24)
+ 292.78s     ask: {"askedBy":"goose","header":"shell","question":"Allow id -u; grep -E 'CapEff|NoNewPrivs|Seccomp:' /proc/self/status; echo TMP=$TMPDIR; ech","options":["Allow once","Allow always","Deny"]}
+ 292.78s     end: {"status":"completed"} in 18 ms
+ 292.78s     tool call_1795272258772: shell:running -> shell:failed
+ 292.78s     text: TOOL_RESULT_SEEN The user has declined to run this tool. DO NOT attempt to call this tool again. If there are no alternative methods to proceed, clearly explain
+ 292.78s     context: {"usedTokens":1020,"limitTokens":1048576,"approximate":false}
+ 292.78s     usage: {"input":4000,"output":80,"cacheRead":0,"cacheWrite":0}
+ 292.78s   abort mid-command: "RUN_SLOW now" (deepseek/deepseek-v4.1-flash-1017 high, auto)
+ 292.80s     ask: {"askedBy":"goose","header":"shell","question":"Allow echo started; sleep 300; echo late?","options":["Allow once","Allow always","Deny"]}
+ 295.33s     command running before abort: true
+ 295.34s     end: {"status":"aborted"} in 2552 ms
+ 295.34s     tool call_1795272258802: shell:running -> shell:failed
+ 295.34s     context: {"usedTokens":1020,"limitTokens":1048576,"approximate":false}
+ 295.34s     usage: {"input":1000,"output":20,"cacheRead":0,"cacheWrite":0}
+ 295.46s     after abort: agent holds a process=false, command still running=false, sandboxes of this proof 1 -> 0
+ 295.46s   released: agent holds a process=false
+ 295.46s   second turn in a new process, same session: "RECALL what I asked you to remember" (deepseek/deepseek-v4.1-flash-1017 high, auto, session 20261121_24)
+ 295.62s     end: {"status":"completed"} in 160 ms
+ 295.62s     text: RECALLED kiwi-42
+ 295.62s     context: {"usedTokens":1020,"limitTokens":1048576,"approximate":false}
+ 295.62s     usage: {"input":5000,"output":100,"cacheRead":0,"cacheWrite":0}
+ 295.62s     new process started: true
+ 295.62s   MCP tool call: "RUN_MCP for customer 42" (deepseek/deepseek-v4.1-flash-1017 high, auto)
+ 295.71s     end: {"status":"completed"} in 86 ms
+ 295.71s     tool call_1795272261705: app__lookup_customer:running -> app__lookup_customer:completed
+ 295.71s     text: TOOL_RESULT_SEEN {"id":"42","name":"Wilhelmina Quarrington","plan":"Gold","visits":7}
+ 295.71s     context: {"usedTokens":1020,"limitTokens":1048576,"approximate":false}
+ 295.71s     usage: {"input":2000,"output":40,"cacheRead":0,"cacheWrite":0}
+ 295.71s     MCP server saw: ["server/discover 404","initialize 200","notifications/initialized 202","null 405","tools/list 200","tools/call(lookup_customer) 200"]
+ 295.71s   failure FAIL_401: "FAIL_401" (deepseek/deepseek-v4.1-flash-1017 high, auto)
+ 295.72s     end: {"status":"failed","code":"signin_required","message":"Your OpenRouter account isn't connected or its sign-in expired. Connect it again, then retry."} in 14 ms
+ 295.72s     context: {"usedTokens":0,"limitTokens":1048576,"approximate":false}
+ 295.72s     usage: {"input":0,"output":0,"cacheRead":0,"cacheWrite":0}
+ 295.72s   failure FAIL_429: "FAIL_429" (deepseek/deepseek-v4.1-flash-1017 high, auto)
+ 302.48s     agent's error: -32603 Ran into this error: Rate limit exceeded: Rate limit exceeded: too many requests. Please retry if you think this is a transient or recoverable error. {"reason":"turn_failed"}
+ 302.48s     end: {"status":"failed","code":"rate_limited","message":"The provider is getting too many requests right now. Wait a moment, then try again."} in 6758 ms
+ 302.48s     context: {"usedTokens":0,"limitTokens":1048576,"approximate":false}
+ 302.48s     usage: {"input":0,"output":0,"cacheRead":0,"cacheWrite":0}
+ 302.48s   failure FAIL_QUOTA: "FAIL_QUOTA" (deepseek/deepseek-v4.1-flash-1017 high, auto)
+ 302.51s     agent's error: -32603 Please check your account with your provider to add more credits, then resend your message to continue. {"reason":"credits_exhausted"}
+ 302.51s     end: {"status":"failed","code":"usage_limit","message":"Please check your account with your provider to add more credits, then resend your message to contin"} in 33 ms
+ 302.51s     context: {"usedTokens":0,"limitTokens":1048576,"approximate":false}
+ 302.52s     usage: {"input":0,"output":0,"cacheRead":0,"cacheWrite":0}
+ 302.52s == key checks from a one-shot sandbox through the egress proxy and the mock
+ 302.59s   gemini good key: ok in 67 ms
+ 302.66s   gemini refused key: refused in 65 ms
+ 302.72s   openrouter good key: ok in 66 ms
+ 302.79s   openrouter refused key: refused in 66 ms
+ 302.85s   openrouter unreachable: unreachable
+ 302.85s   keys on any sandbox's argv: false
+ 302.85s == memory peak of one sandbox, by program: {"grok-login":6,"gemini":137,"grok":19,"openrouter":70,"x":0} MiB
+ 302.86s leftover sandboxes: 0
