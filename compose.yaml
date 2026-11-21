@@ -1,21 +1,25 @@
-# Tandem: one service, one container. Every person's runtime is a microVM inside it (KVM), so the
-# host needs /dev/kvm and nothing else: no Docker socket, no sibling containers. Dokploy: create a
-# Compose service from this repository and attach your domain to port 8787 (README, Deploying on
-# Dokploy). A second instance on the same host needs its own project name and volume.
+# Tandem: one service, one container. Every person's runtime is a sandboxed process tree inside it
+# (crun: their own uid, PID/network/mount namespaces, a read-only system, no capabilities), so any
+# Docker host works: no KVM, no Docker socket, no container per person. Dokploy: create a Compose
+# service (type Docker Compose) from this repository and attach your domain to port 8787 (README,
+# Deploying on Dokploy). A second instance on the same host needs its own project name and volume.
 services:
   tandem:
     build: .
-    image: ${TANDEM_IMAGE:-tandem:0.2.0}
+    image: ${TANDEM_IMAGE:-tandem:0.3.0}
     env_file: .env
-    # KVM for the microVMs. Docker's default seccomp profile and capabilities are enough.
-    devices: ["/dev/kvm:/dev/kvm"]
-    # microsandbox's state, every person's home, the runtime image cache and the MCP sockets.
+    # What creating the sandboxes needs, and nothing more: namespaces, mounts and each sandbox's own
+    # cgroup (SYS_ADMIN), each sandbox's loopback (NET_ADMIN), and no AppArmor profile, whose Docker
+    # default forbids mounts. Docker's default seccomp filter stays on for the container, and every
+    # sandbox gets Docker's filter for unprivileged containers on top (src/security.ts).
+    cap_add: [SYS_ADMIN, NET_ADMIN]
+    security_opt: ["apparmor=unconfined"]
+    # Every person's home, their uids and the gateway's sockets.
     volumes: ["tandem-data:/var/lib/tandem"]
-    # Local use: the API on this machine only. Behind Dokploy's proxy, remove `ports` and route the
-    # domain to port 8787 instead.
+    # Local use: the API on this machine only. Behind Dokploy's proxy the domain routes to port 8787
+    # over Dokploy's network instead.
     ports: ["127.0.0.1:${GATEWAY_PORT:-8787}:8787"]
-    # An init reaps the microVM processes; on stop the gateway shuts every running microVM down
-    # gracefully before the container exits.
+    # An init reaps processes; on stop the gateway stops every running sandbox gracefully first.
     init: true
     stop_grace_period: 60s
     restart: unless-stopped

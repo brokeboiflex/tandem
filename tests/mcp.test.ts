@@ -27,11 +27,11 @@ const cfg = {
   oidcJwksUrl: "",
   serviceSecret: "test-service-secret-at-least-32-characters",
   dataDir: "/tmp/tandem-test",
-  runtimeImageArchive: "/nonexistent/runtime.tar",
-  runtimeImage: "",
+  runtimeRootfs: "/nonexistent/rootfs",
   runtimePrefix: "test",
-  runtimeMemoryMb: 1024,
-  runtimeCpus: 1,
+  runtimeMemoryMb: 2048,
+  runtimeCpus: 2,
+  runtimePids: 512,
   idleMs: 60_000,
   permissionMode: "auto",
   restartAfterSignIn: false,
@@ -89,7 +89,7 @@ function rpc(
     opts.token === undefined
       ? M.proxyToken(cfg.serviceSecret, key(subject))
       : opts.token;
-  // Through the socket the gateway listens on for this person's runtime (its vsock route).
+  // Through the socket the gateway listens on for this person's runtime (mounted into its sandbox).
   return fetch(`http://runtime/mcp/${key(subject)}/${name}`, {
     unix: runtime.mcpSocket(key(subject)),
     method: opts.method ?? "POST",

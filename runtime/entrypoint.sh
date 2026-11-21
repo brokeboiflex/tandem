@@ -1,15 +1,16 @@
 #!/bin/sh
-# Runtime entrypoint, run in the person's microVM as `agent` once per boot (src/runtime.ts): install
-# the gateway-owned config, start the private bridge and the MCP route, then run the Happy Agent
-# daemon in the foreground.
+# Runtime entrypoint, run in the person's sandbox as their own user (src/runtime.ts, under tini):
+# install the gateway-owned config, start the egress and MCP relays, then run the Happy Agent daemon
+# in the foreground. The gateway talks to the daemon over its Unix socket in the home.
 set -eu
 umask 077
 
 mkdir -p "$HOME/happy/config" "$HOME/.codex" "$HOME/projects/chats" "$HOME/.agent-runtime" \
   "$HOME/.gemini/antigravity-cli"
-# The gateway points TMPDIR into the home: Happy unpacks its 341 MiB Claude Code binary there, once
-# per person instead of on every boot.
+# TMPDIR is the person's own temporary directory (src/runtime.ts), emptied at every start: Happy
+# unpacks its 341 MiB Claude Code there. Older Tandems unpacked it into the home; that copy goes.
 mkdir -p "${TMPDIR:-/tmp}"
+rm -rf "$HOME/.cache/tmp"
 
 # Install the gateway-owned config. API keys the person chose (written by the gateway to the
 # private files below) become Happy's documented `api_key` of their account, with a display name
@@ -86,36 +87,20 @@ if [ ! -e "$HOME/.codex/config.toml" ]; then
   printf 'cli_auth_credentials_store = "file"\n' > "$HOME/.codex/config.toml"
 fi
 
-# A killed daemon (a hung microVM that was killed, OOM, host crash) leaves agent.lock/auto-agent.lock
-# naming its PID. After a reboot the new daemon can get that same PID, treat the lock as live and
-# exit: "The Happy agent store is already owned by process 7". This microVM is the home's only user
-# and no daemon runs yet, so any lock here is stale.
+# A killed daemon (a hung sandbox that was killed, OOM, host crash) leaves agent.lock/auto-agent.lock
+# naming its PID. In a fresh PID namespace the new daemon usually gets that same PID, treats the
+# lock as live and exits: "The Happy agent store is already owned by process 7". This sandbox is the
+# home's only daemon and none runs yet, so any lock here is stale.
 if ! pgrep -x happy-agent >/dev/null; then
   rm -f "$HOME/.happy/agent/agent.lock" "$HOME/.happy/agent/auto-agent.lock"
 fi
 
-# Private bridge: TCP 24790 -> the daemon's owner-only Unix socket. It forwards bytes only; the
-# daemon still requires its bearer token on every request. The gateway reaches it through the port
-# microsandbox publishes on the gateway container's loopback, and those connections come from this
-# microVM's own network gateway: only that address may connect. Without one, loopback only (nobody).
-gateway=""
-if [ -r /proc/net/route ]; then
-  while read -r _ dest gw _; do
-    if [ "$dest" = 00000000 ] && [ "$gw" != 00000000 ]; then
-      # Little-endian hex, e.g. 090010AC = 172.16.0.9.
-      byte() { printf '%d' "0x$(printf '%s' "$gw" | cut -c"$1")"; }
-      gateway="$(byte 7-8).$(byte 5-6).$(byte 3-4).$(byte 1-2)"
-      break
-    fi
-  done < /proc/net/route
-fi
-socat "TCP-LISTEN:24790,fork,reuseaddr,range=${gateway:-127.0.0.1}/32" \
-  UNIX-CONNECT:"$HOME/.happy/agent/server.sock" &
-
-# MCP route: the gateway's MCP proxy at 127.0.0.1:8790 inside this microVM, forwarded over vsock to
-# this person's own socket on the gateway (src/runtime.ts). Nothing else in the microVM listens on it.
-if [ -n "${MCP_VSOCK_PORT:-}" ]; then
-  socat "TCP-LISTEN:8790,bind=127.0.0.1,fork,reuseaddr" "VSOCK-CONNECT:2:$MCP_VSOCK_PORT" &
+# The sandbox has loopback only. Its two ways out are the gateway's sockets, mounted at
+# /run/tandem (src/security.ts): the egress proxy (HTTPS_PROXY) and this person's MCP proxy
+# (MCP_PROXY_URL), each relayed to a loopback port here.
+socat TCP-LISTEN:4750,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:/run/tandem/egress.sock &
+if [ -S /run/tandem/mcp.sock ]; then
+  socat TCP-LISTEN:8790,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:/run/tandem/mcp.sock &
 fi
 
 exec happy-agent run

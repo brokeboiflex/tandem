@@ -303,7 +303,7 @@ export class McpProxy {
 
   /**
    * Handles one request from a runtime: `/mcp/<runtime key>/<server name>`. `from` is the runtime
-   * whose own socket (its vsock route) the request arrived on.
+   * whose own socket (mounted into that runtime's sandbox only) the request arrived on.
    */
   async handle(req: Request, server: ServerLike, from: string): Promise<Response> {
     const m = new URL(req.url).pathname.match(/^\/mcp\/([^/]+)\/([^/]+)$/);

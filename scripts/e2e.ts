@@ -1,6 +1,7 @@
-// End-to-end check against a running Tandem container (docker compose up) on a KVM host. Uses the
-// Docker CLI on the host only to run `msb` inside that container (stop a microVM, run a probe inside
-// one, read its footprint) and to restart the container; everything else goes through the /v1 façade.
+// End-to-end check against a running Tandem container (docker compose up). Uses the Docker CLI on
+// the host only to look inside that container (a sandbox's state, a command run as a person through
+// src/cli.ts, a request on a person's MCP socket) and to restart it; everything else goes through the
+// /v1 façade.
 //
 //   bun scripts/e2e.ts                      sign-in flows, wrong codes, isolation, cold start, footprint;
 //                                           restarts the Tandem container once (reads after a restart)
@@ -15,7 +16,7 @@
 // `extra_hosts: ["host.docker.internal:host-gateway"]`); MCP_ALLOWED_ORIGINS must allow that origin.
 import { devToken } from "../src/auth";
 import { CONTEXT_OPEN, PROVIDER_IDS } from "../src/happy";
-import { COPY } from "../src/mcp";
+import { COPY, proxyToken } from "../src/mcp";
 import { runtimeKey } from "../src/runtime";
 import { sseFrames } from "../src/sse";
 import { STUB_CUSTOMER, startStubMcp } from "./stub-mcp";
@@ -54,27 +55,43 @@ const GATEWAY =
   process.env.E2E_CONTAINER ||
   docker("ps", "-q", "--filter", "label=com.docker.compose.service=tandem").split("\n")[0]!;
 if (!GATEWAY) throw new Error("No Tandem container: set E2E_CONTAINER or start compose.yaml.");
-const msb = (...args: string[]) => docker("exec", GATEWAY, "msb", ...args);
-/** A person's microVM (src/runtime.ts). */
-const vm = (subject: string) => `${PREFIX}-${runtimeKey(serviceSecret, subject)}`;
-/** Its status in microsandbox (`running`, `stopped`, ...), or null while it does not exist. */
-const vmStatus = (subject: string) => {
-  const line = msb("ls").split("\n").find((l) => l.startsWith(`${vm(subject)} `));
-  return line ? line.trim().split(/\s+/)[2]! : null;
+/** A person's sandbox (src/runtime.ts) and its state in crun: `running`, `stopped`, or null. */
+const sandbox = (subject: string) => `${PREFIX}-${runtimeKey(serviceSecret, subject)}`;
+const crun = (...args: string[]) =>
+  docker("exec", GATEWAY, "crun", "--cgroup-manager=disabled", ...args);
+const sandboxStatus = (subject: string) => {
+  try {
+    return JSON.parse(crun("state", sandbox(subject))).status as string;
+  } catch {
+    return null;
+  }
 };
-/** The daemon's MCP settings, exported for a probe: they live only in its own environment. */
-const DAEMON_ENV =
-  "eval \"$(tr '\\0' '\\n' < /proc/$(pgrep -xo happy-agent)/environ | grep -E '^(MCP_PROXY_TOKEN|MCP_PROXY_URL)=' | sed 's/^/export /')\"; ";
-/** Runs a shell snippet inside a person's microVM as `agent`; `env` values pass as variables. */
+const shq = (v: string) => `'${v.replace(/'/g, "'\\''")}'`;
+/** Runs a shell snippet as the person in a one-shot sandbox like theirs; `env` values are exported. */
 const inRuntime = (subject: string, script: string, env: Record<string, string> = {}) =>
+  Bun.spawnSync([
+    "docker", "exec", GATEWAY, "bun", "src/cli.ts", "exec", runtimeKey(serviceSecret, subject), "--",
+    "sh", "-c",
+    Object.entries(env).map(([k, v]) => `export ${k}=${shq(v)}; `).join("") + script,
+  ])
+    .stdout.toString()
+    .trim();
+/** A request on the person's own MCP socket, as their runtime sends it: "<status> <body>". */
+const fromRuntimeOf = (subject: string, path: string, token: string | null, body: string) =>
   Bun.spawnSync(
     [
-      "docker", "exec", ...Object.keys(env).flatMap((k) => ["-e", k]), GATEWAY,
-      "sh", "-c",
-      `exec msb exec -u agent ${Object.keys(env).map((k) => `-e "${k}=$${k}"`).join(" ")} "$0" -- sh -c "$1"`,
-      vm(subject), DAEMON_ENV + script,
+      "docker", "exec", "-e", "SOCK", "-e", "URL", "-e", "TOKEN", "-e", "BODY", GATEWAY, "bun", "-e",
+      `const r = await fetch(process.env.URL, { unix: process.env.SOCK, method: "POST", headers: { "content-type": "application/json", ...(process.env.TOKEN ? { authorization: "Bearer " + process.env.TOKEN } : {}) }, body: process.env.BODY }); console.log(r.status + " " + (await r.text()).slice(0, 300));`,
     ],
-    { env: { ...process.env, ...env } },
+    {
+      env: {
+        ...process.env,
+        SOCK: `/var/lib/tandem/run/${runtimeKey(serviceSecret, subject)}/mcp.sock`,
+        URL: `http://runtime${path}`,
+        TOKEN: token ?? "",
+        BODY: body,
+      },
+    },
   )
     .stdout.toString()
     .trim();
@@ -144,12 +161,12 @@ async function waitFor<T>(
 // --- 1. Reads never start a runtime; opening the event stream does ------------------------------
 const alice = await client(`e2e-alice-${run}`);
 const bob = await client(`e2e-bob-${run}`);
-const running = async (subject: string) => vmStatus(subject) === "running";
+const running = async (subject: string) => sandboxStatus(subject) === "running";
 const allUnknown = (r: { status: number; body: any }) =>
   r.status === 200 &&
   r.body.providers.length === PROVIDER_IDS.length &&
   r.body.providers.every((p: any) => p.status === "unknown" && p.checkedAt === null);
-/** Opens the stream; reports when the microVM ran and when the live state came. */
+/** Opens the stream; reports when the sandbox ran and when the live state came. */
 async function wakeAndTime(c: Client) {
   const since = c.events.length;
   const t0 = performance.now();
@@ -157,7 +174,7 @@ async function wakeAndTime(c: Client) {
   let watching = true;
   const watch = (async () => {
     while (watching && started === undefined) {
-      if (vmStatus(c.subject) === "running") started = performance.now() - t0;
+      if (sandboxStatus(c.subject) === "running") started = performance.now() - t0;
       else await Bun.sleep(100);
     }
   })();
@@ -179,12 +196,12 @@ check(
   "new person: other reads answer 409 runtime_stopped",
 );
 await Bun.sleep(2000);
-check(vmStatus(alice.subject) === null, "…and no runtime is created");
+check(sandboxStatus(alice.subject) === null, "…and no runtime is created");
 let woke = await wakeAndTime(alice);
 check(
   woke.started !== undefined,
-  "cold start: opening /v1/events boots a fresh microVM",
-  `microVM running after ${ms(woke.started)}`,
+  "cold start: opening /v1/events starts a fresh sandbox",
+  `sandbox running after ${ms(woke.started)}`,
 );
 check(
   !!woke.state && woke.state.every((p: any) => p.status !== "unknown"),
@@ -197,7 +214,9 @@ for (const p of woke.state ?? [])
 // The UI closes, then the runtime stops (as after an idle stop): reads still start nothing.
 alice.close();
 await Bun.sleep(500);
-msb("stop", vm(alice.subject));
+crun("kill", sandbox(alice.subject), "TERM"); // like an idle stop: wait until it has stopped
+await waitFor(() => sandboxStatus(alice.subject) !== "running" || undefined, 30_000);
+await Bun.sleep(500); // the gateway notices its daemon is gone
 const stoppedAt = Date.now();
 t0 = performance.now();
 const warm = await alice.call("GET", "/v1/providers");
@@ -225,8 +244,8 @@ check(!(await running(alice.subject)), "after a gateway restart: …and starts n
 woke = await wakeAndTime(alice);
 check(
   woke.started !== undefined,
-  "stopped runtime: opening /v1/events boots it again",
-  `microVM running after ${ms(woke.started)}`,
+  "stopped runtime: opening /v1/events starts it again",
+  `sandbox running after ${ms(woke.started)}`,
 );
 check(
   !!woke.state && woke.state.every((p: any) => p.status !== "unknown") && (await running(alice.subject)),
@@ -234,11 +253,11 @@ check(
   `${ms(woke.live)} after opening`,
 );
 // With the stream open, a runtime stopped behind the gateway's back is restarted at once and the
-// live state comes again on the same stream (a restart waits for the microVM to finish stopping).
+// live state comes again on the same stream (a restart waits for the sandbox to finish stopping).
 {
   const since = alice.events.length;
   t0 = performance.now();
-  msb("stop", vm(alice.subject));
+  crun("kill", sandbox(alice.subject), "TERM");
   const again = await alice.live(since, 300_000);
   check(
     !!again && (await running(alice.subject)),
@@ -246,51 +265,66 @@ check(
     `${seconds(t0)} after the stop`,
   );
 }
-// The bridges listen on the container's own loopback: the host sees only the API port.
+// The host sees only the API port; each daemon listens on a Unix socket in its home, not on TCP.
 check(
   docker("port", GATEWAY).split("\n").every((l) => l.startsWith("8787/tcp")),
   "only the API port is published",
   docker("port", GATEWAY).replace(/\n/g, ", "),
 );
-const bridge = inRuntime(alice.subject, "pgrep -a socat | grep -o 'range=[0-9./]*' | head -1");
-check(
-  /^range=\d+\.\d+\.\d+\.\d+\/32$/.test(bridge) && !bridge.includes("127.0.0.1"),
-  "runtime bridge accepts only its microVM's own gateway address",
-  bridge,
-);
-// From inside a microVM: no other person's microVM, no gateway API, no host, no cloud metadata, and
-// only allowlisted hosts on the Internet.
+// From inside a sandbox: its own user, no capabilities, nobody else's files or processes, no
+// network but loopback, and the Internet only through the egress proxy's allowlist.
 await bob.listen();
-await bob.live(0, 300_000);
-const aliceIp = inRuntime(alice.subject, "hostname -I | cut -d' ' -f1");
-/** "blocked" when the connection fails or microsandbox answers its own denial; else the HTTP status. */
-const probe = (url: string) => {
-  const out = inRuntime(bob.subject, `curl -s -m 8 -w '\\n%{http_code}' "$U" | tail -c 400; true`, { U: url });
-  const code = out.slice(-3);
-  // microsandbox answers a denied plain-HTTP request itself: 403 with JSON naming the destination.
-  const denied = code === "403" && /"code"\s*:/.test(out) && /"domain"\s*:/.test(out);
-  return code === "000" || denied ? "blocked" : code;
-};
-const bobGateway = inRuntime(
+await bob.live(0, 120_000);
+const inside = inRuntime(
   bob.subject,
-  "awk '$2==\"00000000\"{print $3; exit}' /proc/net/route",
+  'echo "uid=$(id -u) caps=$(grep ^CapEff /proc/self/status | cut -f2) nnp=$(grep ^NoNewPrivs /proc/self/status | cut -f2) seccomp=$(grep ^Seccomp: /proc/self/status | cut -f2)"; ls /var/lib/tandem 2>&1 | head -1; ls /home; ps -e | wc -l; cat /sys/class/net/*/address | wc -l; touch /usr/x 2>&1 | head -1',
 );
-const dotted = (hex: string) =>
-  hex.length === 8
-    ? [6, 4, 2, 0].map((i) => parseInt(hex.slice(i, i + 2), 16)).join(".")
-    : "0.0.0.0";
-for (const [url, label] of [
-  [`http://${aliceIp}:24790/v0/health`, "another person's microVM"],
-  [`http://${dotted(bobGateway)}:8787/healthz`, "the gateway API from a microVM"],
-  [`http://${dotted(bobGateway)}:${41000}/v0/health`, "the bridge ports from a microVM"],
-  ["http://169.254.169.254/latest/meta-data/", "cloud metadata"],
-  ["https://example.com/", "a host outside the allowlist"],
+const aliceUid = JSON.parse(docker("exec", GATEWAY, "cat", "/var/lib/tandem/uids.json"))[runtimeKey(serviceSecret, alice.subject)];
+const bobUid = JSON.parse(docker("exec", GATEWAY, "cat", "/var/lib/tandem/uids.json"))[runtimeKey(serviceSecret, bob.subject)];
+check(
+  !!aliceUid && !!bobUid && aliceUid !== bobUid && inside.startsWith(`uid=${bobUid} caps=0000000000000000 nnp=1 seccomp=2`),
+  "each person runs as their own uid, without capabilities, under seccomp",
+  inside.split("\n")[0],
+);
+check(
+  /No such file/.test(inside) && /\nagent\n/.test(`\n${inside}\n`) && /Read-only file system/.test(inside),
+  "a sandbox sees only its own home, and the system is read-only",
+  inside.replace(/\n/g, " | "),
+);
+/** "blocked" when the connection fails or the egress proxy refuses it; else the HTTP status. */
+const probe = (url: string, direct = false) => {
+  const code = inRuntime(
+    bob.subject,
+    `curl -s -m 8 ${direct ? '--noproxy "*"' : ""} -o /dev/null -w '%{http_code}' "$U"; true`,
+    { U: url },
+  ).slice(-3);
+  return code === "000" ? "blocked" : code;
+};
+for (const [url, direct, label] of [
+  ["http://127.0.0.1:8787/healthz", true, "the gateway API"],
+  ["http://169.254.169.254/latest/meta-data/", false, "cloud metadata"],
+  ["http://10.0.0.1/", false, "a private address"],
+  ["https://example.com/", false, "a host outside the allowlist"],
+  ["https://api.anthropic.com/v1/models", true, "the Internet without the proxy"],
 ] as const) {
-  const code = probe(url);
-  check(code === "blocked", `a microVM cannot reach ${label}`, code);
+  const code = probe(url, direct);
+  // Smokescreen answers a refused plain-HTTP request itself with 407 or 403.
+  check(["blocked", "403", "407"].includes(code), `a sandbox cannot reach ${label}`, code);
 }
 const allowed = probe("https://api.anthropic.com/v1/models");
-check(/^[1-5]\d\d$/.test(allowed), "a microVM reaches an allowlisted vendor", allowed);
+check(/^[1-5]\d\d$/.test(allowed) && allowed !== "407", "a sandbox reaches an allowlisted vendor", allowed);
+const refused = inRuntime(bob.subject, "unshare -U true 2>&1; unshare -m true 2>&1; true");
+check(
+  (refused.match(/Operation not permitted/g) ?? []).length === 2,
+  "a sandbox cannot create namespaces (seccomp)",
+  refused.replace(/\n/g, " | "),
+);
+const cgroup = docker("exec", GATEWAY, "sh", "-c", `cd /sys/fs/cgroup/sandboxes/${sandbox(bob.subject)} 2>/dev/null && cat memory.max cpu.max pids.max`);
+check(
+  /^\d+\n\d+ 100000\n\d+$/.test(cgroup),
+  "a running sandbox has its own memory, CPU and process limits",
+  cgroup.replace(/\n/g, " | "),
+);
 
 // --- 2. Connect -> cancel for every provider that signs in ---------------------------------------------
 for (const id of ["claude", "codex", "grok"]) {
@@ -422,8 +456,8 @@ check(
   "second person: no conversations",
 );
 check(
-  vm(alice.subject) !== vm(bob.subject) && vmStatus(bob.subject) === "running",
-  "second person: a separate microVM",
+  sandbox(alice.subject) !== sandbox(bob.subject) && sandboxStatus(bob.subject) === "running",
+  "second person: a separate sandbox",
 );
 
 // --- 6. MCP servers, the proxy, instructions ---------------------------------------------------------
@@ -464,40 +498,28 @@ check(
   "instructions: AGENTS.md and CLAUDE.md in the chat workspace",
 );
 const probeBody = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "lookup_customer", arguments: { id: "1" } } });
-const proxyCurl = (auth: string) =>
-  `curl -s -m 10 -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' ${auth} --data "$BODY" "$MCP_PROXY_URL/stub"`;
+const aliceKey = runtimeKey(serviceSecret, alice.subject);
+const bobKey = runtimeKey(serviceSecret, bob.subject);
+const aliceToken = proxyToken(serviceSecret, aliceKey);
 check(
-  inRuntime(alice.subject, proxyCurl(""), { BODY: probeBody }) === "401" &&
-    inRuntime(alice.subject, proxyCurl("-H 'authorization: Bearer wrong'"), { BODY: probeBody }) === "401",
+  fromRuntimeOf(alice.subject, `/mcp/${aliceKey}/stub`, null, probeBody).startsWith("401") &&
+    fromRuntimeOf(alice.subject, `/mcp/${aliceKey}/stub`, "wrong", probeBody).startsWith("401"),
   "proxy: an absent or wrong runtime token is refused",
 );
-const noCredential = inRuntime(
-  alice.subject,
-  `curl -s -m 10 -X POST -H 'content-type: application/json' -H "authorization: Bearer $MCP_PROXY_TOKEN" --data "$BODY" "$MCP_PROXY_URL/stub"`,
-  { BODY: probeBody },
-);
+const noCredential = fromRuntimeOf(alice.subject, `/mcp/${aliceKey}/stub`, aliceToken, probeBody);
 check(
   noCredential.includes(COPY.expired("stub")) && stub.requests.length === 0,
   "proxy: its own runtime gets a clear MCP error while no credential was sent",
   noCredential.slice(0, 160),
 );
-const aliceProxyToken = inRuntime(alice.subject, 'printf %s "$MCP_PROXY_TOKEN"');
-const aliceKey = runtimeKey(serviceSecret, alice.subject);
-// Bob's runtime reaches the proxy only through its own route: it tries Alice's path there.
+// Bob's runtime reaches the proxy only through its own socket: it tries Alice's path there.
 check(
-  inRuntime(bob.subject, `curl -s -m 10 -o /dev/null -w '%{http_code}' -X POST -H "authorization: Bearer $MCP_PROXY_TOKEN" --data "$BODY" "\${MCP_PROXY_URL%/mcp/*}/mcp/$KEY/stub"`, {
-    BODY: probeBody,
-    KEY: aliceKey,
-  }) === "401",
+  fromRuntimeOf(bob.subject, `/mcp/${aliceKey}/stub`, proxyToken(serviceSecret, bobKey), probeBody).startsWith("401"),
   "proxy: another person's runtime cannot use its own token on this person's path",
 );
 check(
-  inRuntime(bob.subject, `curl -s -m 10 -o /dev/null -w '%{http_code}' -X POST -H "authorization: Bearer $T" --data "$BODY" "\${MCP_PROXY_URL%/mcp/*}/mcp/$KEY/stub"`, {
-    BODY: probeBody,
-    KEY: aliceKey,
-    T: aliceProxyToken,
-  }) === "403",
-  "proxy: a leaked runtime token is refused from any other microVM",
+  fromRuntimeOf(bob.subject, `/mcp/${aliceKey}/stub`, aliceToken, probeBody).startsWith("403"),
+  "proxy: a leaked runtime token is refused on any other person's socket",
 );
 
 // --- 7. Real turns (optional) -----------------------------------------------------------------------
@@ -589,7 +611,7 @@ if (realSubject) {
       `reply "${first.reply}", ${first.deltas.length} streamed deltas`,
     );
     t0 = performance.now();
-    msb("stop", vm(realSubject)); // stopped outside the gateway (the idle stop does the same after IDLE_MINUTES)
+    crun("kill", sandbox(realSubject), "TERM"); // stopped outside the gateway (the idle stop does the same after IDLE_MINUTES)
     const second = await ask(
       conv.id,
       "What single word did you reply with in your previous message? Answer with just that word.",
@@ -655,9 +677,10 @@ if (realSubject) {
     return p.stdout.toString() + p.stderr.toString();
   };
   const leaks = [
-    msb("inspect", vm(realSubject)),
-    inRuntime(realSubject, 'cat /proc/[0-9]*/environ 2>/dev/null | tr "\\0" "\\n"'),
-    logsOf("docker", "exec", GATEWAY, "msb", "logs", vm(realSubject)),
+    crun("state", sandbox(realSubject)),
+    // Every process in the container, the person's daemon included.
+    logsOf("docker", "exec", GATEWAY, "sh", "-c", 'cat /proc/[0-9]*/environ 2>/dev/null | tr "\\0" "\\n"'),
+    logsOf("docker", "exec", GATEWAY, "cat", `/var/lib/tandem/run/${runtimeKey(serviceSecret, realSubject)}/daemon.log`),
     logsOf("docker", "logs", GATEWAY),
   ].filter((text) => new RegExp(marker).test(text)).length;
   const files = inRuntime(
@@ -703,12 +726,20 @@ if (realSubject) {
   real.close();
 }
 
-// --- 8. Idle footprint ----------------------------------------------------------------------------
+// --- 8. Footprint ---------------------------------------------------------------------------------
+// A stopped runtime keeps only its home: Happy's unpacked Claude Code goes with the stop.
+{
+  const key = runtimeKey(serviceSecret, bob.subject);
+  bob.close();
+  Bun.spawnSync(["docker", "exec", GATEWAY, "bun", "src/cli.ts", "stop", key]);
+  const gone = docker("exec", GATEWAY, "sh", "-c", `test -e /var/lib/tandem/tmp/${key} && echo present || echo gone`);
+  const home = docker("exec", GATEWAY, "du", "-sm", `/var/lib/tandem/homes/${key}`).split(/\s/)[0];
+  check(gone === "gone" && Number(home) < 50, "a stopped runtime takes only its home on disk", `temporary files ${gone}, home ${home} MiB`);
+}
+
 await Bun.sleep(5000);
-console.log(`      idle footprint ${vm(alice.subject)}:`);
-console.log(msb("metrics", vm(alice.subject)).replace(/^/gm, "        "));
 console.log(
-  `      Tandem container (gateway and every microVM): ${docker("stats", "--no-stream", "--format", "{{.MemUsage}} cpu={{.CPUPerc}}", GATEWAY)}`,
+  `      Tandem container (gateway and ${(await Promise.resolve(crun("list", "-q"))).split("\n").filter(Boolean).length} sandboxes): ${docker("stats", "--no-stream", "--format", "{{.MemUsage}} cpu={{.CPUPerc}}", GATEWAY)}`,
 );
 
 alice.close();

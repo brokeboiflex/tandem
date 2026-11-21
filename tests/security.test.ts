@@ -1,21 +1,35 @@
-// What keeps people apart: the egress rules, the configuration that selects them, and the microVM
-// controller (src/runtime.ts) against a fake microsandbox that records every call.
+// What keeps people apart: the configuration, the egress proxy's ACL, the sandbox spec, and the
+// sandbox controller (src/runtime.ts) against a fake crun that reads the bundles it is given.
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { loadConfig, type Config } from "../src/config";
+import { smokescreenArgs } from "../src/egress";
 import { proxyToken, PROXY_TOKEN_ENV } from "../src/mcp";
 import {
-  BRIDGE_HOST_PORTS,
-  BRIDGE_PORT,
-  buildPolicy,
-  freePort,
-  imageRef,
-  MCP_VSOCK_PORT,
-  MicroVmRuntime,
-  type Msb,
+  DAEMON_ARGS,
+  FIRST_UID,
+  nextUid,
+  SandboxRuntime,
+  WITH_EGRESS,
+  type Crun,
 } from "../src/runtime";
-import { egressRules, parseHosts, RUNTIME_TMPDIR } from "../src/security";
+import {
+  allowedHosts,
+  RUNTIME_TMPDIR,
+  sandboxSeccomp,
+  sandboxSpec,
+  SANDBOX_EGRESS_SOCKET,
+  SANDBOX_MCP_SOCKET,
+  smokescreenAcl,
+} from "../src/security";
 
 const BASE_ENV = {
   AUTH_MODE: "dev",
@@ -37,19 +51,16 @@ function configWith(vars: Record<string, string> = {}): Config {
   }
 }
 
-const work = mkdtempSync("/tmp/tandem-sec-");
+const work = mkdtempSync("/tmp/tsec-");
 afterAll(() => rmSync(work, { recursive: true, force: true }));
 
 describe("configuration", () => {
-  test("defaults: allowlist egress, 2 GiB and 2 CPUs per microVM, data in /var/lib/tandem", () => {
-    const cfg = configWith();
-    expect(cfg).toMatchObject({
+  test("defaults: allowlist egress, 512 processes per person, data in /var/lib/tandem", () => {
+    expect(configWith()).toMatchObject({
       egressMode: "allowlist",
-      runtimeMemoryMb: 2048,
-      runtimeCpus: 2,
+      runtimePids: 512,
       dataDir: "/var/lib/tandem",
-      runtimeImageArchive: "/opt/tandem/runtime.tar",
-      runtimeImage: "",
+      runtimeRootfs: "/opt/tandem/rootfs",
     });
   });
 
@@ -57,515 +68,452 @@ describe("configuration", () => {
     for (const [vars, message] of [
       [{ EGRESS_MODE: "off" }, "EGRESS_MODE"],
       [{ EGRESS_ALLOW_RANGES: "10.0.0.0" }, "EGRESS_ALLOW_RANGES"],
-      [{ RUNTIME_MEMORY_MB: "0" }, "RUNTIME_MEMORY_MB"],
-      [{ RUNTIME_MEMORY_MB: "256" }, "RUNTIME_MEMORY_MB"],
-      [{ RUNTIME_CPUS: "0" }, "RUNTIME_CPUS"],
+      [{ RUNTIME_PIDS: "8" }, "RUNTIME_PIDS"],
+      [{ RUNTIME_ROOTFS: "rootfs" }, "RUNTIME_ROOTFS"],
       [{ DATA_DIR: "relative/path" }, "DATA_DIR"],
-      [{ DATA_DIR: `/${"x".repeat(70)}` }, "DATA_DIR"],
+      [{ DATA_DIR: `/${"x".repeat(45)}` }, "DATA_DIR"],
       [{ RUNTIME_PREFIX: "Has.Dots" }, "RUNTIME_PREFIX"],
     ] as const)
       expect(() => configWith(vars)).toThrow(message);
   });
 });
 
-describe("egress rules", () => {
-  test("the shipped allowlist parses; wildcards become suffix rules that also cover the apex", () => {
-    const rules = egressRules(configWith());
-    expect(rules.mode).toBe("allowlist");
-    if (rules.mode !== "allowlist") return;
-    expect(rules.suffixes).toContain("anthropic.com");
-    expect(rules.suffixes).toContain("openai.com");
-    // A suffix rule matches its apex, so the apex is not listed twice.
-    expect(rules.exact).not.toContain("anthropic.com");
-    expect(rules.exact).toContain("openrouter.ai");
-  });
-
-  test("EGRESS_ALLOW_DOMAINS and EGRESS_ALLOW_RANGES add to the list; bad names are refused", () => {
-    const rules = egressRules(
+describe("egress proxy (Smokescreen)", () => {
+  test("allowlist: the shipped list plus EGRESS_ALLOW_DOMAINS, enforced", () => {
+    const acl = smokescreenAcl(
       configWith({
-        EGRESS_ALLOW_DOMAINS: "registry.npmjs.org, *.internal.example",
-        EGRESS_ALLOW_RANGES: "10.20.0.0/16",
+        EGRESS_ALLOW_DOMAINS: "registry.npmjs.org, *.Internal.Example",
       }),
     );
-    expect(rules).toMatchObject({
-      mode: "allowlist",
-      ranges: ["10.20.0.0/16"],
-    });
-    if (rules.mode !== "allowlist") return;
-    expect(rules.exact).toContain("registry.npmjs.org");
-    expect(rules.suffixes).toContain("internal.example");
-    expect(() => parseHosts("", ["exa mple.com"])).toThrow("not a hostname");
-    expect(() => parseHosts("http://x.com\n", [])).toThrow("not a hostname");
+    expect(acl).toContain("action: enforce");
+    for (const host of [
+      "anthropic.com",
+      "*.anthropic.com",
+      "openrouter.ai",
+      "registry.npmjs.org",
+      "*.internal.example",
+    ])
+      expect(acl).toContain(`- "${host}"`);
+    expect(acl).not.toContain('example.com"');
   });
 
-  test("open mode: public addresses plus the listed ranges", () => {
-    expect(egressRules(configWith({ EGRESS_MODE: "open" }))).toEqual({
-      mode: "open",
-      ranges: [],
+  test("open: any public host; private ranges only when listed", () => {
+    const cfg = configWith({
+      EGRESS_MODE: "open",
+      EGRESS_ALLOW_RANGES: "10.20.0.0/16",
     });
-  });
-
-  test("the microsandbox policy: deny by default, DNS to its gateway, the hosts on 80/443, the ranges", () => {
-    const allow = buildPolicy(RecordingPolicy as any, {
-      mode: "allowlist",
-      exact: ["openrouter.ai"],
-      suffixes: ["anthropic.com"],
-      ranges: ["10.20.0.0/16"],
-    }) as RecordingPolicy;
-    expect(allow.calls).toEqual([
-      "defaultIngress(allow)",
-      "defaultEgress(deny)",
-      "egress: udp tcp port(53) allowHost",
-      'egress: tcp ports([80,443]) allowDomains(["openrouter.ai"])',
-      'egress: tcp ports([80,443]) allowDomainSuffixes(["anthropic.com"])',
-      "egress: tcp allow(cidr(10.20.0.0/16))",
+    expect(smokescreenAcl(cfg)).toContain("action: open");
+    const args = smokescreenArgs(cfg, "/x");
+    expect(args).toContain("127.0.0.1"); // the container's loopback, which no sandbox reaches
+    expect(args.slice(args.indexOf("--allow-range"))).toEqual([
+      "--allow-range",
+      "10.20.0.0/16",
     ]);
-    // Open without ranges keeps microsandbox's own default: public internet only.
+    expect(smokescreenArgs(configWith(), "/x")).not.toContain("--allow-range");
+  });
+
+  test("hostnames are validated", () => {
+    expect(() => allowedHosts("", ["exa mple.com"])).toThrow("not a hostname");
+    expect(() => allowedHosts("http://x.com\n", [])).toThrow("not a hostname");
     expect(
-      buildPolicy(RecordingPolicy as any, { mode: "open", ranges: [] }),
-    ).toBeNull();
-    const open = buildPolicy(RecordingPolicy as any, {
-      mode: "open",
-      ranges: ["10.20.0.0/16"],
-    }) as RecordingPolicy;
-    expect(open.calls).toContain("egress: allowPublic");
-    expect(open.calls).not.toContain("defaultEgress(allow)");
+      allowedHosts("# comment\nA.com\n\n*.b.org # trailing\n", []),
+    ).toEqual(["*.b.org", "a.com"]);
   });
 });
 
-/** Records a NetworkPolicyBuilder chain as readable lines. */
-class RecordingPolicy {
-  calls: string[] = [];
-  defaultIngress(a: string) {
-    this.calls.push(`defaultIngress(${a})`);
-    return this;
-  }
-  defaultEgress(a: string) {
-    this.calls.push(`defaultEgress(${a})`);
-    return this;
-  }
-  egress(configure: (r: any) => any) {
-    const parts: string[] = [];
-    const rule: any = new Proxy(
-      {},
-      {
-        get:
-          (_, name: string) =>
-          (...args: any[]) => {
-            if (name === "allow")
-              args[0]({ cidr: (c: string) => parts.push(`allow(cidr(${c}))`) });
-            else
-              parts.push(
-                args.length
-                  ? `${name}(${args.map((a) => JSON.stringify(a)).join(",")})`
-                  : name,
-              );
-            return rule;
-          },
-      },
-    );
-    configure(rule);
-    this.calls.push(`egress: ${parts.join(" ")}`);
-    return this;
-  }
-}
-
-// --- The microVM controller against a fake microsandbox ------------------------------------------
-
-type FakeBox = {
-  name: string;
-  status: "running" | "stopped" | "crashed";
-  labels: Record<string, string>;
-  spec: Record<string, unknown>;
-  execs: { file: string; args: string[]; user?: string; stdin?: string }[];
-  detached: { file: string; user?: string; env: Record<string, string> }[];
-  daemon: boolean;
-  files: Map<string, string>;
-};
-
-function fakeMsb() {
-  const boxes = new Map<string, FakeBox>();
-  const images = new Set<string>();
-  const log: string[] = [];
-  const opts = () => {
-    const o: any = { args: [], env: {} };
-    const b: any = {
-      args: (a: string[]) => ((o.args = a), b),
-      user: (u: string) => ((o.user = u), b),
-      env: (k: string, v: string) => ((o.env[k] = v), b),
-      timeout: () => b,
-      stdinBytes: (d: Buffer) => ((o.stdin = d.toString()), b),
-    };
-    return { o, b };
-  };
-  const connected = (box: FakeBox) => ({
-    async execWith(file: string, configure: (b: any) => any) {
-      const { o, b } = opts();
-      configure(b);
-      box.execs.push({ file, args: o.args, user: o.user, stdin: o.stdin });
-      let code = 0;
-      let stdout = "";
-      if (file === "pgrep") code = box.daemon ? 0 : 1;
-      else if (file === "cat") {
-        const v = box.files.get(o.args[0]);
-        code = v === undefined ? 1 : 0;
-        stdout = v ?? "";
-      } else if (file === "sh" &&
-        o.args[1]?.includes('cat > "$1/$2.tmp"')
-      )
-        // sh -c <script> <$0> <$1 dir> <$2 name>
-        box.files.set(`${o.args[3]}/${o.args[4]}`, o.stdin);
-      return { status: { code }, stdout: () => stdout };
-    },
-    async execDetachedWith(file: string, configure: (b: any) => any) {
-      const { o, b } = opts();
-      configure(b);
-      box.detached.push({ file, user: o.user, env: o.env });
-      box.daemon = true;
-      box.files.set("/home/agent/.happy/agent/token", "T".repeat(43));
-      return {};
-    },
-    async stopWithTimeout() {
-      log.push(`stop ${box.name}`);
-      box.status = "stopped";
-      box.daemon = false;
-    },
-    async kill() {
-      box.status = "stopped";
-    },
-  });
-  const handle = (box: FakeBox) => ({
-    name: box.name,
-    get status() {
-      return box.status;
-    },
-    updatedAt: new Date(1_000),
-    config: () => ({ labels: box.labels }),
-    connect: async () => connected(box),
-    startDetached: async () => {
-      log.push(`start ${box.name}`);
-      box.status = "running";
-      return connected(box);
-    },
-  });
-  const notFound = (what: string) =>
-    Object.assign(new Error(`${what} not found`), {
-      code: what === "image" ? "imageNotFound" : "sandboxNotFound",
+describe("the sandbox spec", () => {
+  test("its own cgroup: memory, CPU and process limits, and the seccomp filter", () => {
+    expect((spec.linux as any).cgroupsPath).toBe("/sandboxes/tandem-abc");
+    expect((spec.linux as any).resources).toEqual({
+      memory: { limit: 1024 * 1024 * 1024 },
+      cpu: { quota: 150_000, period: 100_000 },
+      pids: { limit: 512 },
     });
-  const msb = {
-    Image: {
-      get: async (ref: string) => {
-        if (!images.has(ref)) throw notFound("image");
-        return {};
-      },
-      load: async (path: string, o: { tag: string }) => {
-        log.push(`load ${path} as ${o.tag}`);
-        images.add(o.tag);
-        return [];
-      },
-    },
-    Sandbox: {
-      builder: (name: string) => {
-        const spec: any = { labels: {}, volumes: [], ports: [], vsock: [] };
-        const b: any = {
-          image: (v: string) => ((spec.image = v), b),
-          cpus: (v: number) => ((spec.cpus = v), b),
-          memory: (v: number) => ((spec.memory = v), b),
-          user: (v: string) => ((spec.user = v), b),
-          label: (k: string, v: string) => ((spec.labels[k] = v), b),
-          volume: (guest: string, configure: (m: any) => any) => {
-            const mount: any = { guest };
-            const m: any = {
-              bind: (h: string) => ((mount.bind = h), m),
-              owner: (u: number, g: number) => ((mount.owner = [u, g]), m),
-            };
-            configure(m);
-            spec.volumes.push(mount);
-            return b;
-          },
-          port: (h: number, g: number) => (spec.ports.push([h, g]), b),
-          vsock: (path: string, port: number) => (
-            spec.vsock.push([path, port]),
-            b
-          ),
-          detached: (v: boolean) => ((spec.detached = v), b),
-          network: (configure: (n: any) => any) => {
-            const n: any = {
-              strict: (v: boolean) => ((spec.strict = v), n),
-              policyFromBuilder: (p: any) => ((spec.policy = p.calls), n),
-            };
-            configure(n);
-            return b;
-          },
-          create: async () => {
-            log.push(`create ${name}`);
-            boxes.set(name, {
-              name,
-              status: "running",
-              labels: spec.labels,
-              spec,
-              execs: [],
-              detached: [],
-              daemon: false,
-              files: new Map(),
-            });
-          },
-        };
-        return b;
-      },
-      get: async (name: string) => {
-        const box = boxes.get(name);
-        if (!box) throw notFound("sandbox");
-        return handle(box);
-      },
-      remove: async (name: string) => {
-        log.push(`remove ${name}`);
-        boxes.delete(name);
-      },
-      listWith: async () => ({
-        sandboxes: [...boxes.values()].map(handle),
-        nextCursor: undefined,
-      }),
-    },
-    NetworkPolicyBuilder: RecordingPolicy,
+    expect((spec.linux as any).seccomp).toEqual({ marker: "seccomp" });
+  });
+
+  test("the seccomp filter is Docker's default for a process without capabilities", () => {
+    for (const arch of ["x64", "arm64"]) {
+      const f = sandboxSeccomp(undefined, arch, "6.8.0-134-generic");
+      expect(f.defaultAction).toBe("SCMP_ACT_ERRNO");
+      const allowed = new Set(
+        f.syscalls.filter((r: any) => r.action === "SCMP_ACT_ALLOW" && !r.args).flatMap((r: any) => r.names),
+      );
+      for (const name of ["read", "write", "openat", "execve", "connect"])
+        expect(allowed.has(name)).toBe(true);
+      // socket() per address family: Unix and IPv4 (below 3) and IPv6 (10) among them.
+      const families = f.syscalls
+        .filter((r: any) => r.names.length === 1 && r.names[0] === "socket" && r.action === "SCMP_ACT_ALLOW")
+        .map((r: any) => `${r.args?.[0]?.op}:${r.args?.[0]?.value}`);
+      expect(families).toContain("SCMP_CMP_LT:3");
+      expect(families).toContain("SCMP_CMP_EQ:10");
+      // Allowed to the Tandem container (SYS_ADMIN), never to a sandbox.
+      for (const name of ["mount", "umount2", "unshare", "setns", "bpf", "keyctl", "pivot_root"])
+        expect(allowed.has(name)).toBe(false);
+    }
+    expect(sandboxSeccomp(undefined, "x64").architectures[0]).toBe("SCMP_ARCH_X86_64");
+    expect(() => sandboxSeccomp(undefined, "ppc64")).toThrow("no seccomp profile");
+  });
+
+  const spec = sandboxSpec({
+    uid: 100_007,
+    rootfs: "/opt/tandem/rootfs",
+    home: "/data/homes/abc",
+    passwd: "/data/run/abc/passwd",
+    group: "/data/run/abc/group",
+    tmp: "/data/tmp/abc",
+    egressSocket: "/data/run/egress.sock",
+    mcpSocket: "/data/run/abc/mcp.sock",
+    args: ["/bin/true"],
+    env: { HOME: "/home/agent" },
+    pids: 512,
+    seccomp: { marker: "seccomp" },
+    cgroup: { path: "/sandboxes/tandem-abc", memoryMb: 1024, cpus: 1.5 },
+  });
+
+  test("the person's own uid, no capabilities, no new privileges, a read-only system", () => {
+    expect(spec.process.user).toEqual({
+      uid: 100_007,
+      gid: 100_007,
+      additionalGids: [],
+    });
+    for (const set of Object.values(spec.process.capabilities))
+      expect(set).toEqual([]);
+    expect(spec.process.noNewPrivileges).toBe(true);
+    expect(spec.root).toEqual({ path: "/opt/tandem/rootfs", readonly: true });
+    expect(spec.process.rlimits).toContainEqual({
+      type: "RLIMIT_NPROC",
+      hard: 512,
+      soft: 512,
+    });
+  });
+
+  test("its own PID, network (loopback only), IPC, UTS, cgroup and mount namespaces", () => {
+    expect(spec.linux.namespaces.map((n) => n.type).sort()).toEqual([
+      "cgroup",
+      "ipc",
+      "mount",
+      "network",
+      "pid",
+      "uts",
+    ]);
+    expect(spec.linux.maskedPaths).toContain("/proc/kcore");
+    expect(spec.linux.readonlyPaths).toContain("/proc/sys");
+  });
+
+  test("the only host paths inside: the person's home (writable), their passwd/group, the two sockets", () => {
+    const binds = spec.mounts.filter((m) => m.type === "bind");
+    expect(
+      binds.map((m) => [m.source, m.destination, m.options.includes("rw")]),
+    ).toEqual([
+      ["/data/homes/abc", "/home/agent", true],
+      ["/data/tmp/abc", RUNTIME_TMPDIR, true],
+      ["/data/run/abc/passwd", "/etc/passwd", false],
+      ["/data/run/abc/group", "/etc/group", false],
+      ["/data/run/egress.sock", SANDBOX_EGRESS_SOCKET, false],
+      ["/data/run/abc/mcp.sock", SANDBOX_MCP_SOCKET, false],
+    ]);
+    expect(
+      spec.mounts.find((m) => m.destination === "/tmp")?.options,
+    ).toContain("noexec");
+  });
+});
+
+// --- The controller against a fake crun -----------------------------------------------------------
+
+type Box = { config: any; running: boolean };
+
+function fakeCrun(dataDir: string) {
+  const boxes = new Map<string, Box>();
+  const calls: string[][] = [];
+  const oneShots: {
+    args: string[];
+    env: string[];
+    mounts: any[];
+    stdin?: string;
+    uid: number;
+  }[] = [];
+  const tokens = new Map<string, string>(); // home -> daemon token
+  const servers: { stop(): void }[] = [];
+  const homeOf = (config: any) =>
+    config.mounts.find((m: any) => m.destination === "/home/agent")
+      ?.source as string;
+  const run: Crun = async (args, opts = {}) => {
+    calls.push(opts.cgroups ? ["cgroups", ...args] : args);
+    const ok = (stdout = "") => ({ code: 0, stdout, stderr: "" });
+    const [cmd] = args;
+    const id = args[args.length - 1]!;
+    if (cmd === "state")
+      return boxes.get(id)?.running
+        ? ok(JSON.stringify({ id, status: "running" }))
+        : { code: 1, stdout: "", stderr: "no such container" };
+    if (cmd === "delete") {
+      boxes.delete(id);
+      return ok();
+    }
+    if (cmd === "kill") {
+      const box = boxes.get(args.includes("--all") ? args[2]! : args[1]!);
+      if (box) box.running = false;
+      return ok();
+    }
+    if (cmd === "list")
+      return ok(
+        JSON.stringify(
+          [...boxes].map(([id, b]) => ({
+            id,
+            status: b.running ? "running" : "stopped",
+          })),
+        ),
+      );
+    if (cmd === "run") {
+      const bundle = args[args.indexOf("--bundle") + 1]!;
+      const config = JSON.parse(
+        readFileSync(join(bundle, "config.json"), "utf8"),
+      );
+      const home = homeOf(config);
+      if (args.includes("--detach")) {
+        boxes.set(id, { config, running: true });
+        tokens.set(home, "T".repeat(43));
+        const sock = join(home, ".happy", "agent", "server.sock");
+        mkdirSync(join(home, ".happy", "agent"), { recursive: true });
+        rmSync(sock, { force: true });
+        servers.push(Bun.listen({ unix: sock, socket: { data() {} } }));
+        return ok();
+      }
+      const inner = config.process.args.slice(1); // after with-egress
+      oneShots.push({
+        args: config.process.args,
+        env: config.process.env,
+        mounts: config.mounts,
+        stdin: opts.stdin?.toString(),
+        uid: config.process.user.uid,
+      });
+      if (inner[0] === "rm") tokens.delete(home);
+      if (inner[0] === "cat")
+        return tokens.has(home)
+          ? ok(tokens.get(home))
+          : { code: 1, stdout: "", stderr: "" };
+      return ok();
+    }
+    return ok();
   };
-  return { msb: msb as unknown as Msb, boxes, log, images };
+  return { run, boxes, calls, oneShots, servers };
 }
 
-function controller(vars: Record<string, string> = {}) {
-  const dataDir = mkdtempSync(join(work, "data-"));
-  const archive = join(dataDir, "runtime.tar");
-  writeFileSync(`${archive}.sha256`, `${"ab".repeat(32)}\n`);
+/** The controller with or without delegated cgroups (tests have no cgroup tree). */
+class TestRuntime extends SandboxRuntime {
+  cgroupReason: string | null = "no cgroup tree in tests";
+  protected override delegate() {
+    return Promise.resolve(this.cgroupReason);
+  }
+}
+
+function controller(vars: Record<string, string> = {}, cgroups = false) {
+  const dataDir = mkdtempSync(join(work, "d"));
+  const rootfs = join(dataDir, "rootfs");
+  mkdirSync(join(rootfs, "usr/local/bin"), { recursive: true });
+  writeFileSync(join(rootfs, "usr/local/bin/happy-agent"), "");
   const cfg = configWith({
     DATA_DIR: dataDir,
-    RUNTIME_IMAGE_ARCHIVE: archive,
+    RUNTIME_ROOTFS: rootfs,
     ...vars,
   });
-  const fake = fakeMsb();
-  const rt = new MicroVmRuntime(cfg, () => {}, fake.msb);
+  const fake = fakeCrun(dataDir);
+  const rt = new TestRuntime(cfg, () => {}, fake.run);
+  if (cgroups) rt.cgroupReason = null;
+  afterAll(() => fake.servers.forEach((s) => s.stop()));
   return { cfg, rt, ...fake };
 }
 
-describe("one microVM per person", () => {
+/** Homes in tests are owned by the test user: pin the person's uid to it. */
+function ownUid(cfg: Config, ...keys: string[]) {
+  const uid = process.getuid!();
+  writeFileSync(
+    join(cfg.dataDir, "uids.json"),
+    JSON.stringify(Object.fromEntries(keys.map((k) => [k, uid]))),
+  );
+  return uid;
+}
+
+describe("one sandbox per person", () => {
   const KEY = "0123456789abcdef01234567";
 
-  test("the runtime image is loaded once, by its build digest", async () => {
-    const { rt, log } = controller();
-    await rt.posture();
-    await rt.ensure(KEY);
-    expect(log.filter((l) => l.startsWith("load"))).toEqual([
-      expect.stringMatching(/ as tandem-runtime:abababababababab$/),
-    ]);
-    expect(imageRef(join(controller().cfg.dataDir, "runtime.tar"))).toBe(
-      "tandem-runtime:abababababababab",
+  test("a container that cannot create sandboxes stops the gateway with what it needs", async () => {
+    const { rt } = controller();
+    (rt as any).run = async () => ({
+      code: 1,
+      stdout: "",
+      stderr: "mount: Permission denied",
+    });
+    expect(rt.posture()).rejects.toThrow(
+      /SYS_ADMIN and NET_ADMIN.*apparmor=unconfined/,
     );
   });
 
-  test("created with the person's home, a loopback bridge port, a private vsock route and the egress policy", async () => {
-    const { cfg, rt, boxes } = controller();
+  test("the daemon starts under tini as the person, with the proxy settings and the MCP route", async () => {
+    const { cfg, rt, boxes, calls } = controller();
+    const uid = ownUid(cfg, KEY);
     const h = await rt.ensure(KEY);
     const box = boxes.get(`tandem-${KEY}`)!;
-    expect(box.spec).toMatchObject({
-      image: "tandem-runtime:abababababababab",
-      cpus: 2,
-      memory: 2048,
-      user: "agent",
-      detached: true,
-      strict: false,
-      volumes: [
-        {
-          guest: "/home/agent",
-          bind: `${cfg.dataDir}/homes/${KEY}`,
-          owner: [10001, 10001],
-        },
-      ],
-      ports: [[BRIDGE_HOST_PORTS.first, BRIDGE_PORT]],
-      vsock: [[`${cfg.dataDir}/run/${KEY}.sock`, MCP_VSOCK_PORT]],
+    expect(box.config.process.args).toEqual(DAEMON_ARGS);
+    expect(box.config.process.user.uid).toBe(uid);
+    const env = Object.fromEntries(
+      box.config.process.env.map((e: string) => e.split(/=(.*)/s).slice(0, 2)),
+    );
+    expect(env).toMatchObject({
+      HOME: "/home/agent",
+      HTTPS_PROXY: "http://127.0.0.1:4750",
+      NO_PROXY: "127.0.0.1,localhost",
+      MCP_PROXY_URL: `http://127.0.0.1:8790/mcp/${KEY}`,
+      [PROXY_TOKEN_ENV]: proxyToken(cfg.serviceSecret, KEY),
     });
-    expect((box.spec.policy as string[])[1]).toBe("defaultEgress(deny)");
-    expect(box.labels).toMatchObject({
-      "tandem.runtime": "1",
-      "tandem.key": KEY,
-      "tandem.port": String(BRIDGE_HOST_PORTS.first),
-    });
+    expect(
+      box.config.mounts.find((m: any) => m.destination === "/home/agent")
+        .source,
+    ).toBe(join(cfg.dataDir, "homes", KEY));
     expect(h).toMatchObject({
       key: KEY,
-      url: `http://127.0.0.1:${BRIDGE_HOST_PORTS.first}`,
+      unix: join(cfg.dataDir, "homes", KEY, ".happy/agent/server.sock"),
       token: "T".repeat(43),
     });
-    expect(rt.mcpSocket(KEY)).toBe(`${cfg.dataDir}/run/${KEY}.sock`);
+    // The previous start's token was removed before the daemon started.
+    const rm = calls.findIndex(
+      (c) => c[0] === "run" && !c.includes("--detach") && calls.indexOf(c) > 0,
+    );
+    const start = calls.findIndex((c) => c.includes("--detach"));
+    expect(rm).toBeLessThan(start);
+    // Running: a second ensure starts nothing.
+    await rt.ensure(KEY);
+    expect(calls.filter((c) => c.includes("--detach"))).toHaveLength(1);
   });
 
-  test("the daemon starts once per boot as `agent`, with the MCP route and its token in its environment only", async () => {
+  test("without delegated cgroups the gateway says so and sandboxes run without limits", async () => {
     const { cfg, rt, boxes } = controller();
+    ownUid(cfg, KEY);
+    const posture = await rt.posture();
+    expect(posture.limits).toBe(false);
+    expect(posture.warnings[0]).toContain("no per-person memory, CPU and process limits");
     await rt.ensure(KEY);
-    await rt.ensure(KEY); // already running: nothing new
-    const box = boxes.get(`tandem-${KEY}`)!;
-    expect(box.detached).toEqual([
-      {
-        file: "/usr/local/bin/agent-runtime-entrypoint",
-        user: "agent",
-        env: {
-          HOME: "/home/agent",
-          TMPDIR: RUNTIME_TMPDIR,
-          MCP_PROXY_URL: `http://127.0.0.1:8790/mcp/${KEY}`,
-          MCP_VSOCK_PORT: String(MCP_VSOCK_PORT),
-          [PROXY_TOKEN_ENV]: proxyToken(cfg.serviceSecret, KEY),
-        },
-      },
-    ]);
-    // The previous boot's owner token is removed first, so only the new daemon's is read.
-    expect(box.execs.filter((e) => e.file === "rm")).toEqual([
-      { file: "rm", args: ["-f", "/home/agent/.happy/agent/token"], user: "agent", stdin: undefined },
-    ]);
-    // Every command runs as the runtime's own user.
-    expect(box.execs.every((e) => e.user === "agent")).toBe(true);
+    expect(boxes.get(`tandem-${KEY}`)!.config.linux.cgroupsPath).toBeUndefined();
   });
 
-  test("each person gets their own bridge port; a stopped one keeps it", async () => {
-    const { rt, boxes } = controller();
-    const a = await rt.ensure("a".repeat(24));
-    const b = await rt.ensure("b".repeat(24));
-    expect(a.url).not.toBe(b.url);
-    await rt.stop("a".repeat(24));
-    const c = await rt.ensure("c".repeat(24));
-    expect([a.url, b.url]).not.toContain(c.url);
-    expect((await rt.ensure("a".repeat(24))).url).toBe(a.url);
-    expect(boxes.size).toBe(3);
+  test("with delegated cgroups every sandbox gets its own limits; crun manages them", async () => {
+    const { cfg, rt, boxes, calls } = controller({ RUNTIME_MEMORY_MB: "768", RUNTIME_CPUS: "0.5" }, true);
+    ownUid(cfg, KEY);
+    expect((await rt.posture()).limits).toBe(true);
+    await rt.ensure(KEY);
+    const linux = boxes.get(`tandem-${KEY}`)!.config.linux;
+    expect(linux.cgroupsPath).toBe(`/sandboxes/tandem-${KEY}`);
+    expect(linux.resources.memory.limit).toBe(768 * 1024 * 1024);
+    expect(linux.resources.cpu.quota).toBe(50_000);
+    expect(linux.seccomp.defaultAction).toBe("SCMP_ACT_ERRNO");
+    expect(calls.filter((c) => c[0] !== "cgroups")).toEqual([]);
   });
 
-  test("stop is graceful; a stopped runtime starts again with its home; a changed spec recreates it, keeping its port", async () => {
-    const { rt, boxes, log } = controller();
-    const first = await rt.ensure(KEY);
+  test("the temporary directory is fresh at every start and gone at every stop", async () => {
+    const { cfg, rt, boxes } = controller();
+    ownUid(cfg, KEY);
+    const tmp = join(cfg.dataDir, "tmp", KEY);
+    await rt.ensure(KEY);
+    expect(boxes.get(`tandem-${KEY}`)!.config.mounts.find((m: any) => m.destination === RUNTIME_TMPDIR).source).toBe(tmp);
+    writeFileSync(join(tmp, "claude"), "341 MiB");
     await rt.stop(KEY);
-    expect(boxes.get(`tandem-${KEY}`)!.status).toBe("stopped");
-    expect(await rt.listRunning()).toEqual([]);
+    expect(existsSync(tmp)).toBe(false);
+    mkdirSync(tmp);
+    writeFileSync(join(tmp, "left-over"), "x");
     await rt.ensure(KEY);
-    expect(log.filter((l) => /^(create|start|remove)/.test(l))).toEqual([
-      `create tandem-${KEY}`,
-      `start tandem-${KEY}`,
-    ]);
-    expect(await rt.listRunning()).toEqual([KEY]);
-    await rt.stop(KEY);
-    // Another egress setting: the stopped microVM is recreated; the home is a separate directory.
-    const changed = new MicroVmRuntime(
-      { ...(rt as any).cfg, egressMode: "open" },
-      () => {},
-      (rt as any).msb ? await (rt as any).msb : undefined,
-    );
-    const again = await changed.ensure(KEY);
-    expect(log.slice(-2)).toEqual([
-      `remove tandem-${KEY}`,
-      `create tandem-${KEY}`,
-    ]);
-    expect(again.url).toBe(first.url);
+    expect(existsSync(join(tmp, "left-over"))).toBe(false);
   });
 
-  test("a running runtime is never recreated for a changed spec", async () => {
-    const { rt, log } = controller();
-    await rt.ensure(KEY);
-    const changed = new MicroVmRuntime(
-      { ...(rt as any).cfg, runtimeMemoryMb: 4096 },
-      () => {},
-      await (rt as any).msb,
+  test("one-shot commands run as the person with the egress relay, never with the MCP token", async () => {
+    const { cfg, rt, oneShots } = controller();
+    const uid = ownUid(cfg, KEY);
+    await rt.exec(KEY, ["claude", "auth", "logout"]);
+    const last = oneShots.at(-1)!;
+    expect(last.args).toEqual([WITH_EGRESS, "claude", "auth", "logout"]);
+    expect(last.uid).toBe(uid);
+    expect(last.env.some((e) => e.startsWith(`${PROXY_TOKEN_ENV}=`))).toBe(
+      false,
     );
-    await changed.ensure(KEY);
-    expect(log.filter((l) => l.startsWith("remove"))).toEqual([]);
+    expect(last.mounts.some((m) => m.destination === SANDBOX_MCP_SOCKET)).toBe(
+      false,
+    );
   });
 
-  test("private files go in through standard input as `agent`, never in a command line", async () => {
-    const { rt, boxes } = controller();
-    await rt.ensure(KEY);
+  test("private files go in through standard input, never in a command line", async () => {
+    const { cfg, rt, oneShots } = controller();
+    ownUid(cfg, KEY);
     await rt.writePrivateFile(
       KEY,
       "/home/agent/.agent-runtime",
       "anthropic-api-key",
       "sk-secret\n",
     );
-    const box = boxes.get(`tandem-${KEY}`)!;
-    const write = box.execs.find((e) => e.stdin !== undefined)!;
-    expect(write.user).toBe("agent");
+    const write = oneShots.at(-1)!;
     expect(write.stdin).toBe("sk-secret\n");
     expect(JSON.stringify(write.args)).not.toContain("sk-secret");
-    expect(box.files.get("/home/agent/.agent-runtime/anthropic-api-key")).toBe(
-      "sk-secret\n",
-    );
     expect(rt.writePrivateFile(KEY, "/etc", "passwd", "x")).rejects.toThrow(
-      "outside the runtime home",
+      "outside",
     );
     expect(
       rt.writePrivateFile(KEY, "/home/agent", "../x", "x"),
-    ).rejects.toThrow("outside the runtime home");
+    ).rejects.toThrow("outside");
   });
 
-  test("a runtime being stopped outside the gateway is waited out, then started again", async () => {
-    const { rt, boxes, log } = controller();
+  test("stop is graceful, then the sandbox is removed; listRunning follows", async () => {
+    const { cfg, rt, calls } = controller();
+    ownUid(cfg, KEY);
     await rt.ensure(KEY);
-    const box = boxes.get(`tandem-${KEY}`)!;
-    // `msb stop` from outside: draining for a while, then stopped.
-    (box as any).status = "draining";
-    box.daemon = false;
-    setTimeout(() => ((box as any).status = "stopped"), 700);
-    const again = await rt.restart(KEY);
-    expect(again.token).toBe("T".repeat(43));
-    expect(box.status).toBe("running");
-    expect(log.filter((l) => l.startsWith("start"))).toEqual([`start tandem-${KEY}`]);
-  });
-
-  test("a start that loses a race to another start uses the runtime that is running", async () => {
-    const { rt, boxes, msb } = controller();
-    await rt.ensure(KEY);
+    expect(await rt.listRunning()).toEqual([KEY]);
     await rt.stop(KEY);
-    const real = (msb as any).Sandbox.get;
-    (msb as any).Sandbox.get = async (name: string) => {
-      const h = await real(name);
-      return {
-        ...h,
-        get status() {
-          return boxes.get(name)!.status;
-        },
-        config: h.config,
-        connect: h.connect,
-        startDetached: async () => {
-          boxes.get(name)!.status = "running"; // someone else started it first
-          throw new Error("cannot start sandbox: already running");
-        },
-      };
-    };
-    expect((await rt.ensure(KEY)).key).toBe(KEY);
+    expect(calls.some((c) => c[0] === "kill" && c.includes("TERM"))).toBe(true);
+    expect(calls.at(-1)).toEqual(["delete", "-f", `tandem-${KEY}`]);
+    expect(await rt.listRunning()).toEqual([]);
   });
 
-  test("a connection that fails is dropped: the next call reconnects", async () => {
-    const { rt, msb } = controller();
-    await rt.ensure(KEY);
-    const real = (msb as any).Sandbox.get;
-    let broken = true;
-    (msb as any).Sandbox.get = async (name: string) => {
-      const h = await real(name);
-      if (!broken) return h;
-      return { ...h, status: "running", connect: async () => ({ execWith: async () => { throw new Error("stale"); } }) };
-    };
-    (rt as any).connected.clear();
-    expect(rt.exec(KEY, ["true"])).rejects.toThrow("stale");
-    await Bun.sleep(0);
-    broken = false;
-    expect((await rt.exec(KEY, ["pgrep", "-x", "happy-agent"])).exitCode).toBe(0);
-  });
-
-  test("RUNTIME_IMAGE must already be in the image store; nothing is loaded for it", async () => {
-    const { rt, log } = controller({
-      RUNTIME_IMAGE: "registry.example/tandem-runtime:1",
+  test("every person gets their own uid, kept across gateway restarts", async () => {
+    expect(nextUid([])).toBe(FIRST_UID);
+    expect(nextUid([FIRST_UID, FIRST_UID + 2])).toBe(FIRST_UID + 1);
+    const { cfg, rt } = controller();
+    const uidOf = (r: SandboxRuntime, k: string) =>
+      (r as any).uidOf(k) as Promise<number>;
+    const a = await uidOf(rt, "a".repeat(24));
+    const b = await uidOf(rt, "b".repeat(24));
+    expect(a).not.toBe(b);
+    const again = new SandboxRuntime(
+      cfg,
+      () => {},
+      async () => ({ code: 0, stdout: "", stderr: "" }),
+    );
+    expect(await uidOf(again, "b".repeat(24))).toBe(b);
+    expect(
+      JSON.parse(readFileSync(join(cfg.dataDir, "uids.json"), "utf8")),
+    ).toEqual({
+      ["a".repeat(24)]: a,
+      ["b".repeat(24)]: b,
     });
-    expect(rt.ensure(KEY)).rejects.toThrow("not in microsandbox's image store");
-    expect(log.filter((l) => l.startsWith("load"))).toEqual([]);
   });
 
-  test("bridge ports run out explicitly", () => {
-    const used = new Set<number>();
-    for (let p = BRIDGE_HOST_PORTS.first; p <= BRIDGE_HOST_PORTS.last; p++)
-      used.add(p);
-    expect(freePort(used)).toBeNull();
-    used.delete(BRIDGE_HOST_PORTS.first + 7);
-    expect(freePort(used)).toBe(BRIDGE_HOST_PORTS.first + 7);
+  test("anything but the person's socket at the daemon's path is refused", async () => {
+    const { cfg, rt, run } = controller();
+    ownUid(cfg, KEY);
+    // A daemon that put a plain file (or a link to one) where its socket belongs.
+    (rt as any).run = async (args: string[], opts: any) => {
+      const r = await run(args, opts);
+      if (args.includes("--detach")) {
+        const sock = join(
+          cfg.dataDir,
+          "homes",
+          KEY,
+          ".happy/agent/server.sock",
+        );
+        rmSync(sock, { force: true });
+        writeFileSync(sock, "not a socket");
+      }
+      return r;
+    };
+    expect(rt.ensure(KEY)).rejects.toThrow("not a socket");
+    await Bun.sleep(50);
+    expect(existsSync(join(cfg.dataDir, "homes", KEY))).toBe(true);
   });
 });

@@ -198,6 +198,7 @@ export class Daemon {
         `daemon route not allowed: ${method} ${path.split("?")[0]}`,
       );
     const res = await this.fetchImpl(this.handle.url + path, {
+      unix: this.handle.unix,
       method,
       headers: {
         authorization: `Bearer ${this.handle.token}`,
@@ -206,7 +207,7 @@ export class Daemon {
       },
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: AbortSignal.timeout(timeoutMs),
-    }).catch((e) => {
+    } as RequestInit).catch((e) => {
       throw new DaemonUnreachable((e as Error).name);
     });
     const data = await res.json().catch(() => null);
@@ -221,7 +222,11 @@ export class Daemon {
       this.handle.url +
         path +
         (after ? `?after=${encodeURIComponent(after)}` : ""),
-      { headers: { authorization: `Bearer ${this.handle.token}` }, signal },
+      {
+        unix: this.handle.unix,
+        headers: { authorization: `Bearer ${this.handle.token}` },
+        signal,
+      } as RequestInit,
     );
   }
 }

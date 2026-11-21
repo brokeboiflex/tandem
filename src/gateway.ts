@@ -1,7 +1,7 @@
 // Tandem gateway: authenticates people, maps each one to their own runtime, and exposes only the
-// /v1 façade. Everything Happy-specific lives in ./happy.ts; everything about the microVMs in ./runtime.ts.
-import { unlinkSync } from "node:fs";
-import { join } from "node:path";
+// /v1 façade. Everything Happy-specific lives in ./happy.ts; everything about the sandboxes in ./runtime.ts.
+import { mkdirSync, unlinkSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { devToken, verifier, type Principal } from "./auth";
 import { loadConfig, type Config } from "./config";
 import * as H from "./happy";
@@ -9,10 +9,11 @@ import * as M from "./mcp";
 import {
   CLAUDE_MODELS_COMMAND,
   GEMINI_KEY_COMMAND,
-  MicroVmRuntime,
   runtimeKey,
+  SandboxRuntime,
   type Runtime,
 } from "./runtime";
+import { startEgress } from "./egress";
 import { sseComment, sseEncode, sseFrames } from "./sse";
 
 class HttpError extends Error {
@@ -1506,12 +1507,14 @@ export function createGateway(
   }
 
   /**
-   * Listens on a runtime's MCP socket, the host end of its private vsock route. Only that runtime
-   * can connect to it, so the socket names the caller. Idempotent; kept while the runtime runs.
+   * Listens on a runtime's MCP socket, which is mounted into that runtime's sandbox and nowhere else.
+   * Only that runtime can connect to it, so the socket names the caller. Idempotent; kept while the
+   * runtime runs.
    */
   function listenMcp(key: string) {
     const path = runtime.mcpSocket?.(key);
     if (!path || mcpListeners.has(key)) return;
+    mkdirSync(dirname(path), { recursive: true, mode: 0o711 });
     try {
       unlinkSync(path); // left behind by a previous gateway process
     } catch {}
@@ -1534,16 +1537,19 @@ export function createGateway(
 
 if (import.meta.main) {
   const cfg = loadConfig();
-  const runtime = new MicroVmRuntime(cfg);
-  // The runtime image is loaded and the hypervisor checked before serving: a host without KVM
-  // stops the gateway here.
-  const posture = await runtime.posture().catch((e) => {
-    console.error(`startup failed: ${(e as Error).message}`);
-    process.exit(1);
-  });
+  const runtime = new SandboxRuntime(cfg);
+  // The egress proxy, then a test sandbox: a container without the rights to create sandboxes
+  // stops the gateway here, naming what is missing.
+  const posture = await startEgress(cfg, runtime.egressSocket())
+    .then(() => runtime.posture())
+    .catch((e) => {
+      console.error(`startup failed: ${(e as Error).message}`);
+      process.exit(1);
+    });
   console.log(
     `security: sandbox=${posture.sandbox} egress=${posture.egress} ` +
-      `limits=${cfg.runtimeMemoryMb}MiB/${cfg.runtimeCpus}cpu data=${cfg.dataDir}`,
+      `limits=${posture.limits ? `${cfg.runtimeMemoryMb}MiB/${cfg.runtimeCpus}cpu/${cfg.runtimePids}pids` : "none"} ` +
+      `data=${cfg.dataDir}`,
   );
   for (const w of posture.warnings) console.warn(`WARNING: ${w}`);
   const gateway = createGateway(cfg, runtime);
@@ -1560,7 +1566,7 @@ if (import.meta.main) {
     .rediscover()
     .catch((e) => console.error("rediscovery failed", (e as Error).message));
   setInterval(() => void gateway.idleSweep(), 30_000);
-  // The microVMs live in this container: shut them down cleanly before it stops.
+  // The sandboxes live in this container: stop them cleanly before it stops.
   let stopping = false;
   for (const signal of ["SIGTERM", "SIGINT"] as const)
     process.on(signal, async () => {

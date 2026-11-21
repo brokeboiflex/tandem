@@ -1,8 +1,9 @@
-# Tandem: ONE image and ONE container. The gateway (Bun) runs every person's runtime as a microVM
-# through microsandbox on the host's KVM; the runtime image those microVMs boot is built below and
-# packed into this image. Build with BuildKit for linux/amd64 or linux/arm64. Every download is
-# pinned per architecture and verified by checksum. Do not publish images built from this file:
-# they contain Claude Code, the Grok CLI and Google's Antigravity CLI (see THIRD_PARTY.md).
+# Tandem: ONE image and ONE container. The gateway (Bun) runs every person's runtime as a sandboxed
+# process tree (crun: their own uid and namespaces) on the runtime filesystem built below and kept
+# read-only in this image. No KVM, no Docker socket. Build with BuildKit for linux/amd64 or
+# linux/arm64. Every download is pinned per architecture and verified by checksum. Do not publish
+# images built from this file: they contain Claude Code, the Grok CLI and Google's Antigravity CLI
+# (see THIRD_PARTY.md).
 
 # Multi-arch index digest (covers linux/amd64 and linux/arm64).
 ARG BASE=debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
@@ -95,7 +96,7 @@ RUN set -eu; \
 
 FROM ${BASE} AS runtime
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl git socat procps bubblewrap \
+ && apt-get install -y --no-install-recommends ca-certificates curl git socat procps bubblewrap tini \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=fetch /out/ /usr/local/bin/
@@ -108,42 +109,60 @@ RUN export HOME=/tmp/version-check DISABLE_AUTOUPDATER=1 AGY_CLI_DISABLE_AUTO_UP
  && rm -rf "$HOME"
 
 RUN useradd --create-home --home-dir /home/agent --uid 10001 --user-group --shell /bin/bash agent \
- && chmod 0700 /home/agent
+ && chmod 0700 /home/agent \
+ && install -d -m 0755 /var/tmp/agent
 
 COPY runtime/happy.toml /opt/agent-runtime/happy.toml
 COPY runtime/entrypoint.sh /usr/local/bin/agent-runtime-entrypoint
 COPY runtime/happy-api /usr/local/bin/happy-api
+COPY runtime/with-egress /usr/local/bin/with-egress
 RUN chmod 0644 /opt/agent-runtime/happy.toml \
- && chmod 0755 /usr/local/bin/agent-runtime-entrypoint /usr/local/bin/happy-api
+ && chmod 0755 /usr/local/bin/agent-runtime-entrypoint /usr/local/bin/happy-api /usr/local/bin/with-egress
 
 
-# The runtime's filesystem as a one-layer image archive (`docker save` format), plus its digest:
-# the gateway loads it into microsandbox on first start (src/runtime.ts).
-FROM ${BASE} AS pack
+# Stripe's Smokescreen, the runtimes' egress proxy (src/egress.ts). Release binary pinned per
+# architecture (SHA256SUMS of https://github.com/stripe/smokescreen/releases/tag/v0.1.0).
+FROM --platform=$BUILDPLATFORM ${BASE} AS smokescreen
 ARG TARGETARCH
-COPY --from=runtime / /rootfs/
-COPY runtime/pack-image.sh /usr/local/bin/pack-image
-RUN sh /usr/local/bin/pack-image /rootfs /out "$TARGETARCH" && rm -rf /rootfs
-
-# The gateway. It runs as root inside the container: /dev/kvm's group differs between hosts, and
-# the microVMs, not this container, are what separate people (README, Security).
-FROM oven/bun:1.3.9-slim@sha256:8ca06c7812d9050ccc4b80799685f395d6a0d051d3b7207dfd120e2b437b1ec9
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+ARG SMOKESCREEN_VERSION=v0.1.0
+ARG SMOKESCREEN_SHA256_ARM64=f15ddd0dc2b2cbc6d7318f441928939eb9bedfab2a1881508af3096a1e24b7c9
+ARG SMOKESCREEN_SHA256_AMD64=4e1e447449e3cc653dae956208588722b5c8fe8ce894f633adc756a851d1ec46
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
+RUN set -eu; \
+    case "$TARGETARCH" in \
+      arm64) sha=$SMOKESCREEN_SHA256_ARM64 ;; \
+      amd64) sha=$SMOKESCREEN_SHA256_AMD64 ;; \
+      *) echo "unsupported TARGETARCH '$TARGETARCH'" >&2; exit 1 ;; \
+    esac; \
+    name="smokescreen_${SMOKESCREEN_VERSION}_linux_${TARGETARCH}"; \
+    curl -fsSL -o /tmp/s.tgz "https://github.com/stripe/smokescreen/releases/download/${SMOKESCREEN_VERSION}/${name}.tar.gz"; \
+    echo "${sha}  /tmp/s.tgz" | sha256sum -c -; \
+    tar -xzf /tmp/s.tgz -C /tmp; \
+    install -D -m 0755 "/tmp/${name}/smokescreen" /out/smokescreen
+
+FROM oven/bun:1.3.9-slim@sha256:8ca06c7812d9050ccc4b80799685f395d6a0d051d3b7207dfd120e2b437b1ec9 AS bun
+
+# The Tandem container: the gateway, crun, Smokescreen and the runtime filesystem. It runs as root:
+# creating sandboxes needs it, and the sandboxes (their own uids, no capabilities), not this
+# container, are what separate people (README, Security).
+FROM ${BASE}
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates crun \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
+COPY --from=smokescreen /out/smokescreen /usr/local/bin/smokescreen
+COPY --from=runtime / /opt/tandem/rootfs/
 WORKDIR /app
 COPY package.json bun.lock ./
-RUN bun install --frozen-lockfile --production \
- && ln -s /app/node_modules/@superradcompany/microsandbox-linux-*-gnu/bin/msb /usr/local/bin/msb
+RUN bun install --frozen-lockfile --production
 COPY src ./src
 COPY public ./public
-COPY runtime/egress-allowlist.txt ./runtime/egress-allowlist.txt
-COPY --from=pack /out/ /opt/tandem/
+COPY runtime/egress-allowlist.txt runtime/seccomp-docker-default.json ./runtime/
 ENV DATA_DIR=/var/lib/tandem \
-    MSB_HOME=/var/lib/tandem/msb \
-    RUNTIME_IMAGE_ARCHIVE=/opt/tandem/runtime.tar \
+    RUNTIME_ROOTFS=/opt/tandem/rootfs \
     BIND_HOST=0.0.0.0
 VOLUME /var/lib/tandem
 EXPOSE 8787
-HEALTHCHECK --interval=10s --timeout=3s --retries=3 --start-period=120s \
+HEALTHCHECK --interval=10s --timeout=3s --retries=3 --start-period=60s \
   CMD ["bun", "-e", "fetch('http://127.0.0.1:8787/healthz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
 CMD ["bun", "src/gateway.ts"]

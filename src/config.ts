@@ -61,15 +61,15 @@ export function loadConfig() {
     oidcAudience: env.OIDC_AUDIENCE ?? "",
     oidcJwksUrl: env.OIDC_JWKS_URL ?? "",
     serviceSecret: env.SERVICE_SECRET ?? "",
-    // The gateway's data volume: microsandbox's state, every person's home, the MCP sockets.
+    // The data volume: every person's home, their uids, the gateway's sockets.
     dataDir: (env.DATA_DIR || "/var/lib/tandem").replace(/\/+$/, ""),
-    // The runtime image archive built into the gateway image (Dockerfile), loaded into microsandbox
-    // on first start. RUNTIME_IMAGE names an image already in microsandbox's store instead.
-    runtimeImageArchive: env.RUNTIME_IMAGE_ARCHIVE || "/opt/tandem/runtime.tar",
-    runtimeImage: env.RUNTIME_IMAGE ?? "",
+    // The runtime filesystem every sandbox runs on, read-only (built into the image, Dockerfile).
+    runtimeRootfs: env.RUNTIME_ROOTFS || "/opt/tandem/rootfs",
     runtimePrefix: prefix,
+    // Per person, enforced in their own cgroup: memory (MiB), CPUs, processes.
     runtimeMemoryMb: num(env.RUNTIME_MEMORY_MB, 2048),
     runtimeCpus: num(env.RUNTIME_CPUS, 2),
+    runtimePids: num(env.RUNTIME_PIDS, 512),
     idleMs: Number(env.IDLE_MINUTES ?? 5) * 60_000,
     permissionMode: env.PERMISSION_MODE || "auto",
     restartAfterSignIn: flag(env.RESTART_AFTER_SIGN_IN, true),
@@ -106,17 +106,20 @@ export function loadConfig() {
     throw new Error(
       "PERMISSION_MODE must be read_only, workspace_write, auto or full_access",
     );
-  // Sandbox names and labels: <prefix>-<key>.
+  // Sandbox names: <prefix>-<key>.
   if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(cfg.runtimePrefix))
     throw new Error("RUNTIME_PREFIX must be lowercase letters, digits, '_' or '-'");
-  // A microVM always has a fixed size: no "0 = no limit" here.
-  if (!(Number.isInteger(cfg.runtimeMemoryMb) && cfg.runtimeMemoryMb >= 512))
-    throw new Error("RUNTIME_MEMORY_MB must be a whole number of MiB, at least 512");
-  if (!(Number.isInteger(cfg.runtimeCpus) && cfg.runtimeCpus >= 1 && cfg.runtimeCpus <= 32))
-    throw new Error("RUNTIME_CPUS must be a whole number from 1 to 32");
-  if (!cfg.dataDir.startsWith("/") || cfg.dataDir.length > 60)
-    // Unix socket paths (DATA_DIR/run/<key>.sock) are limited to 107 bytes.
-    throw new Error("DATA_DIR must be an absolute path of at most 60 characters");
+  if (!(Number.isInteger(cfg.runtimePids) && cfg.runtimePids >= 64))
+    throw new Error("RUNTIME_PIDS must be a whole number, at least 64");
+  if (!(Number.isInteger(cfg.runtimeMemoryMb) && cfg.runtimeMemoryMb >= 256))
+    throw new Error("RUNTIME_MEMORY_MB must be a whole number of MiB, at least 256");
+  if (!(cfg.runtimeCpus >= 0.1 && cfg.runtimeCpus <= 64))
+    throw new Error("RUNTIME_CPUS must be a number from 0.1 to 64");
+  if (!cfg.runtimeRootfs.startsWith("/"))
+    throw new Error("RUNTIME_ROOTFS must be an absolute path");
+  if (!cfg.dataDir.startsWith("/") || cfg.dataDir.length > 40)
+    // Unix socket paths (DATA_DIR/homes/<key>/.happy/agent/server.sock) are limited to 107 bytes.
+    throw new Error("DATA_DIR must be an absolute path of at most 40 characters");
   for (const r of cfg.egressAllowRanges)
     if (!/^\d{1,3}(\.\d{1,3}){3}\/\d{1,2}$/.test(r))
       throw new Error(`EGRESS_ALLOW_RANGES: "${r}" is not an IPv4 CIDR range`);

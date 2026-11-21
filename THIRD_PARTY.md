@@ -21,8 +21,10 @@ repository does not contain or redistribute any of them.
 | Debian base image (multi-arch index) | trixie-slim | Debian licenses | `debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2` | pinned by digest |
 | Bun base image (gateway, multi-arch index) | 1.3.9-slim | MIT | `oven/bun:1.3.9-slim@sha256:8ca06c7812d9050ccc4b80799685f395d6a0d051d3b7207dfd120e2b437b1ec9` | pinned by digest |
 | jose (gateway dependency) | 6.1.3 | MIT | npm | `bun.lock` |
-| microsandbox (gateway dependency: SDK, the `msb` runtime) | 0.7.16, linux-arm64-gnu and linux-x64-gnu | Apache-2.0 | npm `microsandbox`, `@superradcompany/microsandbox-linux-*-gnu`; source <https://github.com/superradcompany/microsandbox> | `bun.lock` |
-| libkrunfw (bundled with microsandbox: the microVMs' Linux kernel) | 5.6.1 | Linux kernel GPL-2.0 (libkrunfw LGPL-2.1) | shipped in the microsandbox platform package; source <https://github.com/containers/libkrunfw> | `bun.lock` |
+| Smokescreen (egress proxy) | v0.1.0, linux arm64 and amd64 | MIT | `https://github.com/stripe/smokescreen/releases/tag/v0.1.0` | sha256 `f15ddd0d…24b7c9` (arm64), `4e1e4474…1ec46` (amd64); full values in `Dockerfile` |
+| crun (sandbox runtime) | Debian trixie package | GPL-2.0-or-later (libcrun LGPL-2.1-or-later) | Debian `crun`; source <https://github.com/containers/crun> | Debian archive signatures |
+| Docker's default seccomp profile (`runtime/seccomp-docker-default.json`, copied unmodified) | moby/profiles `a0fa70805f742f7da15b367770d802ea2a86c68b` | Apache-2.0 | <https://github.com/moby/profiles/blob/a0fa70805f742f7da15b367770d802ea2a86c68b/seccomp/default.json> | pinned by commit |
+| tini (init inside each sandbox) | Debian trixie package | MIT | Debian `tini`; source <https://github.com/krallin/tini> | Debian archive signatures |
 
 ## Claude Code
 
@@ -47,10 +49,3 @@ Google's release manifest; Tandem runs it only on a person's own Gemini API key,
 Antigravity sign-in. Both are downloaded from their vendors when *you* build the runtime image and
 never redistributed by this repository, and the same rule applies: do not publish prebuilt Tandem
 images. Their use is governed by xAI's and Google's terms (see README, Vendor terms).
-
-## microsandbox and libkrunfw
-
-microsandbox runs each person's runtime as a microVM on KVM. Its platform package ships libkrunfw, a
-library that embeds a Linux kernel (GPL-2.0) for the microVMs. Tandem uses them unmodified from npm and
-does not redistribute them; anyone who distributes an image containing them takes on the kernel's GPL
-source-offer obligations, one more reason not to publish Tandem images.

@@ -1,39 +1,54 @@
-// Runtime controller: one microVM per person, run by microsandbox inside the gateway's own
-// container. Each microVM boots the runtime image (built into the gateway image), mounts the
-// person's home from the gateway's data volume, publishes its Happy bridge on the container's
-// loopback only, and reaches the gateway's MCP proxy over a private vsock route.
-import { createHash, createHmac } from "node:crypto";
-import { mkdirSync, readFileSync } from "node:fs";
+// Runtime controller: one sandbox per person, inside the one Tandem container. crun (an OCI runtime)
+// runs each person's Happy Agent daemon as their own uid in their own PID, network, IPC, UTS,
+// cgroup and mount namespaces over the read-only runtime filesystem, with only their home writable
+// (src/security.ts). The gateway reaches the daemon over its Unix socket in the home; the sandbox
+// reaches the outside only through the gateway's egress and MCP sockets.
+import { createHmac } from "node:crypto";
+import {
+  chmodSync,
+  chownSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { join } from "node:path";
 import type { Config } from "./config";
 import { proxyToken, PROXY_TOKEN_ENV } from "./mcp";
 import {
-  egressRules,
+  groupFile,
+  passwdFile,
   RUNTIME_TMPDIR,
-  type EgressRules,
+  sandboxSeccomp,
+  sandboxSpec,
+  SANDBOX_EGRESS_PORT,
+  SANDBOX_MCP_PORT,
   type Posture,
 } from "./security";
 
-/** The Happy bridge inside each microVM (runtime/entrypoint.sh). */
-export const BRIDGE_PORT = 24790;
-/** Host ports for the bridges, on the gateway container's loopback only. */
-export const BRIDGE_HOST_PORTS = { first: 41000, last: 48999 };
-/** Inside each microVM the MCP proxy is this loopback port; the entrypoint forwards it over vsock. */
-export const MCP_GUEST_PORT = 8790;
-export const MCP_VSOCK_PORT = 8790;
 const HOME = "/home/agent";
 const TOKEN_PATH = `${HOME}/.happy/agent/token`;
-const ENTRYPOINT = "/usr/local/bin/agent-runtime-entrypoint";
-/** The runtime image's own user (runtime/Dockerfile). */
-const AGENT_UID = 10001;
+/** tini reaps orphans and forwards signals; the entrypoint then runs the daemon (runtime/). */
+export const DAEMON_ARGS = [
+  "/usr/bin/tini",
+  "-s",
+  "--",
+  "/usr/local/bin/agent-runtime-entrypoint",
+];
+/** One-shot commands get the egress relay first (runtime/with-egress). */
+export const WITH_EGRESS = "/usr/local/bin/with-egress";
 const EXEC_TIMEOUT_MS = 60_000;
-/** States microsandbox passes through while a runtime boots or stops; how long to wait them out. */
-const TRANSITIONAL = new Set(["starting", "draining"]);
-const SETTLE_MS = 60_000;
+const STOP_TIMEOUT_MS = 30_000;
+/** Each person's uid: from here up, one per person, recorded in DATA_DIR/uids.json. */
+export const FIRST_UID = 100_000;
 
 /**
  * The daemon's runs and sign-ins, asked over its own socket inside the runtime: this answers also
- * when the gateway cannot reach the runtime's bridge. Read-only; the token goes through a shell
- * builtin to curl's standard input, never into a process's arguments.
+ * when the gateway cannot reach the daemon. Read-only; the token goes through a shell builtin to
+ * curl's standard input, never into a process's arguments.
  */
 export const ACTIVITY_COMMAND = [
   "sh",
@@ -54,9 +69,9 @@ export const CLAUDE_MODELS_COMMAND = [
 
 /**
  * Whether Google accepts the person's Gemini API key: its free model list, asked from inside the
- * runtime. The key goes from its file to curl's standard input through a shell builtin, never into
- * a process's arguments. (Happy's provider check cannot vouch for the Antigravity account on an
- * API key: it looks for Antigravity's own sign-in.)
+ * runtime through the egress proxy. The key goes from its file to curl's standard input through a
+ * shell builtin, never into a process's arguments. (Happy's provider check cannot vouch for the
+ * Antigravity account on an API key: it looks for Antigravity's own sign-in.)
  */
 export const GEMINI_KEY_COMMAND = [
   "sh",
@@ -64,7 +79,7 @@ export const GEMINI_KEY_COMMAND = [
   'k=$(cat /home/agent/.agent-runtime/gemini-api-key) && echo "x-goog-api-key: $k" | curl -sf -m 15 -o /dev/null -H @- "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1"',
 ];
 
-/** Writes standard input to "$1/$2", owner-only, as the runtime's user: no content in argv. */
+/** Writes standard input to "$1/$2", owner-only, as the person: no content in argv. */
 const WRITE_FILE_COMMAND = [
   "sh",
   "-c",
@@ -74,23 +89,29 @@ const WRITE_FILE_COMMAND = [
 
 export type ExecResult = { exitCode: number; stdout: string };
 
-/** A running runtime as the gateway sees it. `token` is the daemon's owner token: memory only. */
+/**
+ * A running runtime as the gateway sees it: the daemon's HTTP API over its Unix socket (`unix`,
+ * with `url` as the request base) or over TCP (`url` only, tests). `token` is the daemon's owner
+ * token: memory only.
+ */
 export type RuntimeHandle = {
   key: string;
   url: string;
+  unix?: string;
   token: string;
   startedAt: number;
 };
 
 export interface Runtime {
-  /** Creates and starts the runtime when needed; resolves once its daemon token is readable. */
+  /** Starts the runtime when needed; resolves once its daemon token is readable. */
   ensure(key: string): Promise<RuntimeHandle>;
   stop(key: string): Promise<void>;
   restart(key: string): Promise<RuntimeHandle>;
   /** Keys of runtimes that are running now (rediscovery after a gateway restart). */
   listRunning(): Promise<string[]>;
+  /** Runs a command as the person, in a sandbox like theirs (their home, the egress proxy). */
   exec(key: string, cmd: string[]): Promise<ExecResult>;
-  /** Writes one owner-only file into the running runtime's home without argv or environment. */
+  /** Writes one owner-only file into the person's home without argv or environment. */
   writePrivateFile(
     key: string,
     dir: string,
@@ -99,14 +120,14 @@ export interface Runtime {
   ): Promise<void>;
   /**
    * The daemon's project (GET /v0/projects/chats) and provider CLIs, read inside the runtime, also
-   * when its bridge is unreachable. Null when the daemon does not answer.
+   * when its socket does not answer the gateway. Null when the daemon does not answer.
    */
   activity?(key: string): Promise<{ project: any; clis: any[] } | null>;
-  /** Which protections this host provides (detected once). */
+  /** Which protections this host provides (checked once). */
   posture?(): Promise<Posture>;
   /**
-   * The Unix socket the runtime's MCP proxy requests arrive on (its vsock route). The gateway
-   * listens there before the runtime starts; a request on it can only come from this runtime.
+   * The Unix socket the runtime's MCP proxy requests arrive on (bind-mounted into its sandbox and
+   * nowhere else). The gateway listens there before the runtime starts.
    */
   mcpSocket?(key: string): string;
 }
@@ -119,105 +140,161 @@ export function runtimeKey(secret: string, subject: string) {
     .slice(0, 24);
 }
 
-/** The microsandbox calls the controller makes: the SDK, or a fake in tests. */
-export type Msb = typeof import("microsandbox");
+/**
+ * Runs crun; the gateway's only use of it. Replaced by a fake in tests. `cgroups`: each sandbox gets
+ * its own cgroup under the delegated tree (delegateCgroups), else crun leaves cgroups alone.
+ */
+export type Crun = (
+  args: string[],
+  opts?: { stdin?: Buffer; timeoutMs?: number; log?: string; cgroups?: boolean },
+) => Promise<{ code: number; stdout: string; stderr: string }>;
 
-/** What a runtime is created with; any change recreates a stopped runtime (its home is kept). */
-export type RuntimeSpec = {
-  image: string;
-  memoryMb: number;
-  cpus: number;
-  egress: EgressRules;
-  port: number;
-  socket: string;
+export const crun: Crun = async (args, opts = {}) => {
+  const manager = opts.cgroups ? "cgroupfs" : "disabled";
+  const p = Bun.spawn(["crun", `--cgroup-manager=${manager}`, ...args], {
+    stdin: opts.stdin ?? "ignore",
+    stdout: opts.log ? Bun.file(opts.log) : "pipe",
+    stderr: opts.log ? Bun.file(opts.log) : "pipe",
+  });
+  const timer = opts.timeoutMs
+    ? setTimeout(() => p.kill("SIGKILL"), opts.timeoutMs)
+    : undefined;
+  const [stdout, stderr, code] = await Promise.all([
+    opts.log ? "" : new Response(p.stdout as ReadableStream).text(),
+    opts.log ? "" : new Response(p.stderr as ReadableStream).text(),
+    p.exited,
+  ]);
+  clearTimeout(timer);
+  return { code, stdout, stderr };
 };
 
-export const specHash = (spec: RuntimeSpec) =>
-  createHash("sha256").update(JSON.stringify(spec)).digest("hex").slice(0, 16);
-
-/** The first free bridge host port, or null when every one is taken. */
-export function freePort(used: Set<number>): number | null {
-  for (let p = BRIDGE_HOST_PORTS.first; p <= BRIDGE_HOST_PORTS.last; p++)
-    if (!used.has(p)) return p;
+/**
+ * Makes this container's cgroup v2 tree writable and moves its own processes into a leaf, so every
+ * sandbox can get its own cgroup with memory, CPU and process limits, the way Docker-in-Docker
+ * does. Needs only the SYS_ADMIN and AppArmor settings the sandboxes need anyway. Resolves to null,
+ * or to why the host cannot (cgroup v1, a controller missing).
+ */
+export async function delegateCgroups(
+  root = "/sys/fs/cgroup",
+): Promise<string | null> {
+  if (!existsSync(join(root, "cgroup.controllers")))
+    return "this host does not use cgroup v2";
+  const have = readFileSync(join(root, "cgroup.controllers"), "utf8").split(/\s+/);
+  const missing = ["memory", "pids", "cpu"].filter((c) => !have.includes(c));
+  if (missing.length) return `the cgroup controllers ${missing.join(", ")} are not available`;
+  const remount = Bun.spawnSync(["mount", "-o", "remount,rw", root]);
+  if (remount.exitCode !== 0)
+    return `cannot write ${root}: ${remount.stderr.toString().trim()}`;
+  // Processes may not live in a cgroup whose children have controllers: move them to a leaf.
+  mkdirSync(join(root, "gateway"), { recursive: true });
+  const enable = "+memory +pids +cpu";
+  for (let attempt = 0; ; attempt++) {
+    for (const pid of readFileSync(join(root, "cgroup.procs"), "utf8").split("\n"))
+      if (pid)
+        try {
+          writeFileSync(join(root, "gateway", "cgroup.procs"), pid);
+        } catch {} // exited meanwhile
+    try {
+      writeFileSync(join(root, "cgroup.subtree_control"), enable);
+      break;
+    } catch (e) {
+      if (attempt >= 5) return `cannot enable cgroup controllers: ${(e as Error).message}`;
+    }
+  }
+  mkdirSync(join(root, "sandboxes"), { recursive: true });
+  writeFileSync(join(root, "sandboxes", "cgroup.subtree_control"), enable);
   return null;
 }
 
-/** The image reference for a runtime image archive: its build-time digest (`<archive>.sha256`). */
-export function imageRef(archive: string) {
-  const sha = readFileSync(`${archive}.sha256`, "utf8").trim().split(/\s/)[0]!;
-  if (!/^[0-9a-f]{64}$/.test(sha))
-    throw new Error(`${archive}.sha256 does not hold a sha256 digest`);
-  return `tandem-runtime:${sha.slice(0, 16)}`;
+/** The first uid at or above FIRST_UID that no person holds. */
+export function nextUid(taken: Iterable<number>): number {
+  const used = new Set(taken);
+  let uid = FIRST_UID;
+  while (used.has(uid)) uid++;
+  return uid;
 }
 
-const notFound = (e: unknown) =>
-  ["sandboxNotFound", "imageNotFound"].includes(
-    (e as { code?: string })?.code ?? "",
-  );
-
-export class MicroVmRuntime implements Runtime {
-  private msb: Promise<Msb>;
-  private ready?: Promise<string>;
+export class SandboxRuntime implements Runtime {
+  private ready?: Promise<void>;
+  /** Per-sandbox cgroups available (delegateCgroups), and why not. */
+  private cgroups = false;
+  private warnings: string[] = [];
+  private seccomp = sandboxSeccomp();
   private tokens = new Map<string, string>();
-  private connected = new Map<string, Promise<any>>();
-  /** One create/start/stop at a time per person, and one port choice at a time overall. */
+  private started = new Map<string, number>();
   private queues = new Map<string, Promise<unknown>>();
-  private portLock: Promise<unknown> = Promise.resolve();
+  private uidLock: Promise<unknown> = Promise.resolve();
+  private seq = 0;
 
   constructor(
     private cfg: Config,
     private log: (...args: unknown[]) => void = console.log,
-    msb?: Msb,
-  ) {
-    this.msb = msb ? Promise.resolve(msb) : import("microsandbox");
-  }
+    private run: Crun = crun,
+  ) {}
 
-  private label = (name: string) => `${this.cfg.runtimePrefix}.${name}`;
-  private name = (key: string) => `${this.cfg.runtimePrefix}-${key}`;
-  private home = (key: string) => `${this.cfg.dataDir}/homes/${key}`;
-  mcpSocket = (key: string) => `${this.cfg.dataDir}/run/${key}.sock`;
+  private id = (key: string) => `${this.cfg.runtimePrefix}-${key}`;
+  private home = (key: string) => join(this.cfg.dataDir, "homes", key);
+  private runDir = (key: string) => join(this.cfg.dataDir, "run", key);
+  private bundles = () => join(this.cfg.dataDir, "bundles");
+  private tmp = (key: string) => join(this.cfg.dataDir, "tmp", key);
+  mcpSocket = (key: string) => join(this.runDir(key), "mcp.sock");
+  egressSocket = () => join(this.cfg.dataDir, "run", "egress.sock");
+  daemonSocket = (key: string) =>
+    join(this.home(key), ".happy", "agent", "server.sock");
 
   posture(): Promise<Posture> {
     return this.setup().then(() => ({
-      sandbox: "microvm",
+      sandbox: "namespaces",
       egress: this.cfg.egressMode,
-      warnings: [],
+      limits: this.cgroups,
+      warnings: this.warnings,
     }));
   }
 
-  /** Loads the runtime image into microsandbox once per image version; resolves to its reference. */
-  private setup(): Promise<string> {
+  /**
+   * Checks once that this container can create sandboxes (compose.yaml grants it SYS_ADMIN and
+   * NET_ADMIN and turns AppArmor off for it), with a throwaway sandbox that runs `true`.
+   */
+  private setup(): Promise<void> {
     return (this.ready ??= (async () => {
-      const { Image } = await this.msb;
-      for (const dir of ["homes", "run"])
-        mkdirSync(`${this.cfg.dataDir}/${dir}`, {
+      for (const dir of ["homes", "run", "bundles", "tmp"])
+        mkdirSync(join(this.cfg.dataDir, dir), {
           recursive: true,
-          mode: 0o700,
+          mode: 0o711,
         });
-      const ref =
-        this.cfg.runtimeImage || imageRef(this.cfg.runtimeImageArchive);
-      const loaded = await Image.get(ref).then(
-        () => true,
-        (e) => {
-          if (notFound(e)) return false;
-          throw e;
-        },
-      );
-      if (!loaded) {
-        if (this.cfg.runtimeImage)
-          throw new Error(
-            `RUNTIME_IMAGE ${ref} is not in microsandbox's image store`,
-          );
-        const t0 = Date.now();
-        this.log(`loading runtime image ${ref}`);
-        await Image.load(this.cfg.runtimeImageArchive, { tag: ref });
-        this.log(`runtime image ${ref} loaded in ${Date.now() - t0} ms`);
-      }
-      return ref;
+      chmodSync(join(this.cfg.dataDir, "run"), 0o711);
+      if (
+        !existsSync(join(this.cfg.runtimeRootfs, "usr/local/bin/happy-agent"))
+      )
+        throw new Error(`no runtime filesystem at ${this.cfg.runtimeRootfs}`);
+      const why = await this.delegate();
+      this.cgroups = why === null;
+      if (why)
+        this.warnings.push(
+          `no per-person memory, CPU and process limits: ${why}. Limit the whole container instead.`,
+        );
+      const probe = await this.oneShot("probe", FIRST_UID - 1, ["true"], {
+        home: null,
+      });
+      if (probe.code !== 0)
+        throw new Error(
+          `this container cannot create sandboxes (${probe.stderr.trim().slice(0, 200)}). ` +
+            "Give it cap_add SYS_ADMIN and NET_ADMIN and security_opt apparmor=unconfined (compose.yaml).",
+        );
     })().catch((e) => {
-      this.ready = undefined; // a failed load must not stick
+      this.ready = undefined;
       throw e;
     }));
+  }
+
+  /** Overridden in tests, which run without a cgroup tree. */
+  protected delegate() {
+    return delegateCgroups();
+  }
+
+  /** crun with this runtime's cgroup setting. */
+  private crun(args: string[], opts: Parameters<Crun>[1] = {}) {
+    return this.run(args, { ...opts, cgroups: this.cgroups });
   }
 
   private serial<T>(key: string, job: () => Promise<T>): Promise<T> {
@@ -233,219 +310,262 @@ export class MicroVmRuntime implements Runtime {
     return run;
   }
 
-  /** Every runtime of this instance, running or stopped. */
-  private async all(): Promise<any[]> {
-    const { Sandbox } = await this.msb;
-    const out: any[] = [];
-    let cursor: string | undefined;
-    do {
-      const page = await Sandbox.listWith((l: any) => {
-        let b = l.label(this.label("runtime"), "1").limit(100);
-        if (cursor) b = b.cursor(cursor);
-        return b;
+  /** The person's uid, allocated once and kept in DATA_DIR/uids.json. */
+  private uidOf(key: string): Promise<number> {
+    const run = this.uidLock.then(() => {
+      const file = join(this.cfg.dataDir, "uids.json");
+      const uids: Record<string, number> = existsSync(file)
+        ? JSON.parse(readFileSync(file, "utf8"))
+        : {};
+      if (uids[key]) return uids[key]!;
+      uids[key] = nextUid(Object.values(uids));
+      writeFileSync(`${file}.tmp`, JSON.stringify(uids, null, 1), {
+        mode: 0o600,
       });
-      out.push(...page.sandboxes);
-      cursor = page.nextCursor ?? undefined;
-    } while (cursor);
-    return out;
+      renameSync(`${file}.tmp`, file);
+      return uids[key]!;
+    });
+    this.uidLock = run.catch(() => {});
+    return run;
   }
 
-  private async handleOf(key: string): Promise<any | null> {
-    const { Sandbox } = await this.msb;
-    return Sandbox.get(this.name(key)).catch((e: unknown) => {
-      if (notFound(e)) return null;
-      throw e;
+  /** Home, passwd/group and the MCP socket's owner, before the person's sandbox starts. */
+  private async prepare(key: string, uid: number) {
+    const home = this.home(key);
+    if (!existsSync(home)) mkdirSync(home, { mode: 0o700 });
+    if (lstatSync(home).uid !== uid) {
+      // A home from another uid (moved from an older Tandem): hand it over. chown -R does not
+      // follow symbolic links.
+      const p = Bun.spawn(["chown", "-R", `${uid}:${uid}`, home]);
+      if ((await p.exited) !== 0) throw new Error(`cannot chown ${home}`);
+    }
+    chmodSync(home, 0o700);
+    const run = this.runDir(key);
+    mkdirSync(run, { recursive: true, mode: 0o711 });
+    writeFileSync(join(run, "passwd"), passwdFile(uid), { mode: 0o644 });
+    writeFileSync(join(run, "group"), groupFile(uid), { mode: 0o644 });
+    // A fresh temporary directory for this start (the last start's unpacked files are gone).
+    this.freshTmp(key, uid);
+    // The gateway listens on it (listenMcp) before the start; only the person may connect.
+    if (existsSync(this.mcpSocket(key))) {
+      chownSync(this.mcpSocket(key), uid, uid);
+      chmodSync(this.mcpSocket(key), 0o600);
+    }
+  }
+
+  /** An empty temporary directory for the person, owner-only. rmSync does not follow links. */
+  private freshTmp(key: string, uid: number) {
+    const tmp = this.tmp(key);
+    rmSync(tmp, { recursive: true, force: true });
+    mkdirSync(tmp, { mode: 0o700 });
+    // Only root can hand a directory to another user (the gateway runs as root in its container).
+    if (process.getuid?.() === 0) chownSync(tmp, uid, uid);
+  }
+
+  /** The person's sandbox spec (sandbox `name`), for their daemon or a one-shot command. */
+  private spec(
+    name: string,
+    key: string | null,
+    uid: number,
+    args: string[],
+    daemon: boolean,
+  ) {
+    return sandboxSpec({
+      uid,
+      rootfs: this.cfg.runtimeRootfs,
+      home: key ? this.home(key) : join(this.cfg.dataDir, "run", "probe-home"),
+      tmp: key ? this.tmp(key) : join(this.cfg.dataDir, "run", "probe-home"),
+      seccomp: this.seccomp,
+      cgroup: this.cgroups
+        ? {
+            path: `/sandboxes/${name}`,
+            memoryMb: this.cfg.runtimeMemoryMb,
+            cpus: this.cfg.runtimeCpus,
+          }
+        : undefined,
+      passwd: key ? join(this.runDir(key), "passwd") : "/etc/passwd",
+      group: key ? join(this.runDir(key), "group") : "/etc/group",
+      egressSocket: this.egressSocket(),
+      mcpSocket:
+        key && daemon && existsSync(this.mcpSocket(key))
+          ? this.mcpSocket(key)
+          : undefined,
+      args,
+      pids: this.cfg.runtimePids,
+      env: {
+        HOME,
+        TMPDIR: RUNTIME_TMPDIR,
+        DISABLE_AUTOUPDATER: "1",
+        AGY_CLI_DISABLE_AUTO_UPDATE: "true",
+        // Every connection out goes through the egress relay to the gateway's Smokescreen.
+        HTTPS_PROXY: `http://127.0.0.1:${SANDBOX_EGRESS_PORT}`,
+        HTTP_PROXY: `http://127.0.0.1:${SANDBOX_EGRESS_PORT}`,
+        https_proxy: `http://127.0.0.1:${SANDBOX_EGRESS_PORT}`,
+        http_proxy: `http://127.0.0.1:${SANDBOX_EGRESS_PORT}`,
+        NO_PROXY: "127.0.0.1,localhost",
+        no_proxy: "127.0.0.1,localhost",
+        ...(key && daemon
+          ? {
+              MCP_PROXY_URL: `http://127.0.0.1:${SANDBOX_MCP_PORT}/mcp/${key}`,
+              // Only useful on this person's own MCP socket (src/mcp.ts).
+              [PROXY_TOKEN_ENV]: proxyToken(this.cfg.serviceSecret, key),
+            }
+          : {}),
+      },
     });
   }
 
-  /**
-   * The runtime once it is not between states: microsandbox reports `starting` and `draining`
-   * while a boot or a stop (also one from outside the gateway) is under way.
-   */
-  private async settled(key: string): Promise<any | null> {
-    for (const until = Date.now() + SETTLE_MS; ; await Bun.sleep(500)) {
-      const h = await this.handleOf(key);
-      if (!h || !TRANSITIONAL.has(h.status) || Date.now() > until) return h;
-    }
+  private writeBundle(name: string, spec: object) {
+    const dir = join(this.bundles(), name);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(dir, "config.json"), JSON.stringify(spec), {
+      mode: 0o600,
+    });
+    return dir;
   }
 
-  /** A live connection to a running runtime, reused for exec. */
-  private sandbox(key: string): Promise<any> {
-    let c = this.connected.get(key);
-    if (!c) {
-      c = this.handleOf(key).then((h) => {
-        if (h?.status !== "running") throw new Error("runtime is not running");
-        return h.connect();
+  /** A command in a throwaway sandbox of the person (or of nobody, `home: null`); stdout back. */
+  private async oneShot(
+    key: string,
+    uid: number,
+    cmd: string[],
+    opts: { home?: null; stdin?: Buffer } = {},
+  ) {
+    const name = `${this.cfg.runtimePrefix}-x${process.pid}-${++this.seq}`;
+    const real = opts.home !== null;
+    if (!real)
+      mkdirSync(join(this.cfg.dataDir, "run", "probe-home"), {
+        recursive: true,
       });
-      c.catch(() => this.connected.delete(key));
-      this.connected.set(key, c);
-    }
-    return c;
-  }
-
-  /**
-   * Runs `job` on the live connection; a failure drops that connection, so a runtime restarted
-   * outside the gateway is reconnected on the next call instead of failing on a stale one.
-   */
-  private async use<T>(key: string, job: (sb: any) => Promise<T>): Promise<T> {
+    else if (!existsSync(this.tmp(key))) this.freshTmp(key, uid);
+    const bundle = this.writeBundle(
+      name,
+      this.spec(name, real ? key : null, uid, [WITH_EGRESS, ...cmd], false),
+    );
     try {
-      return await job(await this.sandbox(key));
-    } catch (e) {
-      this.connected.delete(key);
-      throw e;
+      return await this.crun(
+        ["run", "--no-pivot", "--no-new-keyring", "--bundle", bundle, name],
+        { stdin: opts.stdin, timeoutMs: EXEC_TIMEOUT_MS },
+      );
+    } finally {
+      await this.crun(["delete", "-f", name]).catch(() => {});
+      rmSync(bundle, { recursive: true, force: true });
     }
   }
 
-  private forget(key: string) {
-    this.connected.delete(key);
-    this.tokens.delete(key);
+  private async status(key: string): Promise<string | null> {
+    const r = await this.crun(["state", this.id(key)]);
+    if (r.code !== 0) return null;
+    try {
+      return JSON.parse(r.stdout).status ?? null;
+    } catch {
+      return null;
+    }
   }
 
-  async ensure(key: string): Promise<RuntimeHandle> {
+  ensure(key: string): Promise<RuntimeHandle> {
     return this.serial(key, () => this.ensureNow(key));
   }
 
   private async ensureNow(key: string): Promise<RuntimeHandle> {
-    const image = await this.setup();
-    let h = await this.settled(key);
-    if (h?.status === "running") {
-      await this.startDaemon(key);
-      return this.handle(key, h);
-    }
-    const labels = h?.config()?.labels ?? {};
-    const port =
-      Number(labels[this.label("port")]) || (await this.allocatePort());
-    const spec: RuntimeSpec = {
-      image,
-      memoryMb: this.cfg.runtimeMemoryMb,
-      cpus: this.cfg.runtimeCpus,
-      egress: egressRules(this.cfg),
-      port,
-      socket: this.mcpSocket(key),
-    };
-    const hash = specHash(spec);
-    // A stopped runtime is recreated whenever anything in its spec changed (image, limits, egress).
-    // Its home is a separate directory, so nothing the person keeps is lost.
-    if (h && labels[this.label("spec")] !== hash) {
-      const { Sandbox } = await this.msb;
-      await Sandbox.remove(this.name(key));
-      h = null;
-    }
-    this.forget(key);
-    if (h)
-      await h.startDetached().catch(async (e: unknown) => {
-        // Started meanwhile by someone else (msb, a crash recovery): use it.
-        if ((await this.settled(key))?.status !== "running") throw e;
-      });
-    else await this.create(key, spec, hash);
-    await this.startDaemon(key);
-    return this.handle(key, await this.handleOf(key));
-  }
-
-  /** The lowest bridge host port no runtime of this instance holds (running or stopped). */
-  private allocatePort(): Promise<number> {
-    const run = this.portLock.then(async () => {
-      const used = new Set(
-        (await this.all()).map((h) =>
-          Number(h.config()?.labels?.[this.label("port")]),
-        ),
+    await this.setup();
+    const uid = await this.uidOf(key);
+    if ((await this.status(key)) !== "running") {
+      // A sandbox that stopped (crashed, or stopped outside the gateway) leaves its state behind.
+      await this.crun(["delete", "-f", this.id(key)]).catch(() => {});
+      await this.prepare(key, uid);
+      // The daemon writes a new owner token when it starts: the previous one must not be read.
+      this.tokens.delete(key);
+      await this.oneShot(key, uid, ["rm", "-f", TOKEN_PATH]);
+      const bundle = this.writeBundle(
+        this.id(key),
+        this.spec(this.id(key), key, uid, DAEMON_ARGS, true),
       );
-      const port = freePort(used);
-      if (port === null)
-        throw new Error("no free bridge port: too many runtimes on this host");
-      return port;
-    });
-    this.portLock = run.catch(() => {});
-    return run;
+      const log = join(this.runDir(key), "daemon.log");
+      const r = await this.crun(
+        [
+          "run",
+          "--detach",
+          "--no-pivot",
+          "--no-new-keyring",
+          "--bundle",
+          bundle,
+          this.id(key),
+        ],
+        { log },
+      );
+      if (r.code !== 0) {
+        const tail = existsSync(log)
+          ? readFileSync(log, "utf8").slice(-300)
+          : "";
+        throw new Error(`runtime did not start: ${tail.trim()}`);
+      }
+      this.started.set(key, Date.now());
+    }
+    return this.handle(key, uid);
   }
 
-  private async create(key: string, spec: RuntimeSpec, hash: string) {
-    const { Sandbox, NetworkPolicyBuilder } = await this.msb;
-    const home = this.home(key);
-    mkdirSync(home, { recursive: true, mode: 0o700 });
-    const policy = buildPolicy(NetworkPolicyBuilder, spec.egress);
-    let b = Sandbox.builder(this.name(key))
-      .image(spec.image)
-      .cpus(spec.cpus)
-      .memory(spec.memoryMb)
-      .user("agent")
-      .label(this.label("runtime"), "1")
-      .label(this.label("key"), key)
-      .label(this.label("port"), String(spec.port))
-      .label(this.label("spec"), hash)
-      .volume(HOME, (m: any) => m.bind(home).owner(AGENT_UID, AGENT_UID))
-      .port(spec.port, BRIDGE_PORT)
-      .vsock(spec.socket, MCP_VSOCK_PORT)
-      .detached(true);
-    if (policy)
-      b = b.network((n: any) => n.strict(false).policyFromBuilder(policy));
-    await b.create();
-  }
-
-  /** Starts the Happy daemon (the runtime entrypoint) unless it already runs in this boot. */
-  private startDaemon(key: string) {
-    return this.use(key, (sb) => this.startDaemonOn(key, sb));
-  }
-
-  private async startDaemonOn(key: string, sb: any) {
-    const running = await sb.execWith("pgrep", (b: any) =>
-      b.args(["-x", "happy-agent"]).user("agent").timeout(EXEC_TIMEOUT_MS),
-    );
-    if (running.status?.code === 0) return;
-    // The daemon writes a new owner token when it starts: the previous boot's must not be read.
-    this.tokens.delete(key);
-    await sb.execWith("rm", (b: any) =>
-      b.args(["-f", TOKEN_PATH]).user("agent").timeout(EXEC_TIMEOUT_MS),
-    );
-    await sb.execDetachedWith(ENTRYPOINT, (b: any) =>
-      b
-        .user("agent")
-        .env("HOME", HOME)
-        .env("TMPDIR", RUNTIME_TMPDIR)
-        .env("MCP_PROXY_URL", `http://127.0.0.1:${MCP_GUEST_PORT}/mcp/${key}`)
-        .env("MCP_VSOCK_PORT", String(MCP_VSOCK_PORT))
-        // The MCP proxy token only reaches the gateway's proxy, and only over this runtime's own
-        // vsock route.
-        .env(PROXY_TOKEN_ENV, proxyToken(this.cfg.serviceSecret, key)),
-    );
-  }
-
-  private async handle(key: string, h: any): Promise<RuntimeHandle> {
-    if (h?.status !== "running") throw new Error("runtime is not running");
-    const port = Number(h.config()?.labels?.[this.label("port")]);
+  private async handle(key: string, uid: number): Promise<RuntimeHandle> {
+    const token = await this.token(key, uid);
+    const socket = this.daemonSocket(key);
+    // The socket lives in the person's home, so it is theirs: refuse anything else at that path.
+    for (const deadline = Date.now() + 120_000; ; await Bun.sleep(100)) {
+      const st = existsSync(socket) ? lstatSync(socket) : null;
+      if (st?.isSocket() && st.uid === uid) break;
+      if (st && !st.isSocket())
+        throw new Error("the daemon socket is not a socket");
+      if (Date.now() > deadline)
+        throw new Error("the daemon socket did not appear");
+    }
     return {
       key,
-      url: `http://127.0.0.1:${port}`,
-      token: await this.token(key),
-      startedAt: h.updatedAt?.getTime?.() ?? Date.now(),
+      url: "http://runtime",
+      unix: socket,
+      token,
+      startedAt: this.started.get(key) ?? Date.now(),
     };
   }
 
-  /** Reads the daemon token once per runtime boot; kept only in memory. */
-  private async token(key: string): Promise<string> {
+  /** Reads the daemon token once per start, as the person; kept only in memory. */
+  private async token(key: string, uid: number): Promise<string> {
     const cached = this.tokens.get(key);
     if (cached) return cached;
-    const deadline = Date.now() + 120_000;
-    while (Date.now() < deadline) {
-      const r = await this.exec(key, ["cat", TOKEN_PATH]).catch(() => null);
+    for (const deadline = Date.now() + 120_000; Date.now() < deadline;) {
+      const r = await this.oneShot(key, uid, ["cat", TOKEN_PATH]).catch(
+        () => null,
+      );
       const token = r?.stdout.trim() ?? "";
-      if (r?.exitCode === 0 && /^[A-Za-z0-9_-]{43}$/.test(token)) {
+      if (r?.code === 0 && /^[A-Za-z0-9_-]{43}$/.test(token)) {
         this.tokens.set(key, token);
         return token;
       }
-      await Bun.sleep(250); // a fresh home gets its token on the daemon's first start
+      if ((await this.status(key)) !== "running")
+        throw new Error("runtime stopped before its daemon was ready");
+      await Bun.sleep(150);
     }
     throw new Error("runtime daemon token did not appear");
   }
 
   stop(key: string) {
     return this.serial(key, async () => {
-      this.forget(key);
-      const h = await this.settled(key);
-      if (h?.status !== "running") return;
-      const sb = await h.connect();
-      // Graceful first, so the daemon can finish writing; a hung guest is killed.
-      await sb.stopWithTimeout(30_000).catch(() => sb.kill());
+      this.tokens.delete(key);
+      this.started.delete(key);
+      const id = this.id(key);
+      if ((await this.status(key)) === "running") {
+        // Graceful first (tini passes SIGTERM to the daemon), then killed.
+        await this.crun(["kill", id, "TERM"]);
+        for (
+          const until = Date.now() + STOP_TIMEOUT_MS;
+          Date.now() < until && (await this.status(key)) === "running";
+          await Bun.sleep(250)
+        );
+        if ((await this.status(key)) === "running")
+          await this.crun(["kill", "--all", id, "KILL"]);
+      }
+      await this.crun(["delete", "-f", id]).catch(() => {});
+      rmSync(join(this.bundles(), id), { recursive: true, force: true });
+      // The unpacked Claude Code and other temporary files take disk only while it runs.
+      rmSync(this.tmp(key), { recursive: true, force: true });
     });
   }
 
@@ -455,21 +575,23 @@ export class MicroVmRuntime implements Runtime {
   }
 
   async listRunning() {
-    return (await this.all())
-      .filter((h) => h.status === "running")
-      .map((h) => h.config()?.labels?.[this.label("key")])
-      .filter((k): k is string => typeof k === "string" && !!k);
+    const r = await this.crun(["list", "--format", "json"]);
+    if (r.code !== 0) return [];
+    const prefix = `${this.cfg.runtimePrefix}-`;
+    let list: { id: string; status: string }[] = [];
+    try {
+      list = JSON.parse(r.stdout || "[]") ?? [];
+    } catch {}
+    return list
+      .filter((c) => c.status === "running" && c.id.startsWith(prefix))
+      .map((c) => c.id.slice(prefix.length))
+      .filter((k) => /^[0-9a-f]{24}$/.test(k));
   }
 
-  /** Always as the runtime's own user. */
-  exec(key: string, cmd: string[]): Promise<ExecResult> {
-    const [file, ...args] = cmd;
-    return this.use(key, async (sb) => {
-      const o = await sb.execWith(file!, (b: any) =>
-        b.args(args).user("agent").timeout(EXEC_TIMEOUT_MS),
-      );
-      return { exitCode: o.status?.code ?? -1, stdout: o.stdout() };
-    });
+  async exec(key: string, cmd: string[]): Promise<ExecResult> {
+    await this.setup();
+    const r = await this.oneShot(key, await this.uidOf(key), cmd);
+    return { exitCode: r.code, stdout: r.stdout };
   }
 
   async activity(key: string) {
@@ -497,45 +619,14 @@ export class MicroVmRuntime implements Runtime {
   ) {
     if (!dir.startsWith(`${HOME}/`) || !/^[A-Za-z0-9._-]+$/.test(name))
       throw new Error("writePrivateFile: path outside the runtime home");
+    await this.setup();
     const [file, ...args] = WRITE_FILE_COMMAND;
-    const o = await this.use<any>(key, (sb) =>
-      sb.execWith(file!, (b: any) =>
-        b
-          .args([...args, dir, name])
-          .user("agent")
-          .stdinBytes(Buffer.from(content))
-          .timeout(EXEC_TIMEOUT_MS),
-      ),
+    const r = await this.oneShot(
+      key,
+      await this.uidOf(key),
+      [file!, ...args, dir, name],
+      { stdin: Buffer.from(content) },
     );
-    if (o.status?.code !== 0) throw new Error(`writing ${name} failed`);
+    if (r.code !== 0) throw new Error(`writing ${name} failed`);
   }
 }
-
-/** The microsandbox network policy for these egress rules; null keeps its default (public only). */
-export function buildPolicy(
-  NetworkPolicyBuilder: Msb["NetworkPolicyBuilder"],
-  rules: EgressRules,
-) {
-  if (rules.mode === "open" && !rules.ranges.length) return null;
-  // Inbound traffic reaches a runtime only through its published bridge port.
-  let p: any = new NetworkPolicyBuilder()
-    .defaultIngress("allow")
-    .defaultEgress("deny")
-    // Name resolution through microsandbox's own DNS gateway on the host side.
-    .egress((r: any) => r.udp().tcp().port(53).allowHost());
-  if (rules.mode === "open") p = p.egress((r: any) => r.allowPublic());
-  else {
-    if (rules.exact.length)
-      p = p.egress((r: any) =>
-        r.tcp().ports([80, 443]).allowDomains(rules.exact),
-      );
-    if (rules.suffixes.length)
-      p = p.egress((r: any) =>
-        r.tcp().ports([80, 443]).allowDomainSuffixes(rules.suffixes),
-      );
-  }
-  for (const cidr of rules.ranges)
-    p = p.egress((r: any) => r.tcp().allow((d: any) => d.cidr(cidr)));
-  return p;
-}
-

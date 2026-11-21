@@ -468,7 +468,7 @@ export class FakeRuntime implements Runtime {
     this.files.push({ key, dir, name, content });
     this.volume.set(`${key}:${dir}/${name}`, content);
   }
-  /** Simulates a microVM stopped or crashed behind the gateway's back. */
+  /** Simulates a sandbox stopped or crashed behind the gateway's back. */
   kill(key: string) {
     this.daemons.get(key)?.stop();
     this.daemons.delete(key);
