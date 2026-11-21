@@ -231,14 +231,16 @@ export interface Agent {
 // ---------------------------------------------------------------------------------------------
 // API keys and sign-in
 
-/** The gateway's private folder in the person's home (not the agents' workspace). */
-export const RUNTIME_DIR = "/home/agent/.agent-runtime";
-/** The person's own API key files in RUNTIME_DIR (on the gateway's disk: homeOf(key)/.agent-runtime). */
-export const API_KEY_FILES = {
-  claude: "anthropic-api-key",
-  openrouter: "openrouter-api-key",
-  gemini: "gemini-api-key",
-} as const;
+/**
+ * The person's own API keys. The gateway keeps them in DATA_DIR, outside the person's home: a file
+ * in the home is writable from the person's sandbox and could be a symlink to another person's key,
+ * so nothing reads a secret from a home. An agent puts the key into the environment of that one
+ * vendor process only (never argv, never a file it reads back).
+ */
+export type ApiKeyProvider = "claude" | "openrouter" | "gemini";
+export interface ApiKeys {
+  get(key: string, provider: ApiKeyProvider): string | null;
+}
 
 export type KeyVerdict = "ok" | "refused" | "unreachable";
 
