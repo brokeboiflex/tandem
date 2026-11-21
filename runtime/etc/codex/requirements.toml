@@ -1,0 +1,8 @@
+# Requirements for every person's Codex: these win over every config layer.
+# The gateway reads a person's ChatGPT sign-in from ~/.codex/auth.json (a container has no keyring).
+cli_auth_credentials_store = "file"
+
+# No plugin or app (connector) sync, whatever the person's own config says.
+[features]
+plugins = false
+apps = false

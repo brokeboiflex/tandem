@@ -1,0 +1,15 @@
+# System defaults for every person's Codex: the lowest config layer (the person's own
+# ~/.codex/config.toml comes after it). What must hold is pinned in requirements.toml.
+cli_auth_credentials_store = "file"
+# The runtime filesystem is read-only: there is nothing to update.
+check_for_update_on_startup = false
+
+[features]
+plugins = false
+apps = false
+
+[analytics]
+enabled = false
+
+[feedback]
+enabled = false

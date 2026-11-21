@@ -7,8 +7,6 @@ repository does not contain or redistribute any of them.
 
 | Component | Version | License | Source | Checksum |
 | --- | --- | --- | --- | --- |
-| Happy Agent (standalone daemon) | 2026.11.6-preview.7, linux-arm64 | MIT | `https://github.com/slopus/happy-agent/releases/download/v2026.11.6-preview.7/happy-agent-2026.11.6-preview.7-linux-arm64.tar.gz` | sha256 `7907e0b80b3ecfb2f7c615c38dc949ccb83cd7a98a6245fbb6dcd5ca3ce65a50` |
-| Happy Agent (standalone daemon) | 2026.11.6-preview.7, linux-x64 | MIT | `https://github.com/slopus/happy-agent/releases/download/v2026.11.6-preview.7/happy-agent-2026.11.6-preview.7-linux-x64.tar.gz` | sha256 `4b6023e8380f50c0b7d04e12587fd599f6b3ba791061797ad9ed5cbef398106d` |
 | Codex CLI | 0.160.1, aarch64 musl | Apache-2.0 | `https://github.com/openai/codex/releases/download/rust-v0.160.1/codex-aarch64-unknown-linux-musl.tar.gz` | sha256 `f54dc5852042445bf41da3aa31156f3cb02f52c5a1a04074de73dc5598f7e1f7` |
 | Codex CLI | 0.160.1, x86_64 musl | Apache-2.0 | `https://github.com/openai/codex/releases/download/rust-v0.160.1/codex-x86_64-unknown-linux-musl.tar.gz` | sha256 `9226581be592d18f7e7f740a352fdb63aa61e45e39f7eb9b09d3888c84bba33f` |
 | Codex code-mode host | 0.160.1, aarch64 musl | Apache-2.0 | `https://github.com/openai/codex/releases/download/rust-v0.160.1/codex-code-mode-host-aarch64-unknown-linux-musl.tar.gz` | sha256 `e5e027e6689efda2e3570aa600179f0ebb18632803350e152ed6c9b97dcf9741` |
@@ -18,6 +16,8 @@ repository does not contain or redistribute any of them.
 | Grok CLI (Grok Build) | 1.0.89, linux-x86_64 | Source Apache-2.0 (`github.com/xai-org/grok-build`); xAI's release build, used under xAI's terms | `https://x.ai/cli/grok-1.0.89-linux-x86_64.gz` | sha256 `404456474906572060fa36745266caf1e967e9084e656da9572b42d35febf342` |
 | Antigravity CLI (`agy`) | 1.5.11, linux-arm64 | Google's proprietary terms (not open source) | `https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.11-6132547114106880/linux-arm/cli_linux_arm64.tar.gz` | sha512 `5f703c88…13600585` (vendor manifest; full value in `Dockerfile`) |
 | Antigravity CLI (`agy`) | 1.5.11, linux-x64 | Google's proprietary terms (not open source) | `https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.11-6132547114106880/linux-x64/cli_linux_x64.tar.gz` | sha512 `dad3c015…8ba3ce50` (vendor manifest; full value in `Dockerfile`) |
+| goose (Block) | 1.60.2, aarch64 glibc | Apache-2.0 | `https://github.com/block/goose/releases/download/v1.60.2/goose-aarch64-unknown-linux-gnu.tar.gz` | sha256 `7e74d796e93b89df374715dc669149cb634f74d778de0b87bb7c031b5b093731` |
+| goose (Block) | 1.60.2, x86_64 glibc | Apache-2.0 | `https://github.com/block/goose/releases/download/v1.60.2/goose-x86_64-unknown-linux-gnu.tar.gz` | sha256 `5f6e463621a8428617ae4870eecee7a00a253e9bbfccb6340dfaa4f0ec2aaf32` |
 | Debian base image (multi-arch index) | trixie-slim | Debian licenses | `debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2` | pinned by digest |
 | Bun base image (gateway, multi-arch index) | 1.3.9-slim | MIT | `oven/bun:1.3.9-slim@sha256:8ca06c7812d9050ccc4b80799685f395d6a0d051d3b7207dfd120e2b437b1ec9` | pinned by digest |
 | jose (gateway dependency) | 6.1.3 | MIT | npm | `bun.lock` |
@@ -33,12 +33,9 @@ Claude Code is Anthropic's proprietary software, used under Anthropic's terms
 npm package when *you* build the runtime image and never redistributes it.
 
 **Do not publish prebuilt Tandem images.** An image built from `Dockerfile` contains Claude Code
-(both the copy installed at `/usr/local/bin/claude` and the copy embedded in the Happy Agent binary), so
-pushing it to a public or shared registry would redistribute Anthropic's software. Build the image
-yourself, where you run it.
-
-Happy Agent's own release binary also embeds Claude Code through the Claude Agent SDK; that is part of
-the Happy Agent release you download, under Happy Agent's and Anthropic's terms.
+(installed at `/usr/local/bin/claude`), so pushing it to a public or shared registry would
+redistribute Anthropic's software. Build the image yourself, where you run it. The gateway's npm
+dependencies are installed without their optional dependencies, so no second Claude Code is bundled.
 
 ## Grok CLI and Antigravity CLI
 

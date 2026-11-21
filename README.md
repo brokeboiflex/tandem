@@ -27,9 +27,11 @@ over Happy's owner-level API, and a friendlier sign-in flow.
   system read-only; only the person's home and temporary directory writable; no capabilities,
   `no_new_privs` and Docker's seccomp filter for unprivileged containers. Other people's files and
   processes do not exist inside it.
-- **Its own limits.** Each sandbox has its own cgroup with a memory, CPU and process limit
-  (`RUNTIME_MEMORY_MB`, `RUNTIME_CPUS`, `RUNTIME_PIDS`): a runaway agent is stopped inside its own
-  sandbox and cannot starve the others, the gateway or the server.
+- **Its own limits.** Each person has a cgroup holding their memory and process limits for all of
+  their processes together (`RUNTIME_MEMORY_MB`, `RUNTIME_PIDS`), and every vendor process runs in a
+  child of it: a runaway tool ends only its own process tree, never the person's other processes, other
+  people, the gateway or the server. CPU is shared equally between the people who need it, and the
+  gateway gets more than all sandboxes together.
 - **Vendor credentials stay in the person's home.** `claude auth login`, `codex login` and
   `grok login --device-auth` run inside the sandbox and store their sign-in there, and the gateway
   writes a person's own API key there (through standard input, never a command line). Tandem does not
@@ -310,10 +312,11 @@ only small MCP tools directly; larger ones it may fail to load.
 
 All settings are environment variables, documented with defaults in `.env.example`. The important ones:
 `AUTH_MODE` (`oidc` with `OIDC_ISSUER`/`OIDC_AUDIENCE`/`OIDC_JWKS_URL`, or `dev`), `SERVICE_SECRET`,
-`IDLE_MINUTES` (default 5; a runtime never stops while a run, a question or a sign-in is open),
+`IDLE_MINUTES` (default 2; a vendor process never stops while a run, a question or a sign-in is open),
 `PERMISSION_MODE` (default `auto`, the safest mode in which MCP tools run; never use `full_access` for
 people's chats), `MCP_ALLOWED_ORIGINS` for application MCP servers, the limits per person
-(`RUNTIME_MEMORY_MB`, `RUNTIME_CPUS`, `RUNTIME_PIDS`; defaults 2048 MiB, 2 CPUs, 512 processes), and
+(`RUNTIME_MEMORY_MB`, `RUNTIME_PIDS`; defaults 1024 MiB and 512 processes, for all of a person's
+processes together), and
 the egress settings under [Security](#security). `RUNTIME_PREFIX` names
 every sandbox of one instance.
 
@@ -333,11 +336,16 @@ database of its own.
   turn adds whatever the agent's tools use, up to `RUNTIME_MEMORY_MB`.
 - **Start-up:** a person's live state arrives about 1.2-1.7 seconds after their event stream opens,
   the first time included (2 vCPUs, no KVM).
-- **Limits:** each sandbox's own cgroup caps memory, CPU and processes. The gateway sets this up
-  inside its own container at startup (cgroup v2 hosts, which current Ubuntu and Debian are); on a
-  host without cgroup v2 it logs a `WARNING:` and only the per-uid process limit applies. For a server
-  shared with other apps, also cap the whole container (`mem_limit` in `compose.yaml` or Dokploy's
-  resource settings).
+- **Limits:** each person's cgroup caps the memory and processes of all of their sandboxes
+  together; above 80 % of `RUNTIME_MEMORY_MB` the kernel reclaims their caches and slows them down,
+  and at the limit it ends one process tree (the one using the most), not the person's others. CPU is
+  shared by weight (no per-person quota, which would only leave CPUs idle): the gateway's own cgroup
+  weighs four times all sandboxes together and keeps 128 MiB protected from reclaim. The gateway sets
+  this up inside its own container at startup (cgroup v2 hosts, which current Ubuntu and Debian are);
+  on a host without cgroup v2 it logs a `WARNING:` and only the per-uid process limit applies.
+  `RUNTIME_MEMORY_MB` is per person, so for a server shared with other apps also cap the whole
+  container (`mem_limit` in `compose.yaml` or Dokploy's resource settings); sandboxed processes are
+  ended before the gateway when the container runs out of memory.
 
 ## Operations and upgrades
 
@@ -383,8 +391,9 @@ their `/etc/passwd` and `/etc/group`, the egress socket and their MCP socket.
   converted for a process without capabilities: exactly what an ordinary unprivileged Docker container
   may call. `mount`, `unshare`, `setns`, `bpf`, `keyctl` and the like, which Docker allows the Tandem
   container itself because it holds `SYS_ADMIN`, are refused inside every sandbox.
-- **Limits:** each sandbox's own cgroup (`/sandboxes/<name>` in the container's cgroup tree) with
-  `RUNTIME_MEMORY_MB`, `RUNTIME_CPUS` and `RUNTIME_PIDS`, plus a per-uid process limit.
+- **Limits:** each person's cgroup (`/sandboxes/<prefix>-<id>` in the container's cgroup tree) with
+  `RUNTIME_MEMORY_MB` and `RUNTIME_PIDS` for all of their sandboxes, each sandbox a child cgroup ended
+  as a whole when the person runs out of memory (`memory.oom.group`), plus a per-uid process limit.
 
 The sandboxes share the host's kernel, like containers do. What the Tandem container needs to create
 them, and nothing more (`compose.yaml`): `cap_add: [SYS_ADMIN, NET_ADMIN]` (namespaces, mounts and

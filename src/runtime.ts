@@ -1,8 +1,10 @@
-// Runtime controller: one sandbox per person, inside the one Tandem container. crun (an OCI runtime)
-// runs each person's Happy Agent daemon as their own uid in their own PID, network, IPC, UTS,
-// cgroup and mount namespaces over the read-only runtime filesystem, with only their home writable
-// (src/security.ts). The gateway reaches the daemon over its Unix socket in the home; the sandbox
-// reaches the outside only through the gateway's egress and MCP sockets.
+// The person's sandboxes, inside the one Tandem container. Every vendor process runs in a sandbox of
+// its own: crun (an OCI runtime) runs it as the person's own uid in its own PID, network, IPC, UTS,
+// cgroup and mount namespaces over the read-only runtime filesystem, with only the person's home and
+// temporary directory writable (src/security.ts). All of a person's sandboxes are children of the
+// person's cgroup, which holds their limits. A sandbox reaches the outside only through the gateway's
+// egress and MCP sockets.
+import { spawn as spawnProcess, type ChildProcess } from "node:child_process";
 import { createHmac } from "node:crypto";
 import {
   chmodSync,
@@ -10,74 +12,47 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   renameSync,
+  rmdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { constants } from "node:os";
 import { join } from "node:path";
+import type { SandboxSpawnOptions, Sandboxes } from "./agents/types";
 import type { Config } from "./config";
-import { proxyToken, PROXY_TOKEN_ENV } from "./mcp";
 import {
+  GATEWAY_CGROUP,
   groupFile,
   passwdFile,
+  personCgroupLimits,
   RUNTIME_TMPDIR,
   sandboxSeccomp,
   sandboxSpec,
   SANDBOX_EGRESS_PORT,
-  SANDBOX_MCP_PORT,
   type Posture,
 } from "./security";
 
 const HOME = "/home/agent";
-const TOKEN_PATH = `${HOME}/.happy/agent/token`;
-/** tini reaps orphans and forwards signals; the entrypoint then runs the daemon (runtime/). */
-export const DAEMON_ARGS = [
-  "/usr/bin/tini",
-  "-s",
-  "--",
-  "/usr/local/bin/agent-runtime-entrypoint",
-];
-/** One-shot commands get the egress relay first (runtime/with-egress). */
-export const WITH_EGRESS = "/usr/local/bin/with-egress";
+/** In the runtime filesystem (runtime/agent-run): the relays, then the program. */
+export const AGENT_RUN = "/usr/local/bin/agent-run";
+/**
+ * Every sandbox starts with tini (reaps orphans, passes signals on), then agent-run with the
+ * working directory, then the program.
+ */
+export const SANDBOX_INIT = ["/usr/bin/tini", "-s", "--", AGENT_RUN];
 const EXEC_TIMEOUT_MS = 60_000;
-const STOP_TIMEOUT_MS = 30_000;
+/** How long a stopped sandbox may take to end after SIGTERM before it is killed. */
+export const STOP_GRACE_MS = 5_000;
 /** Each person's uid: from here up, one per person, recorded in DATA_DIR/uids.json. */
 export const FIRST_UID = 100_000;
+const CONTROLLERS = "+memory +pids +cpu";
 
-/**
- * The daemon's runs and sign-ins, asked over its own socket inside the runtime: this answers also
- * when the gateway cannot reach the daemon. Read-only; the token goes through a shell builtin to
- * curl's standard input, never into a process's arguments.
- */
-export const ACTIVITY_COMMAND = [
-  "sh",
-  "-c",
-  't=$(cat /home/agent/.happy/agent/token) && for p in projects/chats provider-clis/claude provider-clis/codex provider-clis/grok; do echo "authorization: Bearer $t" | curl -sf -m 10 -H @- --unix-socket /home/agent/.happy/agent/server.sock "http://runtime/v0/$p" && echo || exit 1; done',
-];
-
-/**
- * Claude Code's names for its models ("Opus 5.5" for the `opus` alias), read from the person's own
- * signed-in Claude Code through its stream-json `initialize` request: no turn, nothing sent to a
- * model. Happy's catalog names only the aliases ("Claude Code · Opus").
- */
-export const CLAUDE_MODELS_COMMAND = [
-  "sh",
-  "-c",
-  `cd /tmp && echo '{"type":"control_request","request_id":"models","request":{"subtype":"initialize"}}' | timeout 20 claude -p --input-format stream-json --output-format stream-json --verbose 2>/dev/null | grep -m 1 '"control_response"'`,
-];
-
-/**
- * Whether Google accepts the person's Gemini API key: its free model list, asked from inside the
- * runtime through the egress proxy. The key goes from its file to curl's standard input through a
- * shell builtin, never into a process's arguments. (Happy's provider check cannot vouch for the
- * Antigravity account on an API key: it looks for Antigravity's own sign-in.)
- */
-export const GEMINI_KEY_COMMAND = [
-  "sh",
-  "-c",
-  'k=$(cat /home/agent/.agent-runtime/gemini-api-key) && echo "x-goog-api-key: $k" | curl -sf -m 15 -o /dev/null -H @- "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1"',
-];
+const KEY_RE = /^[0-9a-f]{24}$/;
+const LABEL_RE = /^[a-z0-9-]{1,24}$/;
+const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /** Writes standard input to "$1/$2", owner-only, as the person: no content in argv. */
 const WRITE_FILE_COMMAND = [
@@ -87,51 +62,6 @@ const WRITE_FILE_COMMAND = [
   "write-file",
 ];
 
-export type ExecResult = { exitCode: number; stdout: string };
-
-/**
- * A running runtime as the gateway sees it: the daemon's HTTP API over its Unix socket (`unix`,
- * with `url` as the request base) or over TCP (`url` only, tests). `token` is the daemon's owner
- * token: memory only.
- */
-export type RuntimeHandle = {
-  key: string;
-  url: string;
-  unix?: string;
-  token: string;
-  startedAt: number;
-};
-
-export interface Runtime {
-  /** Starts the runtime when needed; resolves once its daemon token is readable. */
-  ensure(key: string): Promise<RuntimeHandle>;
-  stop(key: string): Promise<void>;
-  restart(key: string): Promise<RuntimeHandle>;
-  /** Keys of runtimes that are running now (rediscovery after a gateway restart). */
-  listRunning(): Promise<string[]>;
-  /** Runs a command as the person, in a sandbox like theirs (their home, the egress proxy). */
-  exec(key: string, cmd: string[]): Promise<ExecResult>;
-  /** Writes one owner-only file into the person's home without argv or environment. */
-  writePrivateFile(
-    key: string,
-    dir: string,
-    name: string,
-    content: string,
-  ): Promise<void>;
-  /**
-   * The daemon's project (GET /v0/projects/chats) and provider CLIs, read inside the runtime, also
-   * when its socket does not answer the gateway. Null when the daemon does not answer.
-   */
-  activity?(key: string): Promise<{ project: any; clis: any[] } | null>;
-  /** Which protections this host provides (checked once). */
-  posture?(): Promise<Posture>;
-  /**
-   * The Unix socket the runtime's MCP proxy requests arrive on (bind-mounted into its sandbox and
-   * nowhere else). The gateway listens there before the runtime starts.
-   */
-  mcpSocket?(key: string): string;
-}
-
 /** Deterministic, non-reversible runtime identity for a person. */
 export function runtimeKey(secret: string, subject: string) {
   return createHmac("sha256", secret)
@@ -140,70 +70,71 @@ export function runtimeKey(secret: string, subject: string) {
     .slice(0, 24);
 }
 
-/**
- * Runs crun; the gateway's only use of it. Replaced by a fake in tests. `cgroups`: each sandbox gets
- * its own cgroup under the delegated tree (delegateCgroups), else crun leaves cgroups alone.
- */
-export type Crun = (
-  args: string[],
-  opts?: { stdin?: Buffer; timeoutMs?: number; log?: string; cgroups?: boolean },
-) => Promise<{ code: number; stdout: string; stderr: string }>;
+type CrunResult = { code: number; stdout: string; stderr: string };
 
-export const crun: Crun = async (args, opts = {}) => {
-  const manager = opts.cgroups ? "cgroupfs" : "disabled";
-  const p = Bun.spawn(["crun", `--cgroup-manager=${manager}`, ...args], {
-    stdin: opts.stdin ?? "ignore",
-    stdout: opts.log ? Bun.file(opts.log) : "pipe",
-    stderr: opts.log ? Bun.file(opts.log) : "pipe",
-  });
-  const timer = opts.timeoutMs
-    ? setTimeout(() => p.kill("SIGKILL"), opts.timeoutMs)
-    : undefined;
-  const [stdout, stderr, code] = await Promise.all([
-    opts.log ? "" : new Response(p.stdout as ReadableStream).text(),
-    opts.log ? "" : new Response(p.stderr as ReadableStream).text(),
-    p.exited,
-  ]);
-  clearTimeout(timer);
-  return { code, stdout, stderr };
-};
+/** The only environment crun itself gets: it never needs the gateway's (and must not pass it on). */
+const crunEnv = () => ({
+  PATH:
+    process.env.PATH ||
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+});
 
 /**
  * Makes this container's cgroup v2 tree writable and moves its own processes into a leaf, so every
- * sandbox can get its own cgroup with memory, CPU and process limits, the way Docker-in-Docker
- * does. Needs only the SYS_ADMIN and AppArmor settings the sandboxes need anyway. Resolves to null,
- * or to why the host cannot (cgroup v1, a controller missing).
+ * person can get a cgroup with memory and process limits, the way Docker-in-Docker does. Needs only
+ * the SYS_ADMIN and AppArmor settings the sandboxes need anyway. Resolves to null, or to why the host
+ * cannot (cgroup v1, a controller missing).
  */
 export async function delegateCgroups(
   root = "/sys/fs/cgroup",
 ): Promise<string | null> {
   if (!existsSync(join(root, "cgroup.controllers")))
     return "this host does not use cgroup v2";
-  const have = readFileSync(join(root, "cgroup.controllers"), "utf8").split(/\s+/);
+  const have = readFileSync(join(root, "cgroup.controllers"), "utf8").split(
+    /\s+/,
+  );
   const missing = ["memory", "pids", "cpu"].filter((c) => !have.includes(c));
-  if (missing.length) return `the cgroup controllers ${missing.join(", ")} are not available`;
+  if (missing.length)
+    return `the cgroup controllers ${missing.join(", ")} are not available`;
   const remount = Bun.spawnSync(["mount", "-o", "remount,rw", root]);
   if (remount.exitCode !== 0)
     return `cannot write ${root}: ${remount.stderr.toString().trim()}`;
   // Processes may not live in a cgroup whose children have controllers: move them to a leaf.
   mkdirSync(join(root, "gateway"), { recursive: true });
-  const enable = "+memory +pids +cpu";
   for (let attempt = 0; ; attempt++) {
-    for (const pid of readFileSync(join(root, "cgroup.procs"), "utf8").split("\n"))
+    for (const pid of readFileSync(join(root, "cgroup.procs"), "utf8").split(
+      "\n",
+    ))
       if (pid)
         try {
           writeFileSync(join(root, "gateway", "cgroup.procs"), pid);
         } catch {} // exited meanwhile
     try {
-      writeFileSync(join(root, "cgroup.subtree_control"), enable);
+      writeFileSync(join(root, "cgroup.subtree_control"), CONTROLLERS);
       break;
     } catch (e) {
-      if (attempt >= 5) return `cannot enable cgroup controllers: ${(e as Error).message}`;
+      if (attempt >= 5)
+        return `cannot enable cgroup controllers: ${(e as Error).message}`;
     }
   }
+  // Where the kernel offers them; the gateway works without.
+  writeCgroupFiles(join(root, "gateway"), GATEWAY_CGROUP, () => true);
   mkdirSync(join(root, "sandboxes"), { recursive: true });
-  writeFileSync(join(root, "sandboxes", "cgroup.subtree_control"), enable);
+  writeFileSync(join(root, "sandboxes", "cgroup.subtree_control"), CONTROLLERS);
   return null;
+}
+
+function writeCgroupFiles(
+  dir: string,
+  files: Record<string, string>,
+  optional: (name: string) => boolean,
+) {
+  for (const [name, value] of Object.entries(files))
+    try {
+      writeFileSync(join(dir, name), value);
+    } catch (e) {
+      if (!optional(name)) throw e;
+    }
 }
 
 /** The first uid at or above FIRST_UID that no person holds. */
@@ -214,33 +145,81 @@ export function nextUid(taken: Iterable<number>): number {
   return uid;
 }
 
-export class SandboxRuntime implements Runtime {
+export type RuntimeOptions = {
+  log?: (...args: unknown[]) => void;
+  /** The crun program (tests: a stand-in). */
+  crun?: string;
+  /** The cgroup v2 tree of this container (tests: a plain directory). */
+  cgroupRoot?: string;
+  /**
+   * Delete the sandboxes and cgroups of this prefix that are still there at setup (a previous
+   * gateway run). The gateway does; operator commands next to it (src/cli.ts) must not.
+   */
+  sweep?: boolean;
+  /** STOP_GRACE_MS (tests). */
+  stopGraceMs?: number;
+};
+
+/** A sandbox this runtime started and that is not gone yet. */
+type Box = {
+  key: string;
+  id: string;
+  /** Its cgroup (a child of the person's), when cgroups are delegated. */
+  cgroup?: string;
+  /** crun runs for it; its own kill, for a sandbox crun has not created yet. */
+  killCrun?: (signal: NodeJS.Signals) => void;
+  exited: boolean;
+  stopRequested: boolean;
+  stopTimer?: ReturnType<typeof setTimeout>;
+  released?: Promise<void>;
+  /** Resolves once the sandbox is deleted and the person's state is updated. */
+  gone: Promise<void>;
+  done(): void;
+};
+
+export class SandboxRuntime implements Sandboxes {
   private ready?: Promise<void>;
-  /** Per-sandbox cgroups available (delegateCgroups), and why not. */
+  /** Per-person cgroups available (delegateCgroups). */
   private cgroups = false;
   private warnings: string[] = [];
   private seccomp = sandboxSeccomp();
-  private tokens = new Map<string, string>();
-  private started = new Map<string, number>();
+  /** Sandboxes started by this runtime that are not gone yet, by person. */
+  private boxes = new Map<string, Map<string, Box>>();
   private queues = new Map<string, Promise<unknown>>();
   private uidLock: Promise<unknown> = Promise.resolve();
   private seq = 0;
+  private closed = false;
+  private log: (...args: unknown[]) => void;
+  private crunBin: string;
+  private cgroupRoot: string;
+  private sweep: boolean;
+  private grace: number;
 
   constructor(
     private cfg: Config,
-    private log: (...args: unknown[]) => void = console.log,
-    private run: Crun = crun,
-  ) {}
+    opts: RuntimeOptions = {},
+  ) {
+    this.log = opts.log ?? console.log;
+    this.crunBin = opts.crun ?? "crun";
+    this.cgroupRoot = opts.cgroupRoot ?? "/sys/fs/cgroup";
+    this.sweep = opts.sweep ?? true;
+    this.grace = opts.stopGraceMs ?? STOP_GRACE_MS;
+  }
 
-  private id = (key: string) => `${this.cfg.runtimePrefix}-${key}`;
+  private prefix = () => `${this.cfg.runtimePrefix}-`;
   private home = (key: string) => join(this.cfg.dataDir, "homes", key);
   private runDir = (key: string) => join(this.cfg.dataDir, "run", key);
   private bundles = () => join(this.cfg.dataDir, "bundles");
   private tmp = (key: string) => join(this.cfg.dataDir, "tmp", key);
+  private probeHome = () => join(this.cfg.dataDir, "run", "probe-home");
+  /** The person's cgroup, as a path under the cgroup root. */
+  private personCgroup = (key: string) => `/sandboxes/${this.prefix()}${key}`;
   mcpSocket = (key: string) => join(this.runDir(key), "mcp.sock");
   egressSocket = () => join(this.cfg.dataDir, "run", "egress.sock");
-  daemonSocket = (key: string) =>
-    join(this.home(key), ".happy", "agent", "server.sock");
+
+  homeOf(key: string) {
+    return this.home(checkKey(key));
+  }
 
   posture(): Promise<Posture> {
     return this.setup().then(() => ({
@@ -252,8 +231,9 @@ export class SandboxRuntime implements Runtime {
   }
 
   /**
-   * Checks once that this container can create sandboxes (compose.yaml grants it SYS_ADMIN and
-   * NET_ADMIN and turns AppArmor off for it), with a throwaway sandbox that runs `true`.
+   * Once: the directories, the cgroup tree, what a previous gateway run left, and a check that this
+   * container can create sandboxes (compose.yaml grants it SYS_ADMIN and NET_ADMIN and turns AppArmor
+   * off for it), with a throwaway sandbox that runs `true`.
    */
   private setup(): Promise<void> {
     return (this.ready ??= (async () => {
@@ -263,19 +243,16 @@ export class SandboxRuntime implements Runtime {
           mode: 0o711,
         });
       chmodSync(join(this.cfg.dataDir, "run"), 0o711);
-      if (
-        !existsSync(join(this.cfg.runtimeRootfs, "usr/local/bin/happy-agent"))
-      )
+      if (!existsSync(join(this.cfg.runtimeRootfs, AGENT_RUN)))
         throw new Error(`no runtime filesystem at ${this.cfg.runtimeRootfs}`);
       const why = await this.delegate();
       this.cgroups = why === null;
       if (why)
         this.warnings.push(
-          `no per-person memory, CPU and process limits: ${why}. Limit the whole container instead.`,
+          `no per-person memory and process limits: ${why}. Limit the whole container instead.`,
         );
-      const probe = await this.oneShot("probe", FIRST_UID - 1, ["true"], {
-        home: null,
-      });
+      if (this.sweep) await this.sweepLeftovers();
+      const probe = await this.oneShot(null, ["true"]);
       if (probe.code !== 0)
         throw new Error(
           `this container cannot create sandboxes (${probe.stderr.trim().slice(0, 200)}). ` +
@@ -287,17 +264,41 @@ export class SandboxRuntime implements Runtime {
     }));
   }
 
-  /** Overridden in tests, which run without a cgroup tree. */
+  /** Overridden in tests, which have no cgroup tree to delegate. */
   protected delegate() {
-    return delegateCgroups();
+    return delegateCgroups(this.cgroupRoot);
   }
 
-  /** crun with this runtime's cgroup setting. */
-  private crun(args: string[], opts: Parameters<Crun>[1] = {}) {
-    return this.run(args, { ...opts, cgroups: this.cgroups });
+  /** crun with this runtime's cgroup setting; output collected. `box`: the one-shot it runs. */
+  private async crun(
+    args: string[],
+    opts: { stdin?: Buffer; timeoutMs?: number; box?: Box } = {},
+  ): Promise<CrunResult> {
+    const p = Bun.spawn([this.crunBin, this.manager(), ...args], {
+      stdin: opts.stdin ?? "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+      env: crunEnv(),
+    });
+    if (opts.box) this.started(opts.box, (signal) => p.kill(signal));
+    const timer = opts.timeoutMs
+      ? setTimeout(() => p.kill("SIGKILL"), opts.timeoutMs)
+      : undefined;
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(p.stdout).text(),
+      new Response(p.stderr).text(),
+      p.exited,
+    ]);
+    clearTimeout(timer);
+    return { code, stdout, stderr };
   }
 
-  private serial<T>(key: string, job: () => Promise<T>): Promise<T> {
+  /** With delegated cgroups crun creates each sandbox's cgroup; otherwise it leaves cgroups alone. */
+  private manager() {
+    return `--cgroup-manager=${this.cgroups ? "cgroupfs" : "disabled"}`;
+  }
+
+  private serial<T>(key: string, job: () => Promise<T> | T): Promise<T> {
     const run = (this.queues.get(key) ?? Promise.resolve()).then(job, job);
     const tail = run.then(
       () => {},
@@ -329,7 +330,7 @@ export class SandboxRuntime implements Runtime {
     return run;
   }
 
-  /** Home, passwd/group and the MCP socket's owner, before the person's sandbox starts. */
+  /** Home, passwd/group, temporary directory, MCP socket owner and cgroup, before a sandbox starts. */
   private async prepare(key: string, uid: number) {
     const home = this.home(key);
     if (!existsSync(home)) mkdirSync(home, { mode: 0o700 });
@@ -342,81 +343,177 @@ export class SandboxRuntime implements Runtime {
     chmodSync(home, 0o700);
     const run = this.runDir(key);
     mkdirSync(run, { recursive: true, mode: 0o711 });
-    writeFileSync(join(run, "passwd"), passwdFile(uid), { mode: 0o644 });
-    writeFileSync(join(run, "group"), groupFile(uid), { mode: 0o644 });
-    // A fresh temporary directory for this start (the last start's unpacked files are gone).
-    this.freshTmp(key, uid);
+    // Running sandboxes have these mounted: rewriting one would show them an empty file meanwhile.
+    for (const [name, text] of [
+      ["passwd", passwdFile(uid)],
+      ["group", groupFile(uid)],
+    ] as const) {
+      const file = join(run, name);
+      if (!existsSync(file) || readFileSync(file, "utf8") !== text)
+        writeFileSync(file, text, { mode: 0o644 });
+    }
+    // Shared by the person's sandboxes; removed when the last one ends (release).
+    const tmp = this.tmp(key);
+    if (!existsSync(tmp)) {
+      mkdirSync(tmp, { mode: 0o700 });
+      // Only root can hand a directory to another user (the gateway runs as root in its container).
+      if (process.getuid?.() === 0) chownSync(tmp, uid, uid);
+    }
     // The gateway listens on it (listenMcp) before the start; only the person may connect.
     if (existsSync(this.mcpSocket(key))) {
-      chownSync(this.mcpSocket(key), uid, uid);
+      if (process.getuid?.() === 0) chownSync(this.mcpSocket(key), uid, uid);
       chmodSync(this.mcpSocket(key), 0o600);
+    }
+    this.ensurePersonCgroup(key);
+  }
+
+  /** The person's cgroup with their limits, created with their first sandbox. */
+  private ensurePersonCgroup(key: string) {
+    if (!this.cgroups) return;
+    const dir = join(this.cgroupRoot, this.personCgroup(key));
+    if (existsSync(dir)) return;
+    mkdirSync(dir, { recursive: true });
+    writeCgroupFiles(
+      dir,
+      personCgroupLimits(this.cfg.runtimeMemoryMb, this.cfg.runtimePids),
+      (name) => name === "memory.swap.max", // only with swap accounting
+    );
+    writeFileSync(join(dir, "cgroup.subtree_control"), CONTROLLERS);
+  }
+
+  /**
+   * Removes a cgroup, children first. `kill`: ends whatever still runs in it (leftovers, stopAll);
+   * otherwise a cgroup that is still in use (a sandbox of another process, src/cli.ts) is left.
+   */
+  private async removeCgroup(dir: string, kill: boolean): Promise<void> {
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw e;
+    }
+    for (const e of entries)
+      if (e.isDirectory()) await this.removeCgroup(join(dir, e.name), kill);
+    if (kill)
+      try {
+        writeFileSync(join(dir, "cgroup.kill"), "1");
+      } catch {
+        // Kernels before 5.14 have no cgroup.kill.
+        for (const pid of readFileSync(join(dir, "cgroup.procs"), "utf8").split("\n"))
+          if (pid) process.kill(Number(pid), "SIGKILL");
+      }
+    for (const until = Date.now() + (kill ? 5_000 : 1_000); ; await Bun.sleep(20)) {
+      try {
+        return rmdirSync(dir);
+      } catch (e) {
+        const code = (e as NodeJS.ErrnoException).code;
+        if (code === "ENOENT") return;
+        // cgroupfs answers EBUSY while processes remain; only a plain directory (tests) is ENOTEMPTY.
+        if (code === "ENOTEMPTY") return rmSync(dir, { recursive: true, force: true });
+        if (code !== "EBUSY") throw e;
+        if (Date.now() > until) {
+          if (kill) throw e;
+          return;
+        }
+      }
     }
   }
 
-  /** An empty temporary directory for the person, owner-only. rmSync does not follow links. */
-  private freshTmp(key: string, uid: number) {
-    const tmp = this.tmp(key);
-    rmSync(tmp, { recursive: true, force: true });
-    mkdirSync(tmp, { mode: 0o700 });
-    // Only root can hand a directory to another user (the gateway runs as root in its container).
-    if (process.getuid?.() === 0) chownSync(tmp, uid, uid);
+  /** Records a new sandbox of `key` (inside its serial job, so the person's state stays). */
+  private hold(key: string, label: string): Box {
+    if (this.closed) throw new Error("the sandboxes are shutting down");
+    const name = `${label}-${process.pid}-${++this.seq}`;
+    let done!: () => void;
+    const gone = new Promise<void>((resolve) => (done = resolve));
+    const box: Box = {
+      key,
+      id: `${this.prefix()}${key}-${name}`,
+      cgroup: this.cgroups ? `${this.personCgroup(key)}/${name}` : undefined,
+      exited: false,
+      stopRequested: false,
+      gone,
+      done,
+    };
+    let mine = this.boxes.get(key);
+    if (!mine) this.boxes.set(key, (mine = new Map()));
+    mine.set(box.id, box);
+    return box;
   }
 
-  /** The person's sandbox spec (sandbox `name`), for their daemon or a one-shot command. */
+  /**
+   * After the sandbox's crun exited: delete it (crun run deletes its own; this catches a killed
+   * crun's), and when it was the person's last, remove their temporary files and their cgroup.
+   */
+  private release(box: Box): Promise<void> {
+    return (box.released ??= (async () => {
+      box.exited = true;
+      clearTimeout(box.stopTimer);
+      await this.crun(["delete", "-f", box.id]).catch(() => {});
+      rmSync(join(this.bundles(), box.id), { recursive: true, force: true });
+      await this.serial(box.key, async () => {
+        const mine = this.boxes.get(box.key);
+        mine?.delete(box.id);
+        if (mine?.size) return;
+        this.boxes.delete(box.key);
+        await this.forget(box.key, false);
+      });
+      box.done();
+    })());
+  }
+
+  /** No sandbox of the person runs: their temporary directory and cgroup go. */
+  private async forget(key: string, kill: boolean) {
+    rmSync(this.tmp(key), { recursive: true, force: true });
+    if (this.cgroups)
+      await this.removeCgroup(join(this.cgroupRoot, this.personCgroup(key)), kill).catch(
+        (e) => this.log(`cannot remove the cgroup of ${key}: ${(e as Error).message}`),
+      );
+  }
+
+  /** The sandbox's spec: `key` null is the setup probe (nobody's home). */
   private spec(
-    name: string,
     key: string | null,
     uid: number,
+    box: Box,
     args: string[],
-    daemon: boolean,
+    opts: { env?: Record<string, string>; cwd?: string; mcp: boolean },
   ) {
+    const mcp = key !== null && opts.mcp && existsSync(this.mcpSocket(key));
     return sandboxSpec({
       uid,
       rootfs: this.cfg.runtimeRootfs,
-      home: key ? this.home(key) : join(this.cfg.dataDir, "run", "probe-home"),
-      tmp: key ? this.tmp(key) : join(this.cfg.dataDir, "run", "probe-home"),
+      home: key ? this.home(key) : this.probeHome(),
+      tmp: key ? this.tmp(key) : this.probeHome(),
       seccomp: this.seccomp,
-      cgroup: this.cgroups
-        ? {
-            path: `/sandboxes/${name}`,
-            memoryMb: this.cfg.runtimeMemoryMb,
-            cpus: this.cfg.runtimeCpus,
-          }
-        : undefined,
+      cgroup: box.cgroup ? { path: box.cgroup } : undefined,
       passwd: key ? join(this.runDir(key), "passwd") : "/etc/passwd",
       group: key ? join(this.runDir(key), "group") : "/etc/group",
       egressSocket: this.egressSocket(),
-      mcpSocket:
-        key && daemon && existsSync(this.mcpSocket(key))
-          ? this.mcpSocket(key)
-          : undefined,
-      args,
+      mcpSocket: mcp ? this.mcpSocket(key!) : undefined,
+      // agent-run makes the working directory as the person (the home always exists).
+      args: [...SANDBOX_INIT, opts.cwd ?? HOME, ...args],
+      cwd: HOME,
       pids: this.cfg.runtimePids,
+      // Only this: never the gateway's own environment.
       env: {
         HOME,
         TMPDIR: RUNTIME_TMPDIR,
-        DISABLE_AUTOUPDATER: "1",
-        AGY_CLI_DISABLE_AUTO_UPDATE: "true",
-        // Every connection out goes through the egress relay to the gateway's Smokescreen.
+        // Every connection out goes through the egress relay to the gateway's Smokescreen;
+        // loopback (the MCP relay) must not.
         HTTPS_PROXY: `http://127.0.0.1:${SANDBOX_EGRESS_PORT}`,
         HTTP_PROXY: `http://127.0.0.1:${SANDBOX_EGRESS_PORT}`,
         https_proxy: `http://127.0.0.1:${SANDBOX_EGRESS_PORT}`,
         http_proxy: `http://127.0.0.1:${SANDBOX_EGRESS_PORT}`,
         NO_PROXY: "127.0.0.1,localhost",
         no_proxy: "127.0.0.1,localhost",
-        ...(key && daemon
-          ? {
-              MCP_PROXY_URL: `http://127.0.0.1:${SANDBOX_MCP_PORT}/mcp/${key}`,
-              // Only useful on this person's own MCP socket (src/mcp.ts).
-              [PROXY_TOKEN_ENV]: proxyToken(this.cfg.serviceSecret, key),
-            }
-          : {}),
+        ...opts.env,
       },
     });
   }
 
-  private writeBundle(name: string, spec: object) {
-    const dir = join(this.bundles(), name);
+  private writeBundle(id: string, spec: object) {
+    const dir = join(this.bundles(), id);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     writeFileSync(join(dir, "config.json"), JSON.stringify(spec), {
       mode: 0o600,
@@ -424,191 +521,179 @@ export class SandboxRuntime implements Runtime {
     return dir;
   }
 
-  /** A command in a throwaway sandbox of the person (or of nobody, `home: null`); stdout back. */
-  private async oneShot(
+  /** A sandbox for `args` with stdio piped; see Sandboxes.spawn. */
+  async spawn(
     key: string,
-    uid: number,
-    cmd: string[],
-    opts: { home?: null; stdin?: Buffer } = {},
-  ) {
-    const name = `${this.cfg.runtimePrefix}-x${process.pid}-${++this.seq}`;
-    const real = opts.home !== null;
-    if (!real)
-      mkdirSync(join(this.cfg.dataDir, "run", "probe-home"), {
-        recursive: true,
-      });
-    else if (!existsSync(this.tmp(key))) this.freshTmp(key, uid);
-    const bundle = this.writeBundle(
-      name,
-      this.spec(name, real ? key : null, uid, [WITH_EGRESS, ...cmd], false),
-    );
-    try {
-      return await this.crun(
-        ["run", "--no-pivot", "--no-new-keyring", "--bundle", bundle, name],
-        { stdin: opts.stdin, timeoutMs: EXEC_TIMEOUT_MS },
-      );
-    } finally {
-      await this.crun(["delete", "-f", name]).catch(() => {});
-      rmSync(bundle, { recursive: true, force: true });
-    }
-  }
-
-  private async status(key: string): Promise<string | null> {
-    const r = await this.crun(["state", this.id(key)]);
-    if (r.code !== 0) return null;
-    try {
-      return JSON.parse(r.stdout).status ?? null;
-    } catch {
-      return null;
-    }
-  }
-
-  ensure(key: string): Promise<RuntimeHandle> {
-    return this.serial(key, () => this.ensureNow(key));
-  }
-
-  private async ensureNow(key: string): Promise<RuntimeHandle> {
+    args: string[],
+    opts: SandboxSpawnOptions = {},
+  ): Promise<ChildProcess> {
+    checkKey(key);
+    checkCommand(args, opts.env, opts.cwd);
+    const label = opts.label ?? "proc";
+    if (!LABEL_RE.test(label))
+      throw new Error(`invalid sandbox label "${label}"`);
     await this.setup();
     const uid = await this.uidOf(key);
-    if ((await this.status(key)) !== "running") {
-      // A sandbox that stopped (crashed, or stopped outside the gateway) leaves its state behind.
-      await this.crun(["delete", "-f", this.id(key)]).catch(() => {});
+    const box = await this.serial(key, async () => {
       await this.prepare(key, uid);
-      // The daemon writes a new owner token when it starts: the previous one must not be read.
-      this.tokens.delete(key);
-      await this.oneShot(key, uid, ["rm", "-f", TOKEN_PATH]);
+      return this.hold(key, label);
+    });
+    let child: ChildProcess;
+    try {
       const bundle = this.writeBundle(
-        this.id(key),
-        this.spec(this.id(key), key, uid, DAEMON_ARGS, true),
+        box.id,
+        this.spec(key, uid, box, args, {
+          env: opts.env,
+          cwd: opts.cwd,
+          mcp: true,
+        }),
       );
-      const log = join(this.runDir(key), "daemon.log");
-      const r = await this.crun(
+      child = spawnProcess(
+        this.crunBin,
         [
+          this.manager(),
           "run",
-          "--detach",
           "--no-pivot",
           "--no-new-keyring",
           "--bundle",
           bundle,
-          this.id(key),
+          box.id,
         ],
-        { log },
+        { stdio: ["pipe", "pipe", "pipe"], env: crunEnv() },
       );
-      if (r.code !== 0) {
-        const tail = existsSync(log)
-          ? readFileSync(log, "utf8").slice(-300)
-          : "";
-        throw new Error(`runtime did not start: ${tail.trim()}`);
-      }
-      this.started.set(key, Date.now());
-    }
-    return this.handle(key, uid);
-  }
-
-  private async handle(key: string, uid: number): Promise<RuntimeHandle> {
-    const token = await this.token(key, uid);
-    const socket = this.daemonSocket(key);
-    // The socket lives in the person's home, so it is theirs: refuse anything else at that path.
-    for (const deadline = Date.now() + 120_000; ; await Bun.sleep(100)) {
-      const st = existsSync(socket) ? lstatSync(socket) : null;
-      if (st?.isSocket() && st.uid === uid) break;
-      if (st && !st.isSocket())
-        throw new Error("the daemon socket is not a socket");
-      if (Date.now() > deadline)
-        throw new Error("the daemon socket did not appear");
-    }
-    return {
-      key,
-      url: "http://runtime",
-      unix: socket,
-      token,
-      startedAt: this.started.get(key) ?? Date.now(),
-    };
-  }
-
-  /** Reads the daemon token once per start, as the person; kept only in memory. */
-  private async token(key: string, uid: number): Promise<string> {
-    const cached = this.tokens.get(key);
-    if (cached) return cached;
-    for (const deadline = Date.now() + 120_000; Date.now() < deadline;) {
-      const r = await this.oneShot(key, uid, ["cat", TOKEN_PATH]).catch(
-        () => null,
+      const killCrun = child.kill.bind(child);
+      this.started(box, (signal) => void killCrun(signal));
+      await new Promise<void>((resolve, reject) =>
+        child.once("spawn", resolve).once("error", reject),
       );
-      const token = r?.stdout.trim() ?? "";
-      if (r?.code === 0 && /^[A-Za-z0-9_-]{43}$/.test(token)) {
-        this.tokens.set(key, token);
-        return token;
-      }
-      if ((await this.status(key)) !== "running")
-        throw new Error("runtime stopped before its daemon was ready");
-      await Bun.sleep(150);
+    } catch (e) {
+      await this.release(box);
+      throw e;
     }
-    throw new Error("runtime daemon token did not appear");
+    this.adopt(box, child);
+    return child;
   }
 
-  stop(key: string) {
-    return this.serial(key, async () => {
-      this.tokens.delete(key);
-      this.started.delete(key);
-      const id = this.id(key);
-      if ((await this.status(key)) === "running") {
-        // Graceful first (tini passes SIGTERM to the daemon), then killed.
-        await this.crun(["kill", id, "TERM"]);
-        for (
-          const until = Date.now() + STOP_TIMEOUT_MS;
-          Date.now() < until && (await this.status(key)) === "running";
-          await Bun.sleep(250)
-        );
-        if ((await this.status(key)) === "running")
-          await this.crun(["kill", "--all", id, "KILL"]);
+  /**
+   * Makes crun's process stand for the sandbox: kill() stops the sandbox, and `exit`, `close`,
+   * exitCode and signalCode appear once it is gone.
+   */
+  private adopt(box: Box, child: ChildProcess) {
+    let gone = false;
+    let exitCode: number | null = null;
+    let signalCode: NodeJS.Signals | null = null;
+    for (const [name, set] of [
+      ["exitCode", (v: number | null) => (exitCode = v)],
+      ["signalCode", (v: NodeJS.Signals | null) => (signalCode = v)],
+    ] as const)
+      Object.defineProperty(child, name, {
+        configurable: true,
+        enumerable: true,
+        get: () =>
+          gone ? (name === "exitCode" ? exitCode : signalCode) : null,
+        set,
+      });
+    const emit = child.emit.bind(child);
+    const held: (string | symbol)[] = [];
+    child.emit = ((event: string | symbol, ...rest: unknown[]) => {
+      if (gone || (event !== "exit" && event !== "close"))
+        return emit(event, ...rest);
+      held.push(event);
+      void this.release(box).then(() => {
+        if (gone) return;
+        gone = true;
+        for (const e of held) emit(e, exitCode, signalCode);
+      });
+      return true;
+    }) as typeof child.emit;
+    child.kill = ((signal?: NodeJS.Signals | number) => {
+      if (box.exited) return false;
+      if (signal === 0) return true; // only asks whether it runs
+      const name = signalName(signal);
+      (child as { killed: boolean }).killed = true;
+      if (name === "KILL") void this.killNow(box);
+      else if (name === "TERM") void this.stop(box);
+      else void this.crun(["kill", box.id, name]);
+      return true;
+    }) as typeof child.kill;
+  }
+
+  /** crun now runs for `box`: a stop asked for meanwhile starts now. */
+  private started(box: Box, killCrun: (signal: NodeJS.Signals) => void) {
+    box.killCrun = killCrun;
+    if (box.stopRequested) void this.stop(box);
+  }
+
+  /**
+   * TERM to the sandbox (tini passes it to the program), KILL after STOP_GRACE_MS. TERM is repeated
+   * while crun has not created the sandbox yet (a stop right after the start).
+   */
+  private stop(box: Box): Promise<void> {
+    box.stopRequested = true;
+    if (box.killCrun && !box.exited && !box.stopTimer) {
+      box.stopTimer = setTimeout(() => void this.killNow(box), this.grace);
+      void (async () => {
+        for (const until = Date.now() + this.grace; !box.exited && Date.now() < until; ) {
+          if ((await this.crun(["kill", box.id, "TERM"])).code === 0) return;
+          await Bun.sleep(50);
+        }
+      })();
+    }
+    return box.gone;
+  }
+
+  /** KILL to the sandbox's init ends its whole PID namespace. */
+  private async killNow(box: Box) {
+    if (box.exited) return;
+    const r = await this.crun(["kill", box.id, "KILL"]);
+    // crun has not created it yet (or refused): end crun; deleting the sandbox ends the rest.
+    if (r.code !== 0 && !box.exited) box.killCrun?.("SIGKILL");
+  }
+
+  /** One command in a throwaway sandbox of the person (`key` null: the setup probe), output back. */
+  private async oneShot(
+    key: string | null,
+    args: string[],
+    opts: { env?: Record<string, string>; cwd?: string; stdin?: Buffer } = {},
+  ) {
+    const uid = key ? await this.uidOf(key) : FIRST_UID - 1;
+    const owner = key ?? "probe";
+    const box = await this.serial(owner, async () => {
+      if (key) await this.prepare(key, uid);
+      else {
+        mkdirSync(this.probeHome(), { recursive: true });
+        this.ensurePersonCgroup(owner);
       }
-      await this.crun(["delete", "-f", id]).catch(() => {});
-      rmSync(join(this.bundles(), id), { recursive: true, force: true });
-      // The unpacked Claude Code and other temporary files take disk only while it runs.
-      rmSync(this.tmp(key), { recursive: true, force: true });
+      return this.hold(owner, key ? "exec" : "check");
     });
-  }
-
-  async restart(key: string) {
-    await this.stop(key);
-    return this.ensure(key);
-  }
-
-  async listRunning() {
-    const r = await this.crun(["list", "--format", "json"]);
-    if (r.code !== 0) return [];
-    const prefix = `${this.cfg.runtimePrefix}-`;
-    let list: { id: string; status: string }[] = [];
     try {
-      list = JSON.parse(r.stdout || "[]") ?? [];
-    } catch {}
-    return list
-      .filter((c) => c.status === "running" && c.id.startsWith(prefix))
-      .map((c) => c.id.slice(prefix.length))
-      .filter((k) => /^[0-9a-f]{24}$/.test(k));
-  }
-
-  async exec(key: string, cmd: string[]): Promise<ExecResult> {
-    await this.setup();
-    const r = await this.oneShot(key, await this.uidOf(key), cmd);
-    return { exitCode: r.code, stdout: r.stdout };
-  }
-
-  async activity(key: string) {
-    const r = await this.exec(key, ACTIVITY_COMMAND).catch(() => null);
-    if (r?.exitCode !== 0) return null;
-    try {
-      const [project, ...clis] = r.stdout
-        .trim()
-        .split("\n")
-        .map((line) => JSON.parse(line));
-      return {
-        project: project.project,
-        clis: clis.map((c) => c.providerCli),
-      };
-    } catch {
-      return null;
+      const bundle = this.writeBundle(
+        box.id,
+        this.spec(key, uid, box, args, {
+          env: opts.env,
+          cwd: opts.cwd,
+          mcp: false,
+        }),
+      );
+      return await this.crun(
+        ["run", "--no-pivot", "--no-new-keyring", "--bundle", bundle, box.id],
+        { stdin: opts.stdin, timeoutMs: EXEC_TIMEOUT_MS, box },
+      );
+    } finally {
+      await this.release(box);
     }
+  }
+
+  async exec(
+    key: string,
+    args: string[],
+    opts: { env?: Record<string, string>; stdin?: Buffer; cwd?: string } = {},
+  ) {
+    checkKey(key);
+    checkCommand(args, opts.env, opts.cwd);
+    await this.setup();
+    const r = await this.oneShot(key, args, opts);
+    return { exitCode: r.code, stdout: r.stdout, stderr: r.stderr };
   }
 
   async writePrivateFile(
@@ -619,14 +704,151 @@ export class SandboxRuntime implements Runtime {
   ) {
     if (!dir.startsWith(`${HOME}/`) || !/^[A-Za-z0-9._-]+$/.test(name))
       throw new Error("writePrivateFile: path outside the runtime home");
-    await this.setup();
-    const [file, ...args] = WRITE_FILE_COMMAND;
-    const r = await this.oneShot(
-      key,
-      await this.uidOf(key),
-      [file!, ...args, dir, name],
-      { stdin: Buffer.from(content) },
-    );
-    if (r.code !== 0) throw new Error(`writing ${name} failed`);
+    const r = await this.exec(key, [...WRITE_FILE_COMMAND, dir, name], {
+      stdin: Buffer.from(content),
+    });
+    if (r.exitCode !== 0) throw new Error(`writing ${name} failed`);
   }
+
+  /** Sandboxes of this instance that crun knows of, running or not. */
+  async list(): Promise<{ id: string; key: string | null; status: string }[]> {
+    const r = await this.crun(["list", "--format", "json"]);
+    if (r.code !== 0) return [];
+    let all: { id: string; status: string }[] = [];
+    try {
+      all = JSON.parse(r.stdout || "[]") ?? [];
+    } catch {}
+    const prefix = this.prefix();
+    return all
+      .filter((c) => c.id.startsWith(prefix))
+      .map((c) => {
+        const key = c.id.slice(prefix.length, prefix.length + 24);
+        return {
+          id: c.id,
+          key:
+            KEY_RE.test(key) && c.id[prefix.length + 24] === "-" ? key : null,
+          status: c.status,
+        };
+      });
+  }
+
+  /** Sandboxes crun knows of whose id starts with `start` and that this runtime did not start. */
+  private async strays(start: string) {
+    const mine = new Set(
+      [...this.boxes.values()].flatMap((m) => [...m.keys()]),
+    );
+    return (await this.list())
+      .map((c) => c.id)
+      .filter((id) => id.startsWith(start) && !mine.has(id));
+  }
+
+  /** A sandbox started elsewhere (another process): TERM, then deleted (KILL) after the grace. */
+  private async stopStray(id: string) {
+    await this.crun(["kill", id, "TERM"]);
+    for (
+      const until = Date.now() + this.grace;
+      Date.now() < until;
+      await Bun.sleep(100)
+    ) {
+      const r = await this.crun(["state", id]);
+      if (r.code !== 0 || !r.stdout.includes('"running"')) break;
+    }
+    await this.crun(["delete", "-f", id]).catch(() => {});
+  }
+
+  /** Stops every sandbox of the person (sign-out, an operator's stop); their cgroup goes with them. */
+  async stopAll(key: string) {
+    checkKey(key);
+    await this.setup();
+    const mine = [...(this.boxes.get(key)?.values() ?? [])];
+    const strays = await this.strays(`${this.prefix()}${key}-`);
+    await Promise.all([
+      ...mine.map((b) => this.stop(b)),
+      ...strays.map((id) => this.stopStray(id)),
+    ]);
+    await this.serial(key, async () => {
+      if (!this.boxes.get(key)?.size) await this.forget(key, true);
+    });
+  }
+
+  /** Shutdown: stops every sandbox of this instance and starts no more. */
+  async stopEverything() {
+    this.closed = true;
+    if (
+      !this.ready ||
+      !(await this.ready.then(
+        () => true,
+        () => false,
+      ))
+    )
+      return;
+    const mine = [...this.boxes.values()].flatMap((m) => [...m.values()]);
+    const strays = await this.strays(this.prefix());
+    await Promise.all([
+      ...mine.map((b) => this.stop(b)),
+      ...strays.map((id) => this.stopStray(id)),
+    ]);
+    await this.removePersonCgroups();
+  }
+
+  /** What a gateway that was killed left: its sandboxes, their cgroups, bundles and temporary files. */
+  private async sweepLeftovers() {
+    const left = (await this.list()).map((c) => c.id);
+    await Promise.all(
+      left.map((id) => this.crun(["delete", "-f", id]).catch(() => {})),
+    );
+    await this.removePersonCgroups();
+    for (const dir of [this.bundles(), join(this.cfg.dataDir, "tmp")])
+      for (const name of readdirSync(dir))
+        rmSync(join(dir, name), { recursive: true, force: true });
+    if (left.length)
+      this.log(`removed ${left.length} sandbox(es) left from an earlier run`);
+  }
+
+  private async removePersonCgroups() {
+    if (!this.cgroups) return;
+    const sandboxes = join(this.cgroupRoot, "sandboxes");
+    if (!existsSync(sandboxes)) return;
+    for (const e of readdirSync(sandboxes, { withFileTypes: true }))
+      if (e.isDirectory() && e.name.startsWith(this.prefix()))
+        await this.removeCgroup(join(sandboxes, e.name), true).catch((err) =>
+          this.log(
+            `cannot remove the cgroup ${e.name}: ${(err as Error).message}`,
+          ),
+        );
+  }
+}
+
+function checkKey(key: string) {
+  if (!KEY_RE.test(key)) throw new Error("invalid runtime key");
+  return key;
+}
+
+function checkCommand(
+  args: string[],
+  env: Record<string, string> = {},
+  cwd?: string,
+) {
+  if (
+    !args.length ||
+    args.some((a) => typeof a !== "string" || a.includes("\0"))
+  )
+    throw new Error("invalid sandbox command");
+  for (const [k, v] of Object.entries(env))
+    if (!ENV_NAME_RE.test(k) || typeof v !== "string" || v.includes("\0"))
+      throw new Error(`invalid environment variable "${k}"`);
+  if (cwd !== undefined && (!cwd.startsWith("/") || cwd.includes("\0")))
+    throw new Error("the sandbox working directory must be an absolute path");
+}
+
+/** "TERM" for undefined, "SIGTERM", 15. */
+function signalName(signal?: NodeJS.Signals | number): string {
+  if (signal === undefined) return "TERM";
+  const name =
+    typeof signal === "number"
+      ? Object.entries(constants.signals).find(([, n]) => n === signal)?.[0]
+      : signal;
+  if (!name || !(name in constants.signals))
+    throw new Error(`unknown signal ${signal}`);
+  return name.replace(/^SIG/, "");
 }

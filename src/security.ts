@@ -1,20 +1,21 @@
-// What keeps people apart, as pure functions (no tests need a kernel): each person's runtime is a
-// sandboxed process tree run by crun inside the one Tandem container (src/runtime.ts), described by
-// the OCI spec below, and its only way out is Stripe's Smokescreen, configured by the ACL below.
+// What keeps people apart, as pure functions (no tests need a kernel): every vendor process runs in
+// a sandbox of its own, run by crun inside the one Tandem container (src/runtime.ts) and described
+// by the OCI spec below, inside its person's cgroup with the limits below; its only way out is
+// Stripe's Smokescreen, configured by the ACL below.
 import { readFileSync } from "node:fs";
 import { release } from "node:os";
 import type { Config } from "./config";
 
 /**
- * Temporary files, Happy's unpacked Claude Code (341 MiB) included: a per-person directory outside
- * the home, emptied at every start and removed at every stop, so it takes disk only while the
- * person's runtime runs. The mount point exists in the runtime image (Dockerfile).
+ * Temporary files: a per-person directory outside the home, shared by all of the person's
+ * sandboxes and removed when the last one ends, so it takes disk only while the person has a
+ * process. The mount point exists in the runtime image (Dockerfile).
  */
 export const RUNTIME_TMPDIR = "/var/tmp/agent";
 /** Where a sandbox finds the gateway's sockets (bind-mounted files). */
 export const SANDBOX_EGRESS_SOCKET = "/run/tandem/egress.sock";
 export const SANDBOX_MCP_SOCKET = "/run/tandem/mcp.sock";
-/** Inside each sandbox: the egress proxy and the MCP proxy on loopback (runtime/entrypoint.sh). */
+/** Inside each sandbox: the egress proxy and the MCP proxy on loopback (runtime/agent-run). */
 export const SANDBOX_EGRESS_PORT = 4750;
 export const SANDBOX_MCP_PORT = 8790;
 
@@ -74,7 +75,7 @@ export function smokescreenAcl(
   ].join("\n");
 }
 
-/** One person's sandbox: who runs in it, what it sees, what it may do. */
+/** One sandbox of a person: who runs in it, what it sees, what it may do. */
 export type SandboxInput = {
   uid: number;
   /** The read-only runtime filesystem (the runtime image, unpacked into the Tandem image). */
@@ -91,12 +92,25 @@ export type SandboxInput = {
   mcpSocket?: string;
   args: string[];
   env: Record<string, string>;
+  /** Working directory inside the sandbox; must exist (the home always does). */
+  cwd: string;
+  /** Processes of the person's uid (RLIMIT_NPROC); the person's cgroup holds the same limit. */
   pids: number;
   /** The seccomp filter (sandboxSeccomp()). */
   seccomp: object;
-  /** The sandbox's own cgroup and its limits; absent when the host cannot delegate cgroups. */
-  cgroup?: { path: string; memoryMb: number; cpus: number };
+  /**
+   * The sandbox's own cgroup, a child of its person's (personCgroupLimits); absent when the host
+   * cannot delegate cgroups.
+   */
+  cgroup?: { path: string };
 };
+
+/**
+ * Raised for every sandboxed process, so that when the whole container or host runs out of memory
+ * the kernel ends a vendor process before the gateway. Raising needs no privilege; lowering it
+ * again inside the sandbox would (CAP_SYS_RESOURCE).
+ */
+export const SANDBOX_OOM_SCORE_ADJ = 500;
 
 const AGENT_PATH =
   "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -104,9 +118,11 @@ const AGENT_PATH =
 /**
  * The OCI runtime spec for crun: crun's own default (`crun spec`) with the person's uid, no
  * capabilities, no_new_privs, a read-only root, only their home and their temporary directory
- * writable, their own PID, network (loopback only), IPC, UTS, cgroup and mount namespaces, Docker's
- * seccomp filter for unprivileged containers, and their own memory/CPU/process limits. The only
- * connections out are the two bind-mounted gateway sockets.
+ * writable, their own PID, network (loopback only), IPC, UTS, cgroup and mount namespaces and
+ * Docker's seccomp filter for unprivileged containers. Its cgroup is a child of the person's, which
+ * holds their limits; `memory.oom.group` makes the kernel end this sandbox's whole process tree,
+ * and only it, when the person runs out of memory. The only connections out are the two
+ * bind-mounted gateway sockets.
  */
 export function sandboxSpec(s: SandboxInput) {
   const bind = (source: string, destination: string, ...options: string[]) => ({
@@ -121,11 +137,10 @@ export function sandboxSpec(s: SandboxInput) {
       terminal: false,
       user: { uid: s.uid, gid: s.uid, additionalGids: [] },
       args: s.args,
-      env: [
-        `PATH=${AGENT_PATH}`,
-        ...Object.entries(s.env).map(([k, v]) => `${k}=${v}`),
-      ],
-      cwd: "/home/agent",
+      env: Object.entries({ PATH: AGENT_PATH, ...s.env }).map(
+        ([k, v]) => `${k}=${v}`,
+      ),
+      cwd: s.cwd,
       capabilities: {
         bounding: [],
         effective: [],
@@ -140,6 +155,7 @@ export function sandboxSpec(s: SandboxInput) {
         { type: "RLIMIT_CORE", hard: 0, soft: 0 },
       ],
       noNewPrivileges: true,
+      oomScoreAdj: SANDBOX_OOM_SCORE_ADJ,
     },
     root: { path: s.rootfs, readonly: true },
     hostname: "tandem",
@@ -227,19 +243,42 @@ export function sandboxSpec(s: SandboxInput) {
       ...(s.cgroup
         ? {
             cgroupsPath: s.cgroup.path,
-            resources: {
-              memory: { limit: s.cgroup.memoryMb * 1024 * 1024 },
-              cpu: {
-                quota: Math.round(s.cgroup.cpus * 100_000),
-                period: 100_000,
-              },
-              pids: { limit: s.pids },
-            },
+            resources: { unified: { "memory.oom.group": "1" } },
           }
         : {}),
     },
   };
 }
+
+const MIB = 1024 * 1024;
+
+/**
+ * The person's cgroup (`/sandboxes/<prefix>-<key>`): every sandbox of theirs is a child, so these
+ * limits hold for all of their processes together. memory.high (80 %) makes the kernel reclaim
+ * their caches and slow them down before memory.max ends a process tree; equal cpu.weight shares
+ * the CPUs fairly between people under contention without capping an idle server (a cpu.max quota
+ * of N CPUs caps nothing on a host with N or fewer). memory.swap.max, where the host has swap
+ * accounting, keeps the memory limit from spilling into swap.
+ */
+export function personCgroupLimits(memoryMb: number, pids: number) {
+  return {
+    "memory.max": String(memoryMb * MIB),
+    "memory.high": String(Math.floor(memoryMb * 0.8) * MIB),
+    "memory.swap.max": "0",
+    "pids.max": String(pids),
+    "cpu.weight": "100",
+  };
+}
+
+/**
+ * The gateway's own leaf (`/gateway`), a sibling of `/sandboxes`: under contention it gets four
+ * times the CPU of all sandboxes together, and the memory it uses up to 128 MiB is protected from
+ * reclaim when the container's own limit is reached.
+ */
+export const GATEWAY_CGROUP = {
+  "cpu.weight": "400",
+  "memory.min": String(128 * MIB),
+};
 
 /** The person's /etc/passwd and /etc/group inside their sandbox. */
 export const passwdFile = (uid: number) =>
