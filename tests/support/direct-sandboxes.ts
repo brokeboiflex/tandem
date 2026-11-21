@@ -16,6 +16,8 @@ export type Spawned = {
   args: string[];
   env: Record<string, string>;
   label: string | undefined;
+  /** The working directory asked for (inside the sandbox), if any. */
+  cwd: string | undefined;
   child: ChildProcess;
 };
 
@@ -64,8 +66,11 @@ export class DirectSandboxes implements Sandboxes {
   async spawn(key: string, args: string[], opts: SandboxSpawnOptions = {}) {
     const env = this.#env(key, opts.env);
     const [cmd, ...rest] = this.#command(args);
+    // Like runtime/agent-run, which makes the working directory as the person.
+    const cwd = this.path(key, opts.cwd ?? HOME);
+    mkdirSync(cwd, { recursive: true });
     const child = spawn(cmd!, rest, {
-      cwd: this.path(key, opts.cwd ?? HOME),
+      cwd,
       env,
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -80,7 +85,7 @@ export class DirectSandboxes implements Sandboxes {
       child.once("exit", () => clearTimeout(t));
       return sent;
     };
-    this.spawned.push({ key, args, env, label: opts.label, child });
+    this.spawned.push({ key, args, env, label: opts.label, cwd: opts.cwd, child });
     return child;
   }
 

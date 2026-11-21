@@ -127,6 +127,11 @@ export type AcpVendor = {
   ): { usage: any; context: ContextView | null } | null;
   /** Failure from an error the vendor reports in its own shape, before `classifyText`. */
   failure?(e: RpcError, model: string | null): Failure | null;
+  /**
+   * The agent refused a prompt because a run of its own still goes on in the session (goose resumes
+   * an interrupted run after session/load): the prompt is sent again once that run has ended.
+   */
+  busy?(e: RpcError): boolean;
   /** `_meta` of the client capabilities in `initialize` (opting in to vendor extensions). */
   clientMeta?: Record<string, unknown>;
   /** Usage or context from a vendor's own notification, for the live turn of its session. */
@@ -161,6 +166,8 @@ const OPEN_TIMEOUT_MS = 120_000;
 const SET_TIMEOUT_MS = 30_000;
 /** How long a cancelled prompt gets to end before its process is stopped. */
 const CANCEL_GRACE_MS = 5_000;
+/** How long a prompt waits for the agent's own run in the session to end (AcpVendor.busy). */
+const BUSY_MS = 60_000;
 const MAX_CONTEXT_CHARS = 4_000;
 /** Tool kinds `read_only` lets through without asking (ACP ToolKind). */
 const READ_KINDS = new Set(["read", "search", "think"]);
@@ -298,10 +305,7 @@ export class AcpAgent implements Agent, VerifiesApiKeys {
       if (signal.aborted) return { status: "aborted" };
       live = new LiveTurn(this, s.id, input, sink);
       proc.live.set(s.id, live);
-      const prompt = proc.rpc.request("session/prompt", {
-        sessionId: s.id,
-        prompt: [{ type: "text", text: input.text }],
-      });
+      const prompt = this.#prompt(proc, s.id, input.text, signal);
       let onAbort = () => {};
       const cancelled = new Promise<"aborted">((resolve) => {
         onAbort = () => {
@@ -353,6 +357,23 @@ export class AcpAgent implements Agent, VerifiesApiKeys {
       if (live && proc.live.get(live.sessionId) === live)
         proc.live.delete(live.sessionId);
       this.#done(proc);
+    }
+  }
+
+  /** session/prompt, sent again (for up to a minute) while the agent says it is still busy. */
+  async #prompt(proc: Proc, sessionId: string, text: string, signal: AbortSignal) {
+    for (const until = Date.now() + BUSY_MS; ; ) {
+      try {
+        return await proc.rpc.request("session/prompt", {
+          sessionId,
+          prompt: [{ type: "text", text }],
+        });
+      } catch (e) {
+        if (!(e instanceof RpcError) || !this.vendor.busy?.(e) || Date.now() > until)
+          throw e;
+        await Bun.sleep(250);
+        if (signal.aborted) throw e;
+      }
     }
   }
 

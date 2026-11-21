@@ -5,6 +5,7 @@
 //   ASK_QUESTION    one AskUserQuestion call ("Which color?": Red / Blue)
 //   CALL_MCP        lookup_customer of the MCP server (through ToolSearch when the tool is deferred)
 //   SLOW            text streamed slowly for ~12 s (to abort mid-turn)
+//   RUN_SLOW        one Bash call that sleeps for minutes (to abort mid-command)
 //   REMEMBER <w>    "OK"; a later RECALL answers "RECALLED <w>" from the history it was sent
 //   AUTH_FAIL       401 authentication_error
 //   USAGE_LIMIT     429 with the unified rate-limit headers of a spent subscription window
@@ -259,6 +260,7 @@ export function mockAnthropic(opts: { log?: string } = {}) {
           "RUN_TOOL",
           "ASK_QUESTION",
           "CALL_MCP",
+          "RUN_SLOW",
           "SLOW",
           "REMEMBER",
           "RECALL",
@@ -315,6 +317,12 @@ export function mockAnthropic(opts: { log?: string } = {}) {
         );
       case "RUN_TOOL":
         return toolUse(model, "Bash", { command: PROBE, description: "probe" });
+      case "RUN_SLOW":
+        return toolUse(model, "Bash", {
+          command: "echo started; sleep 300; echo late",
+          description: "a long command",
+          timeout: 600000,
+        });
       case "ASK_QUESTION":
         return toolUse(model, "AskUserQuestion", {
           questions: [

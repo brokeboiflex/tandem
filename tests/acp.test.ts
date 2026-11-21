@@ -438,6 +438,21 @@ describe("turns", () => {
     await agent.release(key);
   });
 
+  test("a prompt goose refuses while its own resumed run goes on is sent again", async () => {
+    const key = person();
+    const agent = openrouterAgent(opts());
+    const rec = recorder();
+    const end = await agent.turn(
+      key,
+      input({ provider: "openrouter", model: OPENROUTER_MODELS[0]!, text: "BUSY then hello" }),
+      rec.sink,
+      never(),
+    );
+    expect(end).toEqual({ status: "completed" });
+    expect(calls(key, "session/prompt")).toHaveLength(3);
+    await agent.release(key);
+  });
+
   test("an unanswered question is a cancelled outcome", async () => {
     const key = person();
     const agent = openrouterAgent(opts());

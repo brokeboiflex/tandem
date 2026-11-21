@@ -21,15 +21,21 @@ const CODE_MS = 30_000;
 const URL = /(https:\/\/\S+\/oauth\/authorize\?\S+)/;
 
 /**
- * Claude Code's own words for a code it did not take. "Invalid code" is its local format check and
- * it keeps waiting ("retry"); a code the server refused ends the attempt ("restart").
+ * Claude Code's own words for a code it did not take. Its local format checks keep it waiting
+ * ("retry"): "That doesn't look like the full code…" and "That looks like a verification code…" in
+ * the pinned 2.1.330, "Invalid code" before. A code the server refused ends the attempt ("restart").
  */
 export function codeRejection(lines: string[]): "retry" | "restart" | null {
   if (
     lines.some((l) => /wasn't accepted|was not accepted|invalid_grant/i.test(l))
   )
     return "restart";
-  if (lines.some((l) => /invalid code/i.test(l))) return "retry";
+  if (
+    lines.some((l) =>
+      /invalid code|doesn't look like the full code|looks like a verification code/i.test(l),
+    )
+  )
+    return "retry";
   return null;
 }
 

@@ -84,6 +84,8 @@ type Turn = {
   runId: string;
   abort: AbortController;
   question: PendingQuestion | null;
+  /** Ended by the gateway's own shutdown, not by the person: the run failed. */
+  shutdown?: boolean;
 };
 
 /** What the gateway holds for one person in memory: live state only, nothing it must keep. */
@@ -133,6 +135,8 @@ const MAX_TITLE = 200;
 const MAX_TEXT = 100_000;
 const MAX_QUERY = 200;
 const MAX_INSTRUCTIONS = 64_000;
+/** Grok Build's global rules (its AGENTS.md for every folder). */
+const GROK_RULES = `${HOME}/.grok`;
 /** A live provider read older than this is read again when the person's stream opens. */
 const REFRESH_MS = 15 * 60_000;
 /** Live reads start vendor programs (Claude ~230 MiB for a moment): at most this many at once. */
@@ -329,15 +333,18 @@ export function createGateway(cfg: Config, deps: GatewayDeps) {
     p.signinRequired.delete(id);
     const agent = agentFor(id);
     p.stale.add(agent);
-    releaseStale(p);
-    void refresh(p, id, true);
+    // Read once the old program is gone: a release ends every process of the agent, a read's too.
+    void releaseStale(p).then(() => refresh(p, id, true));
     publish(p, id);
   }
 
-  function releaseStale(p: Person) {
-    if (p.turns.size) return; // after the running turns (a turn's end calls this again)
-    for (const agent of p.stale) void agent.release(p.key).catch(() => {});
+  function releaseStale(p: Person): Promise<void> {
+    if (p.turns.size) return Promise.resolve(); // after the running turns (a turn's end calls this again)
+    const releasing = [...p.stale].map((agent) =>
+      agent.release(p.key).catch(() => {}),
+    );
     p.stale.clear();
+    return Promise.all(releasing).then(() => {});
   }
 
   // --- MCP and instructions storage ---------------------------------------------------------------
@@ -599,6 +606,10 @@ export function createGateway(cfg: Config, deps: GatewayDeps) {
     }
     if (turn.abort.signal.aborted && end.status === "failed")
       end = { status: "aborted" };
+    // The gateway stopping (a restart, a redeploy) is not the person's abort: the run failed, as
+    // a run that a killed gateway left running is at the next start (failInterruptedRuns).
+    if (turn.shutdown && end.status !== "completed")
+      end = { status: "failed", failure: fail.failed() };
     const q = turn.question;
     if (q) {
       turn.question = null;
@@ -1178,23 +1189,29 @@ export function createGateway(cfg: Config, deps: GatewayDeps) {
 
   /**
    * Standing instructions for every conversation. The store keeps the canonical copy; the chat
-   * workspace gets it as AGENTS.md (Codex, agy, Grok Build, goose) and CLAUDE.md (Claude Code).
+   * workspace gets it as AGENTS.md (Codex, agy, goose) and CLAUDE.md (Claude Code). Grok Build
+   * reads a workspace's AGENTS.md only in a folder the person trusted in Grok, so it gets them as
+   * its global rules, ~/.grok/AGENTS.md.
    */
   async function putInstructions({ p, body }: Ctx) {
     const { text } = body;
     if (typeof text !== "string")
       throw new HttpError(400, "invalid_request", "text must be a string");
     if (text.length > MAX_INSTRUCTIONS) throw tooLong(MAX_INSTRUCTIONS);
+    const files: [string, string][] = [
+      [WORKSPACE, "AGENTS.md"],
+      [WORKSPACE, "CLAUDE.md"],
+      [GROK_RULES, "AGENTS.md"],
+    ];
     if (!text.trim())
       await runtime.exec(p.key, [
         "rm",
         "-f",
-        `${WORKSPACE}/AGENTS.md`,
-        `${WORKSPACE}/CLAUDE.md`,
+        ...files.map(([dir, name]) => `${dir}/${name}`),
       ]);
     else
-      for (const name of ["AGENTS.md", "CLAUDE.md"])
-        await runtime.writePrivateFile(p.key, WORKSPACE, name, text);
+      for (const [dir, name] of files)
+        await runtime.writePrivateFile(p.key, dir, name, text);
     store.setSetting(p.key, "instructions", text.trim() ? text : null);
     return json({ text: text.trim() ? text : "" });
   }
@@ -1362,7 +1379,11 @@ export function createGateway(cfg: Config, deps: GatewayDeps) {
   /** Before exiting: every running turn ends now. */
   async function shutdown() {
     for (const p of people.values())
-      for (const t of p.turns.values()) t.abort.abort();
+      for (const t of p.turns.values())
+        if (!t.abort.signal.aborted) {
+          t.shutdown = true;
+          t.abort.abort();
+        }
     await Promise.allSettled(
       [...people.keys()].flatMap((key) =>
         deps.agents.map((a) => a.release(key)),

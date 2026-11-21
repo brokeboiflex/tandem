@@ -1,0 +1,4 @@
+# The end-to-end run's egress allowlist, mounted over runtime/egress-allowlist.txt
+# (scripts/e2e/compose.yaml): the scripted vendor APIs (scripts/mock-vendor/serve.ts) and nothing else,
+# so no sandbox can reach a real vendor during the run, whatever a vendor program tries.
+mock.tandem.test

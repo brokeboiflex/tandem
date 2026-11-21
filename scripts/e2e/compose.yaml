@@ -1,0 +1,43 @@
+# The end-to-end run (scripts/e2e.ts) on top of compose.yaml, which keeps every privilege and setting
+# of production (SYS_ADMIN and NET_ADMIN, AppArmor off, init, stop grace, no memory limit):
+#
+#   docker compose -p tandem-agents-e2e -f compose.yaml -f scripts/e2e/compose.yaml up -d
+#
+# Paths are relative to compose.yaml (the first file). The gateway starts through scripts/e2e-gateway.ts,
+# which points every agent and sign-in at `mock`, a service of the scripted vendor APIs on a fixed
+# address. The sandboxes reach it only through the gateway's egress proxy: its allowlist here names the
+# mock alone, and EGRESS_ALLOW_RANGES (.env, written by scripts/e2e/run.sh) lets Smokescreen through to
+# that one private address.
+services:
+  tandem:
+    command: ["bun", "scripts/e2e-gateway.ts"]
+    # The deployed default (auto) unless the run asks for another (scripts/e2e.ts recreates the
+    # container with E2E_PERMISSION_MODE=workspace_write for Claude's own permission questions).
+    environment:
+      PERMISSION_MODE: ${E2E_PERMISSION_MODE:-auto}
+    volumes:
+      - ./scripts:/app/scripts:ro
+      - ./scripts/e2e/egress-allowlist.txt:/app/runtime/egress-allowlist.txt:ro
+    depends_on: [mock]
+  mock:
+    image: ${TANDEM_IMAGE:-tandem:0.3.0}
+    command: ["bun", "scripts/mock-vendor/serve.ts"]
+    environment:
+      MOCK_LOG: /tmp/mock.log
+      MOCK_MCP_SERVER: stub
+    volumes:
+      - ./scripts:/app/scripts:ro
+    healthcheck:
+      disable: true
+    # The e2e driver's control port, on the host's loopback only.
+    ports: ["127.0.0.1:4797:4797"]
+    networks:
+      default:
+        ipv4_address: 172.29.77.10
+        aliases: [mock.tandem.test]
+    restart: unless-stopped
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.29.77.0/24

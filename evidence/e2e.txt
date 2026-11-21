@@ -1,0 +1,275 @@
+# Tandem end to end on the production-like VM: the merged agent layer, through HTTP /v1 only.
+#
+# Where: Lima VM `hetzner-like` (2 vCPU arm64, 4 GiB, no swap, no KVM, Ubuntu 24.04, kernel 6.8,
+# Docker 28.5.1). The image built from this branch (`tandem:agents-e2e`, Dockerfile unchanged), run by
+# compose.yaml (cap_add SYS_ADMIN + NET_ADMIN, apparmor=unconfined, init, stop grace 60 s, no
+# mem_limit) plus scripts/e2e/compose.yaml. Defaults as deployed: IDLE_MINUTES 2, RUNTIME_MEMORY_MB
+# 1024, RUNTIME_PIDS 512, EGRESS_MODE allowlist, PERMISSION_MODE auto.
+#
+# What runs: the real gateway process (scripts/e2e-gateway.ts = src/gateway.ts's startup with the
+# agents' existing test options: Claude `env`, Codex `config`/`env`, ACP `env`/`urls`, Codex and Grok
+# sign-ins on mock issuers), every vendor's own program from the image (Claude Code 2.1.330, codex
+# 0.160.1 + code-mode host, Grok Build 1.0.89, agy 1.5.11, goose 1.60.2) in crun sandboxes, against
+# scripts/mock-vendor/serve.ts (a separate container). The sandboxes reach the mock only through the
+# real egress path: agent-run's relay -> /run/tandem/egress.sock -> Smokescreen, whose allowlist is
+# replaced by scripts/e2e/egress-allowlist.txt (the mock's name only) and EGRESS_ALLOW_RANGES=<its
+# one address>. No real vendor was contacted, no real credential used (fake keys, mock-issued tokens).
+#
+#   sudo BUN=$HOME/.bun/bin/bun scripts/e2e/run.sh [scenarios|capacity]   (from a copy of the repo)
+#
+# Bugs this run found, fixed in this branch (each with a unit test):
+#  1. src/signin/claude.ts:35 codeRejection: the pinned Claude Code 2.1.330 refuses a malformed code
+#     with "That doesn't look like the full code…" (no longer "Invalid code"), so POST …/connect/code
+#     hung 30 s and answered `waiting` without `wrong_code`. Now matched (tests/claude-signin.test.ts).
+#  2. src/agents/codex.ts:1005 the app-server was spawned in the home, so the chat workspace did not
+#     exist for a person without standing instructions, and every Codex shell command failed:
+#     "Failed to create unified exec process: No such file or directory". Now spawned with cwd = the
+#     workspace (agent-run makes it) (tests/codex-agent.test.ts).
+#  3. src/agents/codex.ts:931 abort ended the run but Codex kept the interrupted command running as a
+#     background terminal (`sleep` still alive 20 s later). Now thread/backgroundTerminals/clean after
+#     turn/interrupt (needs experimentalApi, :1037) (tests/codex-agent.test.ts).
+#  4. src/gateway.ts:611,1384 a gateway restart (SIGTERM) recorded running runs as `aborted` ("stopped on
+#     request"); now `failed`, like failInterruptedRuns after a kill (tests/gateway.test.ts).
+#  5. src/gateway.ts:337 after an account change the release of the old program raced the new account
+#     read and killed it ("provider_read_failed claude … exited with code 143"); the read now waits for
+#     the release (tests/gateway.test.ts).
+#  6. src/gateway.ts:1204 Grok Build reads a workspace AGENTS.md only in a folder trusted in Grok, so
+#     standing instructions never reached Grok (0 requests carried them); they are now also written as
+#     Grok's global rules ~/.grok/AGENTS.md, which it reads (tests/gateway.test.ts, tests/mcp.test.ts).
+#  7. src/agents/acp.ts:364, acp-vendors.ts:333 after a gateway restart during a goose tool call, goose
+#     resumes the interrupted run itself on session/load and refused the person's next prompt
+#     ("session already has active run `resume_…`"): the turn failed (3 of 6 runs before the fix). The
+#     prompt is now sent again until goose's own run ends (tests/acp.test.ts, tests/fake-acp.ts).
+# The run below is scripts/e2e/run.sh on the final image; the same scenarios passed twice more after it.
+# Mock changes (scripts only): Codex catalog models run in code mode (one JavaScript `exec` tool whose
+# nested tools are exec_command and the deferred MCP tools in ALL_TOOLS); the Anthropic mock got
+# RUN_SLOW (a slow Bash); the Grok MCP dispatcher's server name is MOCK_MCP_SERVER.
+#
+# Not verifiable here, read with care:
+#  - Claude under PERMISSION_MODE=auto: Claude Code asks Anthropic's server whether an action is safe
+#    ("Auto mode can't check actions in this session. Its safety check runs on the server, and your
+#    requests go through mock.tandem.test:4799, which doesn't pass it through"), so against the mock it
+#    refuses Bash. Claude's shell, allow/deny and abort are therefore proven under workspace_write
+#    (container recreated for that section); auto with the real API is unverified.
+#  - Streaming: Smokescreen buffers plain-HTTP proxied responses, so the mock's streams arrive whole
+#    (deltas come at the end). Real vendors are HTTPS through CONNECT tunnels, which this run did not use.
+#  - Real accounts, plans, usage limits and the real Claude/ChatGPT/xAI sign-in pages: not touched.
+#  - goose asks models.dev (not on the default allowlist) for model data: refused, harmless here.
+#  - In the egress list below, tandem:8787, 169.254.169.254, 10.0.0.1, 172.29.77.10, example.com and
+#    api.anthropic.com are the isolation probes (example.com also Claude's own probe command); models.dev
+#    is goose.
+
+# Tandem end to end, 2026-11-21T16:25:53.053Z: image tandem:agents-e2e, container f6982f069ac2, run mwqmdmro
+# host: Linux 6.8.0-134-generic aarch64, 2 vCPU, Mem: 3904 723 665 1 2706 3181 ; Docker 28.5.1
+# gateway: security: sandbox=namespaces egress=allowlist limits=1024MiB/512pids per person data=/var/lib/tandem (e2e: vendors at mock.tandem.test) | tandem gateway on 0.0.0.0:8787 (auth dev, idle 2 min, permission mode auto)
+   0.6s PASS  the container runs with the deployed PERMISSION_MODE  (tandem gateway on 0.0.0.0:8787 (auth dev, idle 2 min, permission mode auto))
+
+   0.6s == a new person: nothing runs until they use it
+   0.6s PASS  GET /v1/providers answers at once: every provider not_connected  (3 ms)
+   0.6s PASS  GET /v1/conversations: none
+   3.7s PASS  opening /v1/events sends each provider's state and starts no process  (5 events, 0 sandboxes)
+   3.8s PASS  only the API port is published  (8787/tcp -> 127.0.0.1:8787)
+
+   3.8s == sign-in flows (the vendors' own CLIs in the person's sandbox)
+   3.9s PASS  claude: `claude auth login` prints its page; connect answers waiting, paste_code  (114 ms, https://claude.ai/oauth/authorize?<redacted>, expires 2026-11-21T16:40:56.894Z)
+   3.9s PASS  claude: provider.updated connecting
+   3.9s PASS  claude: a malformed code → still waiting, wrong_code, at once  (1 ms: That code didn't work. Copy the whole code from the sign-in page and paste it again.)
+   3.9s PASS  claude: cancel → cancelled, provider not_connected
+   3.9s PASS  codex: connect → waiting with the CLI's page and code  (33 ms, http://mock.tandem.test:4796/codex/device, TEST-12345)
+   4.4s PASS  codex: cancel → cancelled, provider not_connected
+   4.5s PASS  grok: connect → waiting with the CLI's page and code  (64 ms, https://device.mock.invalid/activate?user_code=MOCK-1001, MOCK-1001)
+   5.0s PASS  grok: cancel → cancelled, provider not_connected
+   5.0s PASS  openrouter, gemini: connect only with an API key (400 otherwise)
+   5.3s PASS  gemini: DELETE /v1/providers/gemini signs out (the key is forgotten)
+   6.3s PASS  after the sign-ins: no process of that person is left  (0 sandboxes)
+
+   6.3s == claude: connect, a conversation, tool calls, questions, abort, MCP, hidden context
+   6.3s PASS  claude: a key the vendor refuses → failed, invalid_api_key  (checked from a sandbox through the egress proxy in 51 ms)
+   6.4s PASS  claude: a key the vendor accepts → connected  (31 ms)
+   6.6s PASS  claude: provider.updated connected, with the account's models  (api_key, - / API key, models claude-code/default, claude-code/opus, claude-code/fable, claude-code/sonnet, …)
+   6.6s PASS  claude: the app registers its MCP server and standing instructions
+   6.6s PASS  claude: POST /v1/conversations → 201  (claude-code/default, 1 ms)
+   9.6s   connected, a conversation, no turn yet: 0 process(es) (none; a read's process stays for IDLE_MINUTES)
+  10.0s   claude, PERMISSION_MODE=auto: completed in 276 ms; tools Bash:failed; " TOOL_RESULT_SEEN Auto mode is unavailable: its safety check does not run for this session, so Bash was not run. Other actions that need the check will be denied too, and retrying won't help. Finish what you can without them, then"
+  10.0s PASS  claude: the standing instructions (CLAUDE.md) reach the vendor  (2 vendor request(s) carried them)
+  10.1s PASS  claude: Claude's own question (AskUserQuestion) answered through /v1  (Which color? [Red / Blue] → Blue; completed in 70 ms; " TOOL_RESULT_SEEN Your questions have been answered: "Which color?"="Blue". You can now continue with these answers in m")
+  10.1s PASS  claude: an MCP tool call through the gateway's proxy, with the message's credential  (completed in 45 ms; tools ToolSearch:completed,mcp__stub__lookup_customer:completed; the MCP server saw tools/call(lookup_customer) 200)
+  10.2s PASS  claude: a credential the app's server refuses → a tool error the agent relays  (completed in 75 ms; " TOOL_RESULT_SEEN Sign-in for stub expired or is missing. Send a new message to continue.")
+  10.3s PASS  claude: hidden context reaches the vendor and is never shown back  (1 vendor request(s) carried it; in history or events: false)
+
+  10.3s == codex: connect, a conversation, tool calls, questions, abort, MCP, hidden context
+  10.3s PASS  codex: connect starts the vendor CLI's device sign-in  (20 ms, http://mock.tandem.test:4796/codex/device, code TEST-12345)
+  11.5s PASS  codex: provider.updated connected, with the account's models  (subscription, - / -, models codex-cli/gpt-6.1-sol, codex-cli/gpt-6-astra, codex-cli/gpt-6-sol, codex-cli/gpt-6-luna, …)
+  11.6s PASS  codex: the app registers its MCP server and standing instructions
+  11.6s PASS  codex: POST /v1/conversations → 201  (codex-cli/gpt-6.1-sol, 1 ms)
+  14.6s   connected, a conversation, no turn yet: 1 process(es) (codex-7-15; a read's process stays for IDLE_MINUTES)
+  14.9s PASS  codex: a shell tool call runs in the person's sandbox, as their uid, without capabilities  (completed in 230 ms; tools exec_command:completed; 0 deltas; "TOOL_RESULT_SEEN [{"type":"input_text","text":"Script completed\nWall time 0.0 seconds\nOutput:\n"},{"type":"input_text","text":"100103\nCapEff:\t0000000000000000\nNoNewPrivs:\t1\nSeccomp:\t2\nTMP=/va")
+  14.9s PASS  codex: the standing instructions (AGENTS.md) reach the vendor  (2 vendor request(s) carried them)
+  15.0s PASS  codex: a permission question through /v1 answered "Allow once": the tool ran  (Codex: Allow running `rm -f doomed.txt && echo removed > removed.txt && cat r [Allow once / Allow always / Deny]; GET showed it pending: true; completed in 97 ms)
+  15.1s PASS  codex: another one answered "Deny": the tool did not run, the turn ends normally  (Allow running `rm -f doomed.txt && echo removed > removed.tx → Deny; completed in 65 ms; tools exec_command:failed)
+  18.0s PASS  codex: abort mid-command → run aborted; the command is gone; the next turn completes  (aborted aborted in 2785 ms; `sleep` running before the abort: 2, after: 0; next completed in 45 ms)
+  18.1s PASS  codex: an MCP tool call through the gateway's proxy, with the message's credential  (completed in 50 ms; tools mcp__stub__lookup_customer:completed; the MCP server saw tools/call(lookup_customer) 200)
+  18.1s PASS  codex: a credential the app's server refuses → a tool error the agent relays  (completed in 45 ms; "TOOL_RESULT_SEEN [{"type":"input_text","text":"Script completed\nWall time 0.0 seconds\nOutput:\n"},{"type":"input_text"")
+  18.2s PASS  codex: hidden context reaches the vendor and is never shown back  (2 vendor request(s) carried it; in history or events: false)
+
+  18.2s == grok: connect, a conversation, tool calls, questions, abort, MCP, hidden context
+  18.2s PASS  grok: connect starts the vendor CLI's device sign-in  (25 ms, https://device.mock.invalid/activate?user_code=MOCK-1002, code MOCK-1002)
+  19.4s PASS  grok: provider.updated connected, with the account's models  (subscription, person@mock.invalid / -, models xai/grok-4.6, xai/grok-build)
+  19.5s PASS  grok: the app registers its MCP server and standing instructions
+  19.5s PASS  grok: POST /v1/conversations → 201  (xai/grok-4.6, 1 ms)
+  22.5s   connected, a conversation, no turn yet: 1 process(es) (grok-7-21; a read's process stays for IDLE_MINUTES)
+  22.7s PASS  grok: a shell tool call runs in the person's sandbox, as their uid, without capabilities  (completed in 131 ms; tools run_terminal_command:completed; 1 deltas; " TOOL_RESULT_SEEN exit: 0 100104 CapEff: 0000000000000000 NoNewPrivs: 1 Seccomp: 2 TMP=/var/tmp/agent hi ")
+  22.7s PASS  grok: the standing instructions (AGENTS.md) reach the vendor  (2 vendor request(s) carried them)
+  22.7s PASS  grok: a permission question through /v1 answered "Allow once": the tool ran  (Grok Build: Allow id -u; grep -E 'CapEff|NoNewPrivs|Seccomp:' /proc/self/status; e [Allow once / Allow always / Deny]; GET showed it pending: true; completed in 131 ms)
+  22.9s PASS  grok: another one answered "Deny": the tool did not run, the turn ends normally  (Allow id -u; grep -E 'CapEff|NoNewPrivs|Seccomp:' /proc/self → Deny; completed in 112 ms; tools run_terminal_command:failed)
+  25.6s PASS  grok: abort mid-command → run aborted; the command is gone; the next turn completes  (aborted aborted in 2579 ms; `sleep` running before the abort: 1, after: 0; next completed in 114 ms)
+  25.7s PASS  grok: an MCP tool call through the gateway's proxy, with the message's credential  (completed in 69 ms; tools use_tool:completed; the MCP server saw server/discover 404, initialize 200, notifications/initialized 202, null 405, tools/list 200, tools/call(lookup_customer) 200)
+  25.9s PASS  grok: a credential the app's server refuses → a tool error the agent relays  (completed in 84 ms; " TOOL_RESULT_SEEN Failed to call lookup_customer: Sign-in for stub expired or is missing. Send a new message to continue")
+  25.9s PASS  grok: hidden context reaches the vendor and is never shown back  (3 vendor request(s) carried it; in history or events: false)
+
+  25.9s == openrouter: connect, a conversation, tool calls, questions, abort, MCP, hidden context
+  25.9s PASS  openrouter: a key the vendor refuses → failed, invalid_api_key  (checked from a sandbox through the egress proxy in 23 ms)
+  26.0s PASS  openrouter: a key the vendor accepts → connected  (22 ms)
+  26.2s PASS  openrouter: provider.updated connected, with the account's models  (api_key, - / API key, models deepseek/deepseek-v4.1-flash-1017, openai/gpt-6.2-sol, x-ai/grok-4.7, qwen/qwen4-max, …)
+  26.2s PASS  openrouter: the app registers its MCP server and standing instructions
+  26.2s PASS  openrouter: POST /v1/conversations → 201  (deepseek/deepseek-v4.1-flash-1017, 1 ms)
+  29.2s   connected, a conversation, no turn yet: 0 process(es) (none; a read's process stays for IDLE_MINUTES)
+  29.5s PASS  openrouter: a shell tool call runs in the person's sandbox, as their uid, without capabilities  (completed in 222 ms; tools shell:completed; 1 deltas; " TOOL_RESULT_SEEN 100105 CapEff: 0000000000000000 NoNewPrivs: 1 Seccomp: 2 TMP=/var/tmp/agent hi")
+  29.5s PASS  openrouter: the standing instructions (AGENTS.md) reach the vendor  (2 vendor request(s) carried them)
+  29.5s PASS  openrouter: a permission question through /v1 answered "Allow once": the tool ran  (goose: Allow id -u; grep -E 'CapEff|NoNewPrivs|Seccomp:' /proc/self/status; e [Allow once / Allow always / Deny]; GET showed it pending: true; completed in 222 ms)
+  29.6s PASS  openrouter: another one answered "Deny": the tool did not run, the turn ends normally  (Allow id -u; grep -E 'CapEff|NoNewPrivs|Seccomp:' /proc/self → Deny; completed in 71 ms; tools shell:failed)
+  32.4s PASS  openrouter: abort mid-command → run aborted; the command is gone; the next turn completes  (aborted aborted in 2584 ms; `sleep` running before the abort: 2, after: 0; next completed in 120 ms)
+  32.6s PASS  openrouter: an MCP tool call through the gateway's proxy, with the message's credential  (completed in 124 ms; tools stub__lookup_customer:completed; the MCP server saw server/discover 404, initialize 200, notifications/initialized 202, null 405, tools/list 200, tools/call(lookup_customer) 200)
+  32.6s PASS  openrouter: a credential the app's server refuses → a tool error the agent relays  (completed in 22 ms; " TOOL_RESULT_SEEN Sign-in for stub expired or is missing. Send a new message to continue.")
+  32.7s PASS  openrouter: hidden context reaches the vendor and is never shown back  (1 vendor request(s) carried it; in history or events: false)
+
+  32.7s == gemini: connect, a conversation, tool calls, questions, abort, MCP, hidden context
+  32.7s PASS  gemini: a key the vendor refuses → failed, invalid_api_key  (checked from a sandbox through the egress proxy in 23 ms)
+  32.7s PASS  gemini: a key the vendor accepts → connected  (20 ms)
+  32.9s PASS  gemini: provider.updated connected, with the account's models  (api_key, - / API key, models antigravity/gemini-4-carbon, antigravity/gemini-4-hydrogen, antigravity/gemini-4-argon, antigravity/gemini-3.8-flash, …)
+  33.0s PASS  gemini: the app registers its MCP server and standing instructions
+  33.0s PASS  gemini: POST /v1/conversations → 201  (antigravity/gemini-4-carbon, 0 ms)
+  36.0s   connected, a conversation, no turn yet: 1 process(es) (gemini-7-35; a read's process stays for IDLE_MINUTES)
+  36.1s PASS  gemini: a shell tool call runs in the person's sandbox, as their uid, without capabilities  (completed in 68 ms; tools run_command:completed; 1 deltas; " TOOL_RESULT_SEEN {"output":"Created At: 2026-11-21T16:26:29Z\nCompleted At: 2026-11-21T16:26:29Z\nCommand exited with code 0.\n\nCommand output:\n100106\r\nCapEff:\t0000000000000000\r\nNoNewPrivs:\t1")
+  36.1s PASS  gemini: the standing instructions (AGENTS.md) reach the vendor  (2 vendor request(s) carried them)
+  36.1s PASS  gemini: a permission question through /v1 answered "Allow once": the tool ran  (Antigravity: Allow id -u; grep -E 'CapEff|NoNewPrivs|Seccomp:' /proc/self/status; e [Allow once / Deny]; GET showed it pending: true; completed in 68 ms)
+  36.2s PASS  gemini: another one answered "Deny": the tool did not run, the turn ends normally  (Allow id -u; grep -E 'CapEff|NoNewPrivs|Seccomp:' /proc/self → Deny; completed in 54 ms; tools run_command:failed)
+  39.1s PASS  gemini: abort mid-command → run aborted; the command is gone; the next turn completes  (aborted aborted in 2581 ms; `sleep` running before the abort: 2, after: 0; next completed in 154 ms)
+  39.2s PASS  gemini: an MCP tool call through the gateway's proxy, with the message's credential  (completed in 61 ms; tools mcp_stub_lookup_customer:completed; the MCP server saw notifications/roots/list_changed 202, tools/call(lookup_customer) 200)
+  39.3s PASS  gemini: a credential the app's server refuses → a tool error the agent relays  (completed in 61 ms; " TOOL_RESULT_SEEN {"error":"Encountered error in tool execution: Sign-in for stub expired or is missing. Send a new mess")
+  39.3s PASS  gemini: hidden context reaches the vendor and is never shown back  (1 vendor request(s) carried it; in history or events: false)
+
+  39.3s == isolation: the codex person (A) and the openrouter person (B)
+  39.3s PASS  conversations: B lists none of A's; reading, writing, aborting, renaming or archiving A's is 404  (404,404,404,404,404)
+  39.3s PASS  events: B's stream carries nothing of A's
+  46.9s PASS  files: B's sandbox has only B's home; A's file is nowhere in it; no data volume  (. .. agent . .. .config .grok .local projects ls: cannot access '/var/lib/tandem': No such file or directory end)
+  51.4s PASS  processes: while A's `sleep` runs, B's sandbox sees none of A's processes  (A's sleep running: 2; B sees: UID COMMAND 100105 /usr/bin/tini -s -- /usr/local/bin/agent-run /home/agent sh -c ps -eo uid,args; echo; ls /proc | grep -c '^[0-9]' 100105 sh -c ps -eo uid,args; echo; ls /proc | grep -c '^[0-9]' 100; A's run aborted aborted in 4437 ms)
+  51.4s PASS  each person has a uid of their own  (A 100103, B 100105)
+
+  51.4s == a sandbox from the inside (B)
+  53.5s PASS  the person's uid, no capabilities, no_new_privs, seccomp; a read-only system; no new namespaces  (uid=100105 caps=0000000000000000 nnp=1 seccomp=2 touch: cannot touch '/usr/x': Read-only file system unshare: unshare failed: Operation not permitted unshare: unshare failed: Operation not permitted)
+  55.7s PASS  egress: a sandbox cannot reach the gateway's port on its own loopback  (blocked)
+  57.9s PASS  egress: a sandbox cannot reach the gateway by name through the proxy  (407)
+  60.0s PASS  egress: a sandbox cannot reach cloud metadata  (407)
+  62.2s PASS  egress: a sandbox cannot reach a private address  (407)
+  64.3s PASS  egress: a sandbox cannot reach the mock by address (not by an allowed name)  (407)
+  66.5s PASS  egress: a sandbox cannot reach a host outside the allowlist  (blocked)
+  68.6s PASS  egress: a sandbox cannot reach a real vendor (not on the e2e allowlist)  (blocked)
+  70.8s PASS  egress: a sandbox cannot reach the Internet without the proxy  (blocked)
+  72.9s PASS  egress: a sandbox reaches the allowlisted host through the proxy  (HTTP 401 (no key))
+  73.0s PASS  the person's cgroup holds their limits (RUNTIME_MEMORY_MB, RUNTIME_PIDS, cpu.weight)  (memory.max 1073741824, pids.max 512, cpu.weight 100; sandboxes openrouter-7-32)
+
+  73.0s == the MCP proxy: only the person's own sandbox, with its own token
+  73.1s PASS  no token or a wrong one → 401  (401, 401)
+  73.1s PASS  B's own token on A's path (B's socket) → 401  (401 {"error":"unauthorized"})
+  73.1s PASS  A's token on B's socket → 403: the socket names the caller  (403 {"error":"forbidden"})
+  83.9s PASS  the app's MCP credentials never reach a sandbox: no process environment or argv, no file, no log  (10 credentials checked)
+  83.9s PASS  API keys never on any process's argv (only in the environment of that person's vendor process)
+  86.0s PASS  instructions: AGENTS.md and CLAUDE.md in the chat workspace, and Grok's global rules (~/.grok/AGENTS.md)
+
+  86.0s == idle: every vendor process is released, then each conversation resumes
+ 193.4s PASS  every person's processes ended after IDLE_MINUTES without turns  (107 s after the last turns; left: 0,0,0,0,0)
+ 193.7s PASS  …and with them their temporary files and cgroups; only the homes stay  (claude home 1 MiB, codex home 2 MiB, grok home 2 MiB, openrouter home 2 MiB, gemini home 3 MiB)
+ 194.0s PASS  claude: a turn after the process was released resumes the vendor session (a new process)  (completed in 214 ms; "RECALLED kiwimwqmdmroclaude")
+ 194.1s PASS  codex: a turn after the process was released resumes the vendor session (a new process)  (completed in 128 ms; "RECALLED ["REMEMBER kiwimwqmdmrocodex. Then RUN_TOOL please.","RUN_DANGEROUS now","RUN_DANGEROUS once more","RUN_MCP for")
+ 194.2s PASS  grok: a turn after the process was released resumes the vendor session (a new process)  (completed in 90 ms; "RECALLED kiwimwqmdmrogrok")
+ 194.4s PASS  openrouter: a turn after the process was released resumes the vendor session (a new process)  (completed in 107 ms; "RECALLED kiwimwqmdmroopenrouter")
+ 194.5s PASS  gemini: a turn after the process was released resumes the vendor session (a new process)  (completed in 147 ms; "RECALLED kiwimwqmdmrogemini")
+
+ 194.5s == history paging
+ 194.5s PASS  claude: paging back two runs at a time gives the whole history, in order  (6 runs, 17 messages in 3 pages; context {"usedTokens":14609,"limitTokens":967000,"approximate":false}; usage {"input":13200,"output":220,"cacheRead":0,"cacheWrite":0})
+ 194.5s PASS  codex: paging back two runs at a time gives the whole history, in order  (8 runs, 16 messages in 4 pages; context {"usedTokens":1020,"limitTokens":244800,"approximate":false}; usage {"input":12600,"output":280,"cacheRead":1400,"cacheWrite":0})
+ 194.5s PASS  grok: paging back two runs at a time gives the whole history, in order  (6 runs, 15 messages in 3 pages; context {"usedTokens":1020,"limitTokens":500000,"approximate":false}; usage {"input":9000,"output":180,"cacheRead":0,"cacheWrite":0})
+ 194.5s PASS  openrouter: paging back two runs at a time gives the whole history, in order  (7 runs, 18 messages in 4 pages; context {"usedTokens":1020,"limitTokens":1048576,"approximate":false}; usage {"input":11000,"output":220,"cacheRead":0,"cacheWrite":0})
+ 194.5s PASS  gemini: paging back two runs at a time gives the whole history, in order  (6 runs, 15 messages in 3 pages; context {"usedTokens":1020,"limitTokens":1048576,"approximate":false}; usage {"input":9000,"output":180,"cacheRead":0,"cacheWrite":0})
+ 194.5s PASS  conversations: title search, rename, cursor paging
+
+ 194.5s == a gateway restart while every provider's turn runs
+ 194.7s   codex: run m28a83a1bc2d4438484d90ca03fb04f3: its command runs
+ 194.8s   grok: run mfb26efd8cbb34743a22fc6b3e390909: its command runs
+ 194.9s   openrouter: run m5ddd95541b8e46fab5dd8969b651d88: its command runs
+ 195.1s   gemini: run m91442037e65a454e979446836e80f5c: its command runs
+ 197.1s   claude: run m635ea5749d624d88a29d208367ea5ec: streaming
+ 197.7s PASS  docker restart: the gateway stops its sandboxes, exits and starts again  (559 ms)
+ 197.7s PASS  codex: the run the restart interrupted is failed (not aborted: nobody asked)  ({"id":"m28a83a1bc2d4438484d90ca03fb04f3","status":"failed","failure":{"code":"failed","message":"The assistant couldn't finish this reply. Please try again.","params":{}}})
+ 197.7s PASS  grok: the run the restart interrupted is failed (not aborted: nobody asked)  ({"id":"mfb26efd8cbb34743a22fc6b3e390909","status":"failed","failure":{"code":"failed","message":"The assistant couldn't finish this reply. Please try again.","params":{}}})
+ 197.7s PASS  openrouter: the run the restart interrupted is failed (not aborted: nobody asked)  ({"id":"m5ddd95541b8e46fab5dd8969b651d88","status":"failed","failure":{"code":"failed","message":"The assistant couldn't finish this reply. Please try again.","params":{}}})
+ 197.7s PASS  gemini: the run the restart interrupted is failed (not aborted: nobody asked)  ({"id":"m91442037e65a454e979446836e80f5c","status":"failed","failure":{"code":"failed","message":"The assistant couldn't finish this reply. Please try again.","params":{}}})
+ 197.7s PASS  claude: the run the restart interrupted is failed (not aborted: nobody asked)  ({"id":"m635ea5749d624d88a29d208367ea5ec","status":"failed","failure":{"code":"failed","message":"The assistant couldn't finish this reply. Please try again.","params":{}}})
+ 197.9s PASS  after the restart: no sandbox and no command of anyone is left
+ 198.1s PASS  claude: the next turn after the restart resumes the session  (completed in 230 ms; "RECALLED kiwimwqmdmroclaude")
+ 198.3s PASS  codex: the next turn after the restart resumes the session  (completed in 141 ms; "RECALLED ["REMEMBER kiwimwqmdmrocodex. Then RUN_TOOL please.","RUN_DANGEROUS now","RUN_DANGEROUS onc")
+ 198.4s PASS  grok: the next turn after the restart resumes the session  (completed in 124 ms; "RECALLED kiwimwqmdmrogrok")
+ 198.9s PASS  openrouter: the next turn after the restart resumes the session  (completed in 440 ms; "RECALLED kiwimwqmdmroopenrouter")
+ 199.1s PASS  gemini: the next turn after the restart resumes the session  (completed in 165 ms; "RECALLED kiwimwqmdmrogemini")
+
+ 199.1s == the vendor refuses the sign-in or key
+ 201.1s PASS  claude: refused → run failed signin_required; provider not_connected; new conversations 409  (failed signin_required in 1985 ms; Your Claude account isn't connected or its sign-in expired. Connect it again, then retry.)
+ 201.6s PASS  claude: connecting again → connected; the conversation continues  (completed in 234 ms)
+ 201.7s PASS  codex: refused → run failed signin_required; provider not_connected; new conversations 409  (failed signin_required in 63 ms; Your ChatGPT account isn't connected or its sign-in expired. Connect it again, then retry.)
+ 202.0s PASS  codex: connecting again → connected; the conversation continues  (completed in 66 ms)
+ 207.5s PASS  grok: refused → run failed signin_required; provider not_connected; new conversations 409  (failed signin_required in 5425 ms; Your Grok account isn't connected or its sign-in expired. Connect it again, then retry.)
+ 208.8s PASS  grok: connecting again → connected; the conversation continues  (completed in 49 ms)
+ 208.9s PASS  openrouter: refused → run failed signin_required; provider not_connected; new conversations 409  (failed signin_required in 27 ms; Your OpenRouter account isn't connected or its sign-in expired. Connect it again, then ret)
+ 209.2s PASS  openrouter: connecting again → connected; the conversation continues  (completed in 147 ms)
+ 209.3s PASS  gemini: refused → run failed signin_required; provider not_connected; new conversations 409  (failed signin_required in 23 ms; Your Gemini account isn't connected or its sign-in expired. Connect it again, then retry.)
+ 209.6s PASS  gemini: connecting again → connected; the conversation continues  (completed in 43 ms)
+
+ 209.6s == claude under PERMISSION_MODE=workspace_write (auto's safety check runs on Anthropic's server)
+ 215.5s PASS  the container recreated with PERMISSION_MODE=workspace_write  (tandem gateway on 0.0.0.0:8787 (auth dev, idle 2 min, permission mode workspace_write))
+ 215.8s PASS  claude: a shell tool call runs in the person's sandbox, as their uid, without capabilities (workspace_write)  (completed in 304 ms; tools Bash:completed; 1 deltas; " TOOL_RESULT_SEEN 100102 CapEff: 0000000000000000 NoNewPrivs: 1 Seccomp: 2 TMP=/var/tmp/agent curl: (56) CONNECT tunnel failed, response 407 net=000net=blocked")
+ 215.8s PASS  claude: a permission question through /v1 answered "Allow once": the tool ran (workspace_write)  (Claude Code: Allow running `id -u; grep -E 'CapEff|NoNewPrivs|Seccomp:' /proc/self/ [Allow once / Deny]; GET showed it pending: true; completed in 304 ms)
+ 215.9s PASS  claude: another one answered "Deny": the tool did not run, the turn ends normally (workspace_write)  (Allow running `id -u; grep -E 'CapEff|NoNewPrivs|Seccomp:' / → Deny; completed in 73 ms; tools Bash:failed)
+ 218.8s PASS  claude: abort mid-command → run aborted; the command is gone; the next turn completes (workspace_write)  (aborted aborted in 2754 ms; `sleep` running before the abort: 2, after: 0; next completed in 40 ms)
+ 224.6s PASS  the container recreated with the deployed PERMISSION_MODE again  (tandem gateway on 0.0.0.0:8787 (auth dev, idle 2 min, permission mode auto))
+
+ 224.6s == egress during the run
+ 224.6s   hosts the egress proxy refused during the run: models.dev:443 ×5, tandem:8787 ×1, 169.254.169.254 ×1, 10.0.0.1 ×1, 172.29.77.10:4799 ×1, example.com:443 ×2, api.anthropic.com:443 ×1
+ 224.6s   requests the mock answered: 194 (by port: {"4795":121,"4796":46,"4799":27})
+
+ 224.6s == summary
+| scenario | claude | codex | grok | openrouter | gemini |
+| --- | --- | --- | --- | --- | --- |
+| connect | pass | pass | pass | pass | pass |
+| conversation | pass | pass | pass | pass | pass |
+| shell in sandbox | pass | pass | pass | pass | pass |
+| instructions | pass | pass | pass | pass | pass |
+| allow once | pass | pass | pass | pass | pass |
+| deny | pass | pass | pass | pass | pass |
+| question | pass | - | - | - | - |
+| abort | pass | pass | pass | pass | pass |
+| MCP via proxy | pass | pass | pass | pass | pass |
+| hidden context | pass | pass | pass | pass | pass |
+| resume after idle | pass | pass | pass | pass | pass |
+| history paging | pass | pass | pass | pass | pass |
+| restart: run failed | pass | pass | pass | pass | pass |
+| restart: resumes | pass | pass | pass | pass | pass |
+| signin_required | pass | pass | pass | pass | pass |
+(claude: shell, allow once, deny and abort under PERMISSION_MODE=workspace_write; the rest under auto)
+ 224.6s   claude: person's cgroup memory.peak after the first turn 163 MiB, after the scenarios 229 MiB
+ 224.6s   codex: person's cgroup memory.peak after the first turn 28 MiB, after the scenarios 39 MiB
+ 224.6s   grok: person's cgroup memory.peak after the first turn 13 MiB, after the scenarios 24 MiB
+ 224.6s   openrouter: person's cgroup memory.peak after the first turn 70 MiB, after the scenarios 70 MiB
+ 224.6s   gemini: person's cgroup memory.peak after the first turn 123 MiB, after the scenarios 148 MiB
+
+E2E PASSED

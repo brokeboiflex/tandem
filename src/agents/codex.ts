@@ -924,6 +924,15 @@ export class CodexAgent implements Agent {
           15_000,
         )
         .catch(() => {});
+    // Codex keeps a command an interrupt cut short running as a background terminal of the
+    // thread: the person stopped it, so it ends too.
+    await s.rpc
+      .request(
+        "thread/backgroundTerminals/clean",
+        { threadId: run.threadId },
+        15_000,
+      )
+      .catch(() => {});
     // Codex ends an interrupted turn at once; one that does not is ended with its process.
     const done = await Promise.race([
       run.completed.then(() => true),
@@ -991,6 +1000,9 @@ export class CodexAgent implements Agent {
       {
         // TZ=UTC: Codex words a usage limit's reset in local time (see resetFromText).
         env: { TZ: "UTC", RUST_LOG: "warn", ...env, ...this.opts.env },
+        // In the chat workspace, which the sandbox makes if missing: Codex starts every command in
+        // the thread's cwd, and a missing one fails them all ("No such file or directory").
+        cwd: this.#workspace,
         label: "codex",
       },
     );
@@ -1021,7 +1033,8 @@ export class CodexAgent implements Agent {
         {
           clientInfo: { name: "tandem", title: "Tandem", version: "1" },
           capabilities: {
-            experimentalApi: false,
+            // For thread/backgroundTerminals/clean: an abort ends the commands it interrupted.
+            experimentalApi: true,
             requestAttestation: false,
             optOutNotificationMethods: OPT_OUT,
           },
