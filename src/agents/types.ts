@@ -175,6 +175,11 @@ export type TurnInput = {
   text: string;
   mcpServers: McpServer[];
   permissionMode: PermissionMode;
+  /**
+   * The conversation's lifetime usage before this turn (what the last turn reported), or null.
+   * Agents whose vendor reports one turn's usage add it to this (TurnSink.usage is cumulative).
+   */
+  usage?: UsageView | null;
 };
 
 /**

@@ -2,8 +2,8 @@
 // a tool result -> text echoing it. Speaks Anthropic Messages, OpenAI Responses, OpenAI chat
 // completions and Gemini generateContent, dispatched by path; anything else is logged.
 import { appendFileSync } from "node:fs";
-import { handle as anthropic } from "./mock-anthropic.ts";
-import { handle as responses } from "./mock-openai.ts";
+import { handle as anthropic } from "./mock-anthropic";
+import { handle as responses } from "./mock-openai";
 const LOG = process.env.MOCK_LOG ?? "/tmp/poc/mock.log";
 const log = (s: string) => appendFileSync(LOG, s + "\n");
 const PROBE = "id -u; grep -E 'CapEff|NoNewPrivs|Seccomp:' /proc/self/status; echo TMP=$TMPDIR; echo hi > probe.txt && cat probe.txt";
