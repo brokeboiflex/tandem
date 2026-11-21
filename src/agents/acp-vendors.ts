@@ -6,15 +6,17 @@
 // AcpAgent.autoAnswer (full_access allows every ask, read_only allows reads and denies the rest,
 // workspace_write allows edits inside the workspace; every other ask goes to the person):
 //
-// | Tandem          | agy (Antigravity) | Grok Build              | goose          |
-// | --------------- | ----------------- | ----------------------- | -------------- |
-// | read_only       | plan              | (asks; Tandem decides)  | approve        |
-// | workspace_write | accept-edits      | (asks; Tandem decides)  | approve        |
-// | auto            | accept-edits      | (asks; person decides)  | smart_approve  |
-// | full_access     | accept-edits      | (asks; Tandem allows)   | auto           |
+// | Tandem          | agy (Antigravity) | Grok Build | goose          |
+// | --------------- | ----------------- | ---------- | -------------- |
+// | read_only       | plan              | plan       | approve        |
+// | workspace_write | accept-edits      | default    | approve        |
+// | auto            | accept-edits      | default    | smart_approve  |
+// | full_access     | accept-edits      | default    | auto           |
 //
 // agy offers its own `auto` only with its terminal sandbox, which Tandem's sandbox replaces, so
-// `auto` is agy's accept-edits and its asks go to the person.
+// `auto` is agy's accept-edits and its asks go to the person. Grok's default asks before shell
+// commands outside its safe list, edits and MCP calls. Verified with the real programs:
+// evidence/acp-agents.txt.
 import { lstatSync } from "node:fs";
 import { fail } from "./failures";
 import {
@@ -84,6 +86,15 @@ export function geminiAgent(o: VendorOptions) {
       // before an MCP tool call.
       mcpWithoutAdvert: true,
       usage: "turn",
+      // agy reports a failed model request as assistant text (" ⚠ agent executor error: … API key not
+      // valid", " ⚠ API error (attempt 1): Error 429 …") and ends the turn as if it answered.
+      errorText: /^\s*⚠\s*(agent executor error|API error)\b/,
+      // Google words a rate limit "Resource has been exhausted (e.g. check quota)"; a used-up
+      // quota says "exceeded your current quota".
+      classify: (text) =>
+        /RESOURCE_EXHAUSTED|Error 429/.test(text) && !/exceeded your current quota|billing/i.test(text)
+          ? fail.rateLimited("gemini")
+          : null,
       verifyApiKey: (sb, key, apiKey) =>
         checkKey(sb, key, apiKey, {
           header: "x-goog-api-key: %s",
@@ -292,7 +303,27 @@ export function openrouterAgent(o: VendorOptions) {
         },
       }),
       toolName: (call) => call._meta?.goose?.toolCall?.toolName ?? null,
-      usage: "session",
+      // goose streams a failed turn's error as assistant text before failing the prompt with it.
+      errorText: /^Ran into this error: /,
+      // PromptResponse.usage is goose's last request only; the session's totals come in goose's own
+      // usage notification, which it sends to clients that ask for them.
+      usage: "none",
+      clientMeta: { goose: { customNotifications: true } },
+      notification: (method, params) => {
+        const u = params?.update;
+        if (method !== "_goose/unstable/session/update" || u?.sessionUpdate !== "usage_update")
+          return null;
+        if (typeof params.sessionId !== "string") return null;
+        return {
+          sessionId: params.sessionId,
+          usage: {
+            input: Number(u.accumulatedInputTokens) || 0,
+            output: Number(u.accumulatedOutputTokens) || 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+          },
+        };
+      },
       failure: (e: RpcError) =>
         (e.data as any)?.reason === "credits_exhausted"
           ? fail.usageLimit("openrouter", null, e.message)
@@ -399,16 +430,22 @@ export function grokModels(adv: Advertised): CatalogModel[] {
     (modelOpt?.values ?? []).map((v) => ({ modelId: v.value, name: v.name, _meta: undefined }));
   return list.map((m) => {
     const meta = m._meta ?? {};
-    const efforts: string[] = Array.isArray(meta.reasoningEfforts)
-      ? meta.reasoningEfforts
-          .map((e: any) => (typeof e === "string" ? e : (e?.value ?? e?.id)))
-          .filter((e: unknown): e is string => typeof e === "string")
-      : [];
-    const flagged = Array.isArray(meta.reasoningEfforts)
-      ? meta.reasoningEfforts.find((e: any) => e?.default)
-      : null;
-    const preferred = meta.reasoningEffort ?? flagged?.value ?? flagged?.id;
-    const defaultEffort = efforts.includes(preferred) ? preferred : (efforts[0] ?? null);
+    // Each option's `id` is what the reasoning_effort option takes; `value` is the API's word.
+    const options: { id: string; value: unknown; default: boolean }[] = (
+      Array.isArray(meta.reasoningEfforts) ? meta.reasoningEfforts : []
+    )
+      .map((e: any) =>
+        typeof e === "string"
+          ? { id: e, value: e, default: false }
+          : { id: e?.id ?? e?.value, value: e?.value ?? e?.id, default: !!e?.default },
+      )
+      .filter((o: any) => typeof o.id === "string");
+    const efforts = options.map((o) => o.id);
+    const defaultEffort =
+      options.find((o) => o.value === meta.reasoningEffort)?.id ??
+      options.find((o) => o.default)?.id ??
+      efforts[0] ??
+      null;
     return {
       id: `xai/${m.modelId}`,
       name: m.name ?? null,

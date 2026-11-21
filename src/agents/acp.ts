@@ -127,6 +127,20 @@ export type AcpVendor = {
   ): { usage: any; context: ContextView | null } | null;
   /** Failure from an error the vendor reports in its own shape, before `classifyText`. */
   failure?(e: RpcError, model: string | null): Failure | null;
+  /** `_meta` of the client capabilities in `initialize` (opting in to vendor extensions). */
+  clientMeta?: Record<string, unknown>;
+  /** Usage or context from a vendor's own notification, for the live turn of its session. */
+  notification?(
+    method: string,
+    params: any,
+  ): { sessionId: string; usage?: UsageView; context?: ContextView } | null;
+  /**
+   * Assistant text that is the agent reporting its own failure (agy shows API errors as text and
+   * ends the turn normally): held back, and the turn fails with it if nothing follows.
+   */
+  errorText?: RegExp;
+  /** The vendor's failure text classified its own way first (else `classifyText`). */
+  classify?(text: string, model: string | null): Failure | null;
   /** The pasted API key check (VerifiesApiKeys), from a one-shot sandbox. */
   verifyApiKey?(
     sandboxes: Sandboxes,
@@ -310,11 +324,20 @@ export class AcpAgent implements Agent, VerifiesApiKeys {
         if (proc.turns === 1) this.#drop(proc);
         return { status: "aborted" };
       }
-      live.finish("completed");
+      const held = live.heldError;
+      live.finish(held ? "failed" : "completed");
+      if (held) {
+        const failure =
+          v.classify?.(held, input.model) ?? classifyText(v.provider, held, input.model);
+        if (failure.code === "signin_required") this.#drop(proc);
+        return { status: "failed", failure };
+      }
       const own = v.report?.(r, model);
       if (own?.context) sink.context(own.context);
       this.#usage(own ? own.usage : r?.usage, input, sink);
-      if (r?.stopReason === "cancelled") return { status: "aborted" };
+      // Cancelled without our session/cancel: the agent ended the turn itself (Grok does when a
+      // tool call is denied), which is an answer, not a stop.
+      if (r?.stopReason === "cancelled" && signal.aborted) return { status: "aborted" };
       if (r?.stopReason === "refusal")
         return { status: "failed", failure: fail.failed() };
       return { status: "completed" };
@@ -405,7 +428,11 @@ export class AcpAgent implements Agent, VerifiesApiKeys {
       closing: false,
     };
     rpc.onNotification((method, params) => {
-      if (method !== "session/update") return;
+      if (method !== "session/update") {
+        const own = this.vendor.notification?.(method, params);
+        if (own) proc.live.get(own.sessionId)?.report(own);
+        return;
+      }
       const sid = params?.sessionId;
       if (proc.replaying.has(sid)) return;
       const update = params?.update;
@@ -433,6 +460,7 @@ export class AcpAgent implements Agent, VerifiesApiKeys {
           clientCapabilities: {
             fs: { readTextFile: false, writeTextFile: false },
             terminal: false,
+            ...(this.vendor.clientMeta ? { _meta: this.vendor.clientMeta } : {}),
           },
         },
         INIT_TIMEOUT_MS,
@@ -506,9 +534,11 @@ export class AcpAgent implements Agent, VerifiesApiKeys {
         .catch(() => {});
     proc.sessions.delete(input.conversationId);
     let opened: OpenSession | null = null;
-    if (input.session) {
+    // The stored session, or the one this process had open for the conversation.
+    const stored = input.session ?? s?.id ?? null;
+    if (stored) {
       const params = {
-        sessionId: input.session,
+        sessionId: stored,
         cwd: WORKSPACE,
         mcpServers: servers.map(acpServer),
       };
@@ -518,16 +548,16 @@ export class AcpAgent implements Agent, VerifiesApiKeys {
           r = await rpc.request("session/resume", params, OPEN_TIMEOUT_MS);
         else if (caps.loadSession) {
           // Loading replays the whole conversation, which the gateway already has.
-          proc.replaying.add(input.session);
+          proc.replaying.add(stored);
           try {
             r = await rpc.request("session/load", params, OPEN_TIMEOUT_MS);
           } finally {
-            proc.replaying.delete(input.session);
+            proc.replaying.delete(stored);
           }
         }
         if (r !== null)
           opened = {
-            id: input.session,
+            id: stored,
             adv: advertised(r),
             applied: new Map(),
             mcp,
@@ -624,7 +654,8 @@ export class AcpAgent implements Agent, VerifiesApiKeys {
       if (isAuth(e)) return fail.signinRequired(p);
       const own = this.vendor.failure?.(e, model);
       if (own) return own;
-      return classifyText(p, rpcText(e), model);
+      const text = rpcText(e);
+      return this.vendor.classify?.(text, model) ?? classifyText(p, text, model);
     }
     // The agent ended mid-turn: its last words say why, if anything does.
     if (e instanceof ProcessEnded && proc)
@@ -669,6 +700,8 @@ class LiveTurn {
   >();
   #ended = false;
   #onEnd = new Set<() => void>();
+  /** The agent's own failure text, held back from the person (AcpVendor.errorText). */
+  #held: string | null = null;
   readonly #prefix = crypto.randomUUID().slice(0, 8);
 
   constructor(
@@ -690,6 +723,13 @@ class LiveTurn {
       case "agent_message_chunk": {
         const text = u.content?.type === "text" ? u.content.text : null;
         if (typeof text !== "string" || !text) return;
+        const err = this.agent.vendor.errorText;
+        if (err?.test(text)) {
+          this.#held = (this.#held ? `${this.#held}\n` : "") + text;
+          return;
+        }
+        // Text after the agent's failure report: it recovered (a retry worked).
+        this.#held = null;
         const mid = typeof u.messageId === "string" ? u.messageId : null;
         if (
           !this.#item ||
@@ -714,7 +754,8 @@ class LiveTurn {
         const item = known?.item ?? this.#item ?? this.#newItem();
         const view: ToolView = {
           id,
-          name: this.agent.toolName(call),
+          // A tool keeps the name it started with (later updates may carry only a title).
+          name: known?.view.name ?? this.agent.toolName(call),
           status: toolStatus(u.status ?? known?.call.status),
         };
         this.#tools.set(id, { item, view, call });
@@ -774,9 +815,10 @@ class LiveTurn {
     const offered = labels.filter(([, kinds]) =>
       options.some((o) => kinds.includes(o.kind)),
     );
-    const name = this.agent.toolName(call);
-    const what = oneLine(call.title) || name;
+    const name = this.#tools.get(id)?.view.name ?? this.agent.toolName(call);
     const detail = describe(call.rawInput);
+    // What it would do: its command where it has one, else the agent's title for the call.
+    const what = oneLine(command(call.rawInput)) || oneLine(call.title) || name;
     const question: Ask = {
       kind: "permission",
       askedBy: this.agent.vendor.label,
@@ -800,6 +842,18 @@ class LiveTurn {
     const label = answers.permission?.[0];
     const chosen = offered.find(([l]) => l === label);
     return chosen ? pick(chosen[1]) : pick([]);
+  }
+
+  /** Usage or context the agent reported in its own notification. */
+  report(r: { usage?: UsageView; context?: ContextView }) {
+    if (this.#ended) return;
+    if (r.context) this.sink.context(r.context);
+    if (r.usage) this.sink.usage(r.usage);
+  }
+
+  /** The agent's own failure report the turn ended with, if any. */
+  get heldError() {
+    return this.#held;
   }
 
   /** Nobody waits for answers any more: open questions resolve as cancelled. */
@@ -935,6 +989,14 @@ function oneLine(s: unknown) {
   if (typeof s !== "string") return "";
   const t = s.replace(/\s+/g, " ").trim();
   return t.length > 200 ? `${t.slice(0, 199)}…` : t;
+}
+
+function command(raw: unknown): string | null {
+  const r = ask(raw);
+  const cmd = [r.command, r.cmd, r.CommandLine].find(
+    (x) => typeof x === "string" || Array.isArray(x),
+  );
+  return typeof cmd === "string" ? cmd : Array.isArray(cmd) ? cmd.join(" ") : null;
 }
 
 /** What a tool call would do, for the person: its command, else its input. */

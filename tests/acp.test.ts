@@ -455,7 +455,8 @@ describe("turns", () => {
     expect(logOf(key).find((e) => e.permission)?.permission).toEqual({
       outcome: { outcome: "cancelled" },
     });
-    expect(end).toEqual({ status: "aborted" });
+    // The agent ended the turn itself (not stopped by Tandem): an ordinary end.
+    expect(end).toEqual({ status: "completed" });
     expect(rec.asks[0]!.prompts[0]!.header).toBe("shell");
     await agent.release(key);
   });
@@ -689,11 +690,16 @@ describe("turns", () => {
           provider,
           model,
           mcpServers: servers.slice(1),
-          session: params.sessionId ?? null,
+          session: null,
         }),
         recorder().sink,
         never(),
       );
+      const reopened = calls(key, provider === "openrouter" ? "session/load" : "session/resume");
+      expect(reopened.length).toBe(1);
+      expect(reopened[0]!.params.mcpServers).toEqual([acp[1]]);
+      expect(calls(key, "session/close").length).toBe(1);
+      expect(calls(key, "session/new").length).toBe(1);
       await agent.release(key);
     }
   });
@@ -783,10 +789,13 @@ describe("turns", () => {
       effort: "high",
       mode: "smart_approve",
     });
-    // goose reports the session's totals: passed on as they are.
+    // goose's own notification has the session's totals: passed on as they are.
     expect(rec.usages).toEqual([
-      { input: 1000, output: 20, cacheRead: 100, cacheWrite: 0 },
+      { input: 1000, output: 20, cacheRead: 0, cacheWrite: 0 },
     ]);
+    const again = recorder();
+    await or.turn(k3, input({ provider: "openrouter", model: OPENROUTER_MODELS[1]!, session: rec.sessions[0]! }), again.sink, never());
+    expect(again.usages).toEqual([{ input: 2000, output: 40, cacheRead: 0, cacheWrite: 0 }]);
     // An effort goose does not offer for the model is left to goose.
     const rec2 = recorder();
     await or.turn(
@@ -889,6 +898,13 @@ describe("turns", () => {
         "signin_required",
       ],
       [
+      () => geminiAgent(opts()),
+      "gemini",
+      "antigravity/gemini-4-carbon",
+      "SHOWERR=Error 429, Message: Resource has been exhausted (e.g. check quota)., Status: RESOURCE_EXHAUSTED",
+      "rate_limited",
+    ],
+    [
         () => geminiAgent(opts()),
         "gemini",
         "antigravity/gemini-4-carbon",
@@ -927,6 +943,21 @@ describe("turns", () => {
         expect(agent.busy(key)).toBe(false);
       await agent.release(key);
     }
+  });
+
+  test("agy's failure shown as text: the turn fails with it; a recovered retry is not shown", async () => {
+    const key = person();
+    const agent = geminiAgent(opts());
+    const bad = recorder();
+    const end = await agent.turn(key, input({ provider: "gemini", model: "antigravity/gemini-4-carbon", text: "SHOWERR=Error 400, Message: API key not valid. Please pass a valid API key., Status: INVALID_ARGUMENT" }), bad.sink, never());
+    expect(end).toMatchObject({ status: "failed", failure: { code: "signin_required", params: { provider: "gemini" } } });
+    expect([...bad.text.values()]).toEqual([]);
+    const k2 = person();
+    const ok = recorder();
+    const end2 = await agent.turn(k2, input({ provider: "gemini", model: "antigravity/gemini-4-carbon", text: "SHOWERR=Error 429 RECOVER" }), ok.sink, never());
+    expect(end2).toEqual({ status: "completed" });
+    expect([...ok.text.values()]).toEqual(["recovered"]);
+    await agent.release(k2);
   });
 
   test("a person without the key fails with signin_required and starts nothing", async () => {

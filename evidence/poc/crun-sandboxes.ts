@@ -25,6 +25,8 @@ export type CrunOptions = {
 export class CrunSandboxes implements Sandboxes {
   #n = 0;
   readonly spawned: { label: string; args: string[]; env: Record<string, string> }[] = [];
+  /** Each sandbox's own memory peak (its cgroup's memory.peak when it ended), in MiB. */
+  readonly peaks: { label: string; mib: number }[] = [];
   constructor(private o: CrunOptions) {
     const parent = `/sys/fs/cgroup/sandboxes/tandem-${o.key}-acp`;
     if (!existsSync(parent)) mkdirSync(parent);
@@ -83,7 +85,16 @@ export class CrunSandboxes implements Sandboxes {
       }, 3000).unref();
       return true;
     };
+    const cg = `/sys/fs/cgroup/sandboxes/tandem-${key}-acp/${label}-${this.#n}`;
+    let last = 0;
+    const peak = setInterval(() => {
+      try {
+        last = Math.round(Number(readFileSync(`${cg}/memory.peak`, "utf8")) / 2 ** 20);
+      } catch {}
+    }, 200);
     child.once("exit", () => {
+      clearInterval(peak);
+      this.peaks.push({ label, mib: last });
       spawn("crun", ["delete", "-f", name], { stdio: "ignore" }).once("exit", () => rmSync(dir, { recursive: true, force: true }));
     });
     return child;

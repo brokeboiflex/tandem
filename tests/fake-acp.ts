@@ -134,6 +134,7 @@ function serve() {
   const waiting = new Map<number, (m: any) => void>();
   const open = new Map<string, Session>();
   const cancels = new Map<string, () => void>();
+  let customNotifications = false;
   const send = (m: unknown) =>
     process.stdout.write(
       JSON.stringify({ jsonrpc: "2.0", ...(m as object) }) + "\n",
@@ -353,6 +354,7 @@ function serve() {
       });
     switch (m.method) {
       case "initialize":
+        customNotifications = p.clientCapabilities?._meta?.goose?.customNotifications === true;
         return reply({
           protocolVersion: 1,
           agentCapabilities:
@@ -531,13 +533,16 @@ function serve() {
             },
           },
         });
-      // goose: the session's totals; agy: this turn's.
+      // goose: its last request in the response, the session's totals in its own notification
+      // (to clients that ask); agy: this turn's.
+      if (program === "goose" && customNotifications)
+        send({
+          method: "_goose/unstable/session/update",
+          params: { sessionId: s.id, update: { sessionUpdate: "usage_update", used: 1000, contextLimit: 128000, accumulatedInputTokens: 1000 * turn, accumulatedOutputTokens: 20 * turn } },
+        });
       return reply({
         stopReason,
-        usage:
-          program === "goose"
-            ? usage
-            : { ...usage, inputTokens: 1000, totalTokens: 1020 },
+        usage: { ...usage, inputTokens: 1000, totalTokens: 1020 },
       });
     };
     if (program !== "grok")
@@ -588,6 +593,17 @@ function serve() {
           data: { details: failure },
         },
       });
+    }
+    // agy's own way to report a failed model request: as assistant text, then a normal end.
+    const shown = text.match(/SHOWERR=(.*)$/s)?.[1];
+    if (shown !== undefined) {
+      say(` ⚠ API error (attempt 1): ${shown}`);
+      if (!shown.includes("RECOVER")) {
+        say(` ⚠ agent executor error: generating and executing: ${shown}`);
+        return done("end_turn");
+      }
+      say("recovered");
+      return done("end_turn");
     }
     if (text.includes("EXIT")) {
       process.stderr.write("panic: something broke\n");
