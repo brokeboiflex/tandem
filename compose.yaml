@@ -14,9 +14,12 @@ services:
     # gets Docker's filter for unprivileged containers on top (src/security.ts).
     cap_add: [SYS_ADMIN, NET_ADMIN]
     security_opt: ["apparmor=unconfined"]
-    # Every person's home, their uids and the gateway's sockets. On a server shared with other apps,
-    # also cap the whole container (mem_limit): RUNTIME_MEMORY_MB limits each person, not everyone.
+    # Every person's home, the gateway's store, their uids and the gateway's sockets.
     volumes: ["tandem-data:/var/lib/tandem"]
+    # The whole container's memory (e.g. 1536m) on a server shared with other apps: RUNTIME_MEMORY_MB
+    # limits each person, not everyone. Unset (0) means no limit. People's agent processes are ended
+    # before the gateway when it is reached.
+    mem_limit: ${TANDEM_MEM_LIMIT:-0}
     # Local use: the API on this machine only. Behind Dokploy's proxy the domain routes to port 8787
     # over Dokploy's network instead.
     ports: ["127.0.0.1:${GATEWAY_PORT:-8787}:8787"]

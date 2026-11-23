@@ -98,8 +98,8 @@ Tandem deploys as one Compose service on an ordinary Dokploy server (no KVM or o
    `cap_add` and `security_opt`) from this repository, compose path `compose.yaml`.
 2. In **Environment**, set the production variables from `.env.example`: `AUTH_MODE=oidc` with
    `OIDC_ISSUER`, `OIDC_AUDIENCE`, `OIDC_JWKS_URL`, a random `SERVICE_SECRET` (keep it: changing it
-   orphans every home), `MCP_ALLOWED_ORIGINS` (your app's origin) and, as needed, `EGRESS_ALLOW_DOMAINS`
-   and `IDLE_MINUTES`. Dokploy writes them to `.env`, which `compose.yaml` reads.
+   orphans every home), `MCP_ALLOWED_ORIGINS` (your app's origin) and, as needed, `EGRESS_ALLOW_DOMAINS`,
+   `IDLE_MINUTES` and `TANDEM_MEM_LIMIT` (the container's memory on a shared server, e.g. `1536m`). Dokploy writes them to `.env`, which `compose.yaml` reads.
 3. In **Domains**, add your Tandem hostname for service `tandem`, port `8787`, with HTTPS. Dokploy's
    proxy reaches the container over its own network; the `127.0.0.1` port binding in `compose.yaml` is
    for local use (set `GATEWAY_PORT` if 8787 is taken on the server).
@@ -364,8 +364,8 @@ servers, against scripted vendor APIs (`evidence/capacity.txt`):
   this up inside its own container at startup (cgroup v2 hosts, which current Ubuntu and Debian are);
   on a host without cgroup v2 it logs a `WARNING:` and only the per-uid process limit applies.
   `RUNTIME_MEMORY_MB` is per person, so for a server shared with other apps also cap the whole
-  container (`mem_limit` in `compose.yaml` or Dokploy's resource settings); sandboxed processes are
-  ended before the gateway when the container runs out of memory.
+  container with `TANDEM_MEM_LIMIT` (for example `1536m`; `compose.yaml` passes it as `mem_limit`);
+  sandboxed processes are ended before the gateway when the container runs out of memory.
 
 ## Operations and upgrades
 
